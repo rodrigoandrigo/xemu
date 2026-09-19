@@ -134,8 +134,9 @@ DirectXPage::DirectXPage():
 	m_savedSystemPointerCursor(nullptr),
 	m_systemPointerHidden(false),
 	m_logRefreshFrames(0),
-	m_fpsFrames(0),
-	m_fpsSampleStart(std::chrono::steady_clock::now())
+	m_lastPresentTime(std::chrono::steady_clock::now()),
+	m_lastPeriodicTrim(std::chrono::steady_clock::now()),
+	m_stalled(false)
 {
 	InitializeComponent();
 
@@ -221,6 +222,7 @@ void DirectXPage::OnRendering(Object^, Object^)
 	if (++m_logRefreshFrames >= 60) {
 		m_logRefreshFrames = 0;
 		if (toolTabs->SelectedIndex == 6) RefreshLogView();
+		UpdateMemoryStatus();
 		if (m_vlan && m_vlan->IsRunning()) {
 			std::string status = m_vlan->Status();
 			if (status != m_lastVlanStatus) {
@@ -234,33 +236,85 @@ void DirectXPage::OnRendering(Object^, Object^)
 		if (m_xemu->IsRunning()) {
 			HideSystemPointer();
 		}
-		UpdateFpsOverlay(m_xemu->RenderFrame());
+		TrackRenderHealth(m_xemu->RenderFrame());
 	}
 }
 
-void DirectXPage::UpdateFpsOverlay(bool framePresented)
+namespace
 {
+// How long RenderFrame() can go without successfully presenting a frame
+// before it counts as a stall. This is well above a normal frame budget
+// (16-33ms), so only genuine hitches/hangs trigger it, not ordinary
+// frame-pacing jitter.
+constexpr double kStallThresholdSeconds = 1.5;
+
+// Even when nothing stalls, periodically hand back whatever working set
+// xemu has accumulated (shader cache, JIT code cache) so a long play
+// session doesn't sit on memory the OS could be giving to other apps.
+constexpr double kPeriodicTrimIntervalSeconds = 30.0;
+}
+
+void DirectXPage::TrackRenderHealth(bool framePresented)
+{
+	auto now = std::chrono::steady_clock::now();
+
 	if (!m_xemu->IsRunning()) {
-		fpsOverlay->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
-		m_fpsFrames = 0;
-		m_fpsSampleStart = std::chrono::steady_clock::now();
+		m_lastPresentTime = now;
+		m_stalled = false;
 		return;
 	}
 
-	fpsOverlay->Visibility = Windows::UI::Xaml::Visibility::Visible;
 	if (framePresented) {
-		++m_fpsFrames;
+		m_lastPresentTime = now;
+		m_stalled = false;
+	} else {
+		auto sinceLastPresent =
+			std::chrono::duration<double>(now - m_lastPresentTime).count();
+		if (!m_stalled && sinceLastPresent >= kStallThresholdSeconds) {
+			// We've gone noticeably long without presenting a frame.
+			// There's no shader/texture-cache-clear entry point exposed
+			// by the embedded DLL, so the concrete, safe thing this
+			// layer can do is give back whatever reclaimable memory the
+			// process is holding, in case the stall is caused by memory
+			// pressure (e.g. the OS throttling the app near its quota).
+			m_stalled = true;
+			m_lastPeriodicTrim = now;
+			App::TrimWorkingSet();
+		}
 	}
-	auto now = std::chrono::steady_clock::now();
-	auto elapsed = std::chrono::duration<double>(now - m_fpsSampleStart).count();
-	if (elapsed >= 1.0) {
-		wchar_t text[32];
-		double fps = m_fpsFrames / elapsed;
-		swprintf_s(text, L"%.1f FPS", fps);
-		fpsCounter->Text = ref new String(text);
-		m_fpsFrames = 0;
-		m_fpsSampleStart = now;
+
+	auto sincePeriodicTrim =
+		std::chrono::duration<double>(now - m_lastPeriodicTrim).count();
+	if (sincePeriodicTrim >= kPeriodicTrimIntervalSeconds) {
+		m_lastPeriodicTrim = now;
+		App::TrimWorkingSet();
 	}
+}
+
+// Surfaces the OS-reported UWP memory quota directly, rather than a value
+// this app computed itself. On Xbox this quota is a hard platform ceiling
+// (Microsoft docs: 1 GB foreground for apps, 5 GB for games) that nothing
+// in this project can raise; showing the live number lets you confirm
+// exactly what ceiling you're actually up against and how close to it a
+// given title/setting combination runs.
+void DirectXPage::UpdateMemoryStatus()
+{
+	auto usage = Windows::System::MemoryManager::AppMemoryUsage;
+	auto limit = Windows::System::MemoryManager::AppMemoryUsageLimit;
+	auto level = Windows::System::MemoryManager::AppMemoryUsageLevel;
+
+	const wchar_t* levelText = L"LOW";
+	switch (level) {
+	case Windows::System::AppMemoryUsageLevel::Medium:    levelText = L"MEDIUM";     break;
+	case Windows::System::AppMemoryUsageLevel::High:      levelText = L"HIGH";       break;
+	case Windows::System::AppMemoryUsageLevel::OverLimit: levelText = L"OVER LIMIT"; break;
+	default: break;
+	}
+
+	wchar_t text[96];
+	swprintf_s(text, L"Memory: %.0f / %.0f MB (%s)",
+	           usage / (1024.0 * 1024.0), limit / (1024.0 * 1024.0), levelText);
+	memoryStatus->Text = ref new String(text);
 }
 
 // Salva o estado atual do aplicativo para eventos de suspensão e de encerramento.
@@ -466,7 +520,7 @@ void DirectXPage::StartXemu_Click(Object^, RoutedEventArgs^)
 		errorText->Text = "VLan/VPN requires a valid coordinator and 32-character room code.";
 		return;
 	}
-	if (m_xemu->Start()) { hostStatus->Text = "RUNNING"; m_fpsFrames = 0; m_fpsSampleStart = std::chrono::steady_clock::now(); fpsCounter->Text = "0 FPS"; fpsOverlay->Visibility = Windows::UI::Xaml::Visibility::Visible; FocusEmulatorInput(); launcherPanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed; HideSystemPointer(); }
+	if (m_xemu->Start()) { hostStatus->Text = "RUNNING"; m_lastPresentTime = std::chrono::steady_clock::now(); m_lastPeriodicTrim = m_lastPresentTime; m_stalled = false; FocusEmulatorInput(); launcherPanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed; HideSystemPointer(); }
 	else { if (m_vlan) m_vlan->Stop(); auto e = m_xemu->LastError(); errorText->Text = ref new String(std::wstring(e.begin(), e.end()).c_str()); }
 }
 

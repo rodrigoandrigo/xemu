@@ -50,6 +50,16 @@ App::App()
 	InitializeComponent();
 	Suspending += ref new SuspendingEventHandler(this, &App::OnSuspending);
 	Resuming += ref new EventHandler<Object^>(this, &App::OnResuming);
+
+	// The OS enforces a hard per-app memory quota in the UWP/Xbox sandbox
+	// (unlike desktop Win32, going over it leads to suspension or
+	// termination rather than paging). React early so xemu's buffers get
+	// trimmed before that happens.
+	Windows::System::MemoryManager::AppMemoryUsageIncreased +=
+		ref new EventHandler<Object^>(this, &App::OnAppMemoryUsageIncreased);
+	Windows::System::MemoryManager::AppMemoryUsageLimitChanging +=
+		ref new EventHandler<Windows::System::AppMemoryUsageLimitChangingEventArgs^>(
+			this, &App::OnAppMemoryUsageLimitChanging);
 }
 
 /// <summary>
@@ -162,6 +172,63 @@ void App::OnSuspending(Object^ sender, SuspendingEventArgs^ e)
 	(void) e;	// Parâmetro não usado
 
 	m_directXPage->SaveInternalState(ApplicationData::Current->LocalSettings->Values);
+
+	// SaveInternalState already paused xemu, so the CPU/GPU emulation loop
+	// is idle at this point. Hand back whatever working set it built up
+	// (shader cache, translated-code cache, framebuffers) while suspended
+	// so the OS can give that memory to other apps instead of counting it
+	// against this app's quota the whole time it's backgrounded.
+	TrimWorkingSet();
+}
+
+/// <summary>
+/// Fired as overall system-wide app memory usage rises. Used here purely as
+/// an early warning to release reclaimable memory before the app's own
+/// usage limit is hit.
+/// </summary>
+void App::OnAppMemoryUsageIncreased(Object^ sender, Object^ args)
+{
+	(void) sender;
+	(void) args;
+
+	auto level = Windows::System::MemoryManager::AppMemoryUsageLevel;
+	if (level == Windows::System::AppMemoryUsageLevel::High ||
+	    level == Windows::System::AppMemoryUsageLevel::OverLimit)
+	{
+		TrimWorkingSet();
+	}
+}
+
+/// <summary>
+/// Fired when the OS is about to change (typically lower) this app's memory
+/// quota, e.g. another app or game is being launched alongside it. Trim
+/// proactively so the app doesn't get suspended for exceeding the new
+/// limit a moment later.
+/// </summary>
+void App::OnAppMemoryUsageLimitChanging(Object^ sender,
+	Windows::System::AppMemoryUsageLimitChangingEventArgs^ args)
+{
+	(void) sender;
+
+	auto currentUsage = Windows::System::MemoryManager::AppMemoryUsage;
+	if (args != nullptr && currentUsage >= args->NewLimit)
+	{
+		TrimWorkingSet();
+	}
+}
+
+/// <summary>
+/// Releases currently-unused pages in this process's working set back to
+/// the OS. This does not free any live allocation or emulator state; it
+/// only asks Windows to page out memory the process isn't actively
+/// touching, which Windows will happily page back in on demand. Safe to
+/// call at any time, including while xemu is running.
+/// </summary>
+void App::TrimWorkingSet()
+{
+	SetProcessWorkingSetSize(GetCurrentProcess(),
+	                          static_cast<SIZE_T>(-1),
+	                          static_cast<SIZE_T>(-1));
 }
 
 /// <summary>

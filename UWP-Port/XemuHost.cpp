@@ -192,6 +192,26 @@ bool XemuHost::AttachRenderPanel(Windows::UI::Xaml::Controls::SwapChainPanel^ pa
         return false;
     }
 
+    // Mesa's Gallium D3D12 driver keeps its own on-disk compiled-shader
+    // cache, separate from xemu's own NV2A shader cache, and defaults to a
+    // 1 GB ceiling (MESA_SHADER_CACHE_MAX_SIZE) if left unset -- a sizeable
+    // slice of a UWP title's whole memory quota. These env vars must be in
+    // place before gallium_wgl.dll/opengl32.dll load below, since Mesa
+    // reads them once at cache-creation time.
+    //
+    // The dir is also pointed explicitly at this app's own LocalCache
+    // folder: Mesa's default cache-directory detection assumes an
+    // unsandboxed desktop process and may resolve to a path this
+    // AppContainer isn't allowed to touch, in which case the cache would
+    // silently no-op. Giving it a path we know is writable makes the size
+    // cap below meaningful either way.
+    {
+        auto cacheDir = ApplicationData::Current->LocalCacheFolder->Path +
+                        L"\\mesa_shader_cache";
+        SetEnvironmentVariableW(L"MESA_SHADER_CACHE_DIR", cacheDir->Data());
+        SetEnvironmentVariableW(L"MESA_SHADER_CACHE_MAX_SIZE", L"64M");
+    }
+
     WriteDiagnostic("[display] Attaching SwapChainPanel to SDL3 and Mesa");
     if (!m_sdlModule) {
         m_sdlModule = LoadPackagedLibrary(L"SDL3.dll", 0);

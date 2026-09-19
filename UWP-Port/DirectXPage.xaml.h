@@ -42,7 +42,8 @@ namespace UWP_Port
 		void OnRenderPanelScaleChanged(Windows::UI::Xaml::Controls::SwapChainPanel^ sender, Platform::Object^ args);
 		void FocusEmulatorInput();
 		void HideSystemPointer();
-		void UpdateFpsOverlay(bool framePresented);
+		void TrackRenderHealth(bool framePresented);
+		void UpdateMemoryStatus();
 		void UpdateStartButtonState();
 		void RefreshLogView();
 
@@ -99,8 +100,9 @@ namespace UWP_Port
 		Windows::UI::Core::CoreCursor^ m_savedSystemPointerCursor;
 		bool m_systemPointerHidden;
 		unsigned int m_logRefreshFrames;
-		unsigned int m_fpsFrames;
-		std::chrono::steady_clock::time_point m_fpsSampleStart;
+		std::chrono::steady_clock::time_point m_lastPresentTime;
+		std::chrono::steady_clock::time_point m_lastPeriodicTrim;
+		bool m_stalled;
 		std::string m_lastVlanStatus;
 	};
 }
