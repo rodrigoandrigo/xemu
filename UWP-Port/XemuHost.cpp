@@ -32,8 +32,25 @@ struct BrokeredFileStream : BrokeredHandle {
     IRandomAccessStream^ stream;
     std::string name;
 
+    // Keep the WinRT data wrappers alive for the handle lifetime. Brokered
+    // reads and writes fully drain their buffers before returning, so a
+    // subsequent seek on the underlying stream cannot expose stale data.
+    DataReader^ reader;
+    DataWriter^ writer;
+
     BrokeredFileStream(IRandomAccessStream^ value, const std::string& fileName)
-        : BrokeredHandle(Kind::File), stream(value), name(fileName) {}
+        : BrokeredHandle(Kind::File), stream(value), name(fileName),
+          reader(nullptr), writer(nullptr) {}
+
+    ~BrokeredFileStream() override
+    {
+        if (reader) {
+            try { reader->DetachStream(); } catch (...) {}
+        }
+        if (writer) {
+            try { writer->DetachStream(); } catch (...) {}
+        }
+    }
 };
 
 struct BrokeredDirectoryEntry {
@@ -209,7 +226,7 @@ bool XemuHost::AttachRenderPanel(Windows::UI::Xaml::Controls::SwapChainPanel^ pa
         auto cacheDir = ApplicationData::Current->LocalCacheFolder->Path +
                         L"\\mesa_shader_cache";
         SetEnvironmentVariableW(L"MESA_SHADER_CACHE_DIR", cacheDir->Data());
-        SetEnvironmentVariableW(L"MESA_SHADER_CACHE_MAX_SIZE", L"64M");
+        SetEnvironmentVariableW(L"MESA_SHADER_CACHE_MAX_SIZE", L"128M");
     }
 
     WriteDiagnostic("[display] Attaching SwapChainPanel to SDL3 and Mesa");
@@ -745,7 +762,8 @@ void XemuHost::Run(std::vector<std::string> arguments)
         WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &utf8[0], size,
                             nullptr, nullptr);
         utf8.pop_back();
-        arguments = { "xemu", "-config_path", utf8 };
+        arguments = { "xemu", "-accel", "tcg,tb-size=64",
+                 "-config_path", utf8 };
     } else {
         arguments.insert(arguments.begin(), "xemu");
     }
@@ -1070,14 +1088,20 @@ int64_t XemuHost::ReadBrokeredFile(void* opaque, int64_t handle, void* buffer,
                                   std::to_string(position) + ", " +
                                   std::to_string(count) + " bytes");
         }
-        auto reader = ref new DataReader(brokered->stream);
-        reader->InputStreamOptions = InputStreamOptions::Partial;
+        if (!brokered->reader) {
+            brokered->reader = ref new DataReader(brokered->stream);
+            brokered->reader->InputStreamOptions = InputStreamOptions::Partial;
+        } else if (brokered->reader->UnconsumedBufferLength != 0) {
+            brokered->reader->DetachStream();
+            brokered->reader = ref new DataReader(brokered->stream);
+            brokered->reader->InputStreamOptions = InputStreamOptions::Partial;
+        }
+        auto reader = brokered->reader;
         unsigned int loaded = create_task(reader->LoadAsync(count)).get();
         if (loaded) {
             reader->ReadBytes(Platform::ArrayReference<unsigned char>(
                 static_cast<unsigned char*>(buffer), loaded));
         }
-        reader->DetachStream();
         if (self && sequence < 32) {
             self->WriteDiagnostic("[storage] Brokered read #" +
                                   std::to_string(sequence) + " completed: " +
@@ -1108,12 +1132,14 @@ int64_t XemuHost::WriteBrokeredFile(void*, int64_t handle,
         }
         unsigned int count = static_cast<unsigned int>((std::min)(
             size, static_cast<size_t>((std::numeric_limits<unsigned int>::max)())));
-        auto writer = ref new DataWriter(brokered->stream);
+        if (!brokered->writer) {
+            brokered->writer = ref new DataWriter(brokered->stream);
+        }
+        auto writer = brokered->writer;
         writer->WriteBytes(Platform::ArrayReference<unsigned char>(
             const_cast<unsigned char*>(static_cast<const unsigned char*>(buffer)),
             count));
         unsigned int written = create_task(writer->StoreAsync()).get();
-        writer->DetachStream();
         return written;
     } catch (...) {
         return -EIO;
