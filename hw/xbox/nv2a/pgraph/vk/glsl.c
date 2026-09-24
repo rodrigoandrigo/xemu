@@ -18,6 +18,9 @@
  */
 
 #include "ui/xemu-settings.h"
+#define QEMU_HOST_INTERNAL
+#include "qemu/qemu-host.h"
+#undef QEMU_HOST_INTERNAL
 #include "renderer.h"
 
 #include <assert.h>
@@ -160,46 +163,47 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
     };
 
     glslang_shader_t *shader = glslang_shader_create(&input);
+    if (!shader) {
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
+                           "GLSL shader allocation failed");
+        return NULL;
+    }
 
     if (!glslang_shader_preprocess(shader, &input)) {
-        fprintf(stderr,
-                "GLSL preprocessing failed\n"
-                "[INFO]: %s\n"
-                "[DEBUG]: %s\n"
-                "%s\n",
-                glslang_shader_get_info_log(shader),
-                glslang_shader_get_info_debug_log(shader), input.code);
-        assert(!"glslang preprocess failed");
+        g_autofree char *message =
+            g_strdup_printf("GLSL preprocessing failed: %s; %s",
+                            glslang_shader_get_info_log(shader),
+                            glslang_shader_get_info_debug_log(shader));
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR, message);
         glslang_shader_delete(shader);
         return NULL;
     }
 
     if (!glslang_shader_parse(shader, &input)) {
-        fprintf(stderr,
-                "GLSL parsing failed\n"
-                "[INFO]: %s\n"
-                "[DEBUG]: %s\n"
-                "%s\n",
-                glslang_shader_get_info_log(shader),
-                glslang_shader_get_info_debug_log(shader),
-                glslang_shader_get_preprocessed_code(shader));
-        assert(!"glslang parse failed");
+        g_autofree char *message = g_strdup_printf(
+            "GLSL parsing failed: %s; %s", glslang_shader_get_info_log(shader),
+            glslang_shader_get_info_debug_log(shader));
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR, message);
         glslang_shader_delete(shader);
         return NULL;
     }
 
     glslang_program_t *program = glslang_program_create();
+    if (!program) {
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
+                           "GLSL program allocation failed");
+        glslang_shader_delete(shader);
+        return NULL;
+    }
     glslang_program_add_shader(program, shader);
 
     if (!glslang_program_link(program, GLSLANG_MSG_SPV_RULES_BIT |
                                            GLSLANG_MSG_VULKAN_RULES_BIT)) {
-        fprintf(stderr,
-                "GLSL linking failed\n"
-                "[INFO]: %s\n"
-                "[DEBUG]: %s\n",
-                glslang_program_get_info_log(program),
-                glslang_program_get_info_debug_log(program));
-        assert(!"glslang link failed");
+        g_autofree char *message =
+            g_strdup_printf("GLSL linking failed: %s; %s",
+                            glslang_program_get_info_log(program),
+                            glslang_program_get_info_debug_log(program));
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR, message);
         glslang_program_delete(program);
         glslang_shader_delete(shader);
         return NULL;
@@ -226,12 +230,20 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
     glslang_program_SPIRV_generate_with_options(program, stage, &spv_options);
 
     const char *spirv_messages = glslang_program_SPIRV_get_messages(program);
-    if (spirv_messages) {
-        printf("%s\b", spirv_messages);
+    if (spirv_messages && *spirv_messages) {
+        qemu_host_emit_log(QEMU_HOST_LOG_WARNING, spirv_messages);
     }
 
     size_t num_program_bytes =
         glslang_program_SPIRV_get_size(program) * sizeof(uint32_t);
+
+    if (!num_program_bytes) {
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
+                           "GLSL compiler produced empty SPIR-V");
+        glslang_program_delete(program);
+        glslang_shader_delete(shader);
+        return NULL;
+    }
 
     guint8 *data = g_malloc(num_program_bytes);
     glslang_program_SPIRV_get(program, (unsigned int *)data);
@@ -242,7 +254,8 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
     return g_byte_array_new_take(data, num_program_bytes);
 }
 
-VkShaderModule pgraph_vk_create_shader_module_from_spv(PGRAPHVkState *r, GByteArray *spv)
+VkShaderModule pgraph_vk_create_shader_module_from_spv(PGRAPHVkState *r,
+                                                       GByteArray *spv)
 {
     VkShaderModuleCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -250,12 +263,12 @@ VkShaderModule pgraph_vk_create_shader_module_from_spv(PGRAPHVkState *r, GByteAr
         .pCode = (uint32_t *)spv->data,
     };
     VkShaderModule module;
-    VK_CHECK(
-        vkCreateShaderModule(r->device, &create_info, NULL, &module));
+    VK_CHECK(vkCreateShaderModule(r->device, &create_info, NULL, &module));
     return module;
 }
 
-static void block_to_uniforms(const SpvReflectBlockVariable *block, ShaderUniformLayout *layout)
+static void block_to_uniforms(const SpvReflectBlockVariable *block,
+                              ShaderUniformLayout *layout)
 {
     assert(!layout->uniforms);
 
@@ -348,7 +361,8 @@ static void init_layout_from_spv(ShaderModuleInfo *info)
     }
 }
 
-static glslang_stage_t vk_shader_stage_to_glslang_stage(VkShaderStageFlagBits stage)
+static glslang_stage_t
+vk_shader_stage_to_glslang_stage(VkShaderStageFlagBits stage)
 {
     switch (stage) {
     case VK_SHADER_STAGE_GEOMETRY_BIT:
@@ -380,7 +394,7 @@ ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
 static void finalize_uniform_layout(ShaderUniformLayout *layout)
 {
     for (int i = 0; i < layout->num_uniforms; i++) {
-        free((void*)layout->uniforms[i].name);
+        free((void *)layout->uniforms[i].name);
     }
     if (layout->uniforms) {
         g_free(layout->uniforms);

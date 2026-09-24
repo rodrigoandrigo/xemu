@@ -150,16 +150,33 @@ size_t pgraph_get_texture_length(PGRAPHState *pg, TextureShape *shape)
         assert(shape->dimensionality == 2);
         length = shape->height * shape->pitch;
     } else {
-        if (shape->dimensionality >= 2) {
-            unsigned int w = shape->width, h = shape->height;
+        if (shape->dimensionality >= 1) {
+            unsigned int w = shape->width;
+            unsigned int h = shape->dimensionality >= 2 ? shape->height : 1;
+            unsigned int depth = shape->dimensionality >= 3 ?
+                                     shape->depth :
+                                     1;
+            if (shape->border) {
+                w = MAX(16, w * 2);
+                if (shape->dimensionality >= 2) {
+                    h = MAX(16, h * 2);
+                }
+                if (shape->dimensionality >= 3) {
+                    depth = MAX(16, depth * 2);
+                }
+            }
             int level;
             if (!pgraph_is_texture_format_compressed(pg, shape->color_format)) {
                 for (level = 0; level < shape->levels; level++) {
                     w = MAX(w, 1);
                     h = MAX(h, 1);
-                    length += w * h * f.bytes_per_pixel;
+                    depth = MAX(depth, 1);
+                    length += (size_t)w * h * depth * f.bytes_per_pixel;
                     w /= 2;
                     h /= 2;
+                    if (shape->dimensionality >= 3) {
+                        depth /= 2;
+                    }
                 }
             } else {
                 /* Compressed textures are a bit different */
@@ -170,20 +187,22 @@ size_t pgraph_get_texture_length(PGRAPHState *pg, TextureShape *shape)
                 for (level = 0; level < shape->levels; level++) {
                     w = MAX(w, 1);
                     h = MAX(h, 1);
+                    depth = MAX(depth, 1);
                     unsigned int phys_w = (w + 3) & ~3,
                                  phys_h = (h + 3) & ~3;
-                    length += phys_w/4 * phys_h/4 * block_size;
+                    length += (size_t)phys_w / 4 * (phys_h / 4) * depth *
+                              block_size;
                     w /= 2;
                     h /= 2;
+                    if (shape->dimensionality >= 3) {
+                        depth /= 2;
+                    }
                 }
             }
             if (shape->cubemap) {
                 assert(shape->dimensionality == 2);
                 length = (length + NV2A_CUBEMAP_FACE_ALIGNMENT - 1) & ~(NV2A_CUBEMAP_FACE_ALIGNMENT - 1);
                 length *= 6;
-            }
-            if (shape->dimensionality >= 3) {
-                length *= shape->depth;
             }
         }
     }
@@ -290,7 +309,10 @@ TextureShape pgraph_get_texture_shape(PGRAPHState *pg, int texture_idx)
          *    Level 4: 2 x 1
          *    Level 5: 1 x 1
          */
-        levels = MIN(levels, MAX(log_width, log_height) + 1);
+        levels = MIN(levels,
+                     (dimensionality >= 2 ? MAX(log_width, log_height) :
+                                            log_width) +
+                         1);
         assert(levels > 0);
 
         if (dimensionality == 3) {
@@ -354,44 +376,47 @@ uint8_t *pgraph_convert_texture_data(const TextureShape s, const uint8_t *data,
                    NV097_SET_TEXTURE_FORMAT_COLOR_LC_IMAGE_CR8YB8CB8YA8 ||
                s.color_format ==
                    NV097_SET_TEXTURE_FORMAT_COLOR_LC_IMAGE_YB8CR8YA8CB8) {
-        // TODO: Investigate whether a non-1 depth is possible.
-        // Generally the hardware asserts when attempting to use volumetric
-        // textures in linear formats.
-        assert(depth == 1); /* FIXME */
         // FIXME: only valid if control0 register allows for colorspace
         // conversion
-        size = width * height * 4;
+        size = width * height * depth * 4;
         converted_data = g_malloc(size);
         uint8_t *pixel = converted_data;
-        for (int y = 0; y < height; y++) {
-            const uint8_t *line = &data[y * row_pitch * depth];
-            for (int x = 0; x < width; x++, pixel += 4) {
-                if (s.color_format ==
-                    NV097_SET_TEXTURE_FORMAT_COLOR_LC_IMAGE_CR8YB8CB8YA8) {
-                    convert_yuy2_to_rgb(line, x, &pixel[0], &pixel[1],
-                                        &pixel[2]);
-                } else {
-                    convert_uyvy_to_rgb(line, x, &pixel[0], &pixel[1],
-                                        &pixel[2]);
+        for (int z = 0; z < depth; z++) {
+            const uint8_t *slice = data + z * slice_pitch;
+            for (int y = 0; y < height; y++) {
+                const uint8_t *line = slice + y * row_pitch;
+                for (int x = 0; x < width; x++, pixel += 4) {
+                    if (s.color_format ==
+                        NV097_SET_TEXTURE_FORMAT_COLOR_LC_IMAGE_CR8YB8CB8YA8) {
+                        convert_yuy2_to_rgb(line, x, &pixel[0], &pixel[1],
+                                            &pixel[2]);
+                    } else {
+                        convert_uyvy_to_rgb(line, x, &pixel[0], &pixel[1],
+                                            &pixel[2]);
+                    }
+                    pixel[3] = 255;
                 }
-                pixel[3] = 255;
             }
         }
     } else if (s.color_format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5) {
-        assert(depth == 1); /* FIXME */
-        size = width * height * 3;
+        size = width * height * depth * 3;
         converted_data = g_malloc(size);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                uint16_t rgb655 = *(uint16_t *)(data + y * row_pitch + x * 2);
-                int8_t *pixel = (int8_t *)&converted_data[(y * width + x) * 3];
-                /* Maps 5 bit G and B signed value range to 8 bit
-                 * signed values. R is probably unsigned.
-                 */
-                rgb655 ^= (1 << 9) | (1 << 4);
-                pixel[0] = ((rgb655 & 0xFC00) >> 10) * 0x7F / 0x3F;
-                pixel[1] = ((rgb655 & 0x03E0) >> 5) * 0xFF / 0x1F - 0x80;
-                pixel[2] = (rgb655 & 0x001F) * 0xFF / 0x1F - 0x80;
+        for (int z = 0; z < depth; z++) {
+            const uint8_t *slice = data + z * slice_pitch;
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    uint16_t rgb655 =
+                        *(uint16_t *)(slice + y * row_pitch + x * 2);
+                    int8_t *pixel = (int8_t *)&converted_data[
+                        ((z * height + y) * width + x) * 3];
+                    /* Maps 5 bit G and B signed value range to 8 bit
+                     * signed values. R is probably unsigned. */
+                    rgb655 ^= (1 << 9) | (1 << 4);
+                    pixel[0] = ((rgb655 & 0xFC00) >> 10) * 0x7F / 0x3F;
+                    pixel[1] =
+                        ((rgb655 & 0x03E0) >> 5) * 0xFF / 0x1F - 0x80;
+                    pixel[2] = (rgb655 & 0x001F) * 0xFF / 0x1F - 0x80;
+                }
             }
         }
     } else {

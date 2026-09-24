@@ -137,6 +137,8 @@ typedef struct PGRAPHRenderer {
     } ops;
 } PGRAPHRenderer;
 
+typedef struct PGRAPHD3D12State PGRAPHD3D12State;
+
 typedef struct PGRAPHState {
     QemuMutex lock;
     QemuMutex renderer_lock;
@@ -271,6 +273,7 @@ typedef struct PGRAPHState {
         PGRAPHNullState *null_renderer_state;
         PGRAPHGLState *gl_renderer_state;
         PGRAPHVkState *vk_renderer_state;
+        PGRAPHD3D12State *d3d12_renderer_state;
     };
 } PGRAPHState;
 

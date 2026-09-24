@@ -253,6 +253,11 @@ void pgraph_clear_dirty_reg_map(PGRAPHState *pg)
 
 static CONFIG_DISPLAY_RENDERER get_default_renderer(void)
 {
+#ifdef CONFIG_UWP
+    if (renderers[CONFIG_DISPLAY_RENDERER_D3D12]) {
+        return CONFIG_DISPLAY_RENDERER_D3D12;
+    }
+#endif
 #ifdef CONFIG_OPENGL
     if (renderers[CONFIG_DISPLAY_RENDERER_OPENGL]) {
         return CONFIG_DISPLAY_RENDERER_OPENGL;
