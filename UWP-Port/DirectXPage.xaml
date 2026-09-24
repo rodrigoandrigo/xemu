@@ -21,7 +21,7 @@
               <TextBlock Text="xemu para Xbox/UWP" FontSize="38" FontWeight="SemiBold" Foreground="White"/>
               <TextBlock Text="Open-source original Xbox emulator adapted for embedded execution in UWP applications." Foreground="#FFC6D0DA" FontSize="17" TextWrapping="Wrap"/>
               <Border Background="{StaticResource Panel}" BorderBrush="#FF334152" BorderThickness="1" CornerRadius="6" Padding="20" Margin="0,8,0,0">
-                <StackPanel Spacing="8"><TextBlock Text="Rendering" FontSize="20" FontWeight="SemiBold" Foreground="{StaticResource Accent}"/><TextBlock Text="NV2A → OpenGL/Gallium or Vulkan/DZN → D3D12/DXGI" FontFamily="Consolas" Foreground="White" TextWrapping="Wrap"/><TextBlock Text="Both renderers present the Xbox framebuffer directly in the UWP-Port SwapChainPanel." Foreground="#FFAAB8C5" TextWrapping="Wrap"/></StackPanel>
+                <StackPanel Spacing="8"><TextBlock Text="Rendering" FontSize="20" FontWeight="SemiBold" Foreground="{StaticResource Accent}"/><TextBlock Text="NV2A → OpenGL/Gallium, Vulkan/DZN, or native D3D12 → D3D12/DXGI" FontFamily="Consolas" Foreground="White" TextWrapping="Wrap"/><TextBlock Text="All renderers present the Xbox framebuffer directly in the UWP-Port SwapChainPanel." Foreground="#FFAAB8C5" TextWrapping="Wrap"/></StackPanel>
               </Border>
               <Border Background="{StaticResource Panel}" BorderBrush="#FF334152" BorderThickness="1" CornerRadius="6" Padding="20">
                 <StackPanel Spacing="8"><TextBlock Text="UWP integration" FontSize="20" FontWeight="SemiBold" Foreground="{StaticResource Accent}"/><TextBlock Text="Brokered files, Xbox controller input through Windows.Gaming.Input, WASAPI audio, and a non-blocking emulation loop." Foreground="White" TextWrapping="Wrap"/><TextBlock Text="Select the required files on the Files tab to enable startup." Foreground="#FFAAB8C5" TextWrapping="Wrap"/></StackPanel>
@@ -98,7 +98,7 @@
               </Grid>
 
               <TextBlock Text="Video" FontSize="21" FontWeight="SemiBold" Foreground="{StaticResource Accent}" Margin="0,12,0,0"/>
-              <TextBlock Text="Renderer" Foreground="White"/><ComboBox x:Name="renderer"><ComboBoxItem Content="OpenGL (Mesa Gallium D3D12)"/><ComboBoxItem Content="Vulkan (Mesa DZN D3D12)"/></ComboBox>
+              <TextBlock Text="Renderer" Foreground="White"/><ComboBox x:Name="renderer"><ComboBoxItem Content="OpenGL (Mesa Gallium D3D12)"/><ComboBoxItem Content="Vulkan (Mesa DZN D3D12)"/><ComboBoxItem Content="Direct3D 12 (native)"/></ComboBox>
               <TextBlock Text="Internal resolution" Foreground="White"/><ComboBox x:Name="surfaceScale"><ComboBoxItem Content="1x (native)"/><ComboBoxItem Content="2x"/><ComboBoxItem Content="3x"/><ComboBoxItem Content="4x"/><ComboBoxItem Content="5x"/><ComboBoxItem Content="6x"/></ComboBox>
               <TextBlock Text="Filtering" Foreground="White"/><ComboBox x:Name="filtering"><ComboBoxItem Content="Linear"/><ComboBoxItem Content="Nearest"/></ComboBox>
               <TextBlock Text="Display mode" Foreground="White"/><ComboBox x:Name="displayFit"><ComboBoxItem Content="Center"/><ComboBoxItem Content="Scale while preserving aspect ratio"/><ComboBoxItem Content="Stretch"/></ComboBox>

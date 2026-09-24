@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 #define QEMU_HOST_API_VERSION_MAJOR 1U
-#define QEMU_HOST_API_VERSION_MINOR 5U
+#define QEMU_HOST_API_VERSION_MINOR 6U
 #define QEMU_HOST_API_VERSION \
     ((QEMU_HOST_API_VERSION_MAJOR << 16) | QEMU_HOST_API_VERSION_MINOR)
 
@@ -88,6 +88,16 @@ typedef struct QemuHostVideoMetrics {
 
 typedef void (*QemuHostLogCallback)(void *opaque, QemuHostLogLevel level,
                                     const char *message);
+
+typedef long (*QemuHostSwapChainAttachCallback)(void *opaque,
+                                                void *swapchain);
+
+typedef struct QemuHostD3D12PresentTarget {
+    uint32_t width;
+    uint32_t height;
+    QemuHostSwapChainAttachCallback attach;
+    void *opaque;
+} QemuHostD3D12PresentTarget;
 
 typedef struct QemuHostStorageStat {
     uint64_t size;
@@ -210,6 +220,10 @@ QEMU_HOST_EXPORT bool qemu_host_is_running(void);
 QEMU_HOST_EXPORT int qemu_host_get_exit_status(void);
 QEMU_HOST_EXPORT int qemu_host_get_video_metrics(
     QemuHostVideoMetrics *metrics);
+QEMU_HOST_EXPORT int qemu_host_set_d3d12_present_target(
+    uint32_t width, uint32_t height,
+    QemuHostSwapChainAttachCallback attach, void *opaque);
+int qemu_host_get_d3d12_present_target(QemuHostD3D12PresentTarget *target);
 
 QEMU_HOST_EXPORT void qemu_host_register_log_callback(QemuHostLogCallback cb,
                                                       void *opaque);

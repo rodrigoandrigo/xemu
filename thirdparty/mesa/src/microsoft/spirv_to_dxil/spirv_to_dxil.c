@@ -24,6 +24,7 @@
 #include "dxil_spirv_nir.h"
 #include "spirv_to_dxil.h"
 #include "dxil_nir.h"
+#include "dxil_validator.h"
 #include "nir_to_dxil.h"
 #include "shader_enums.h"
 #include "spirv/nir_spirv.h"
@@ -124,6 +125,30 @@ void
 spirv_to_dxil_free(struct dxil_spirv_object *dxil)
 {
    free(dxil->binary.buffer);
+}
+
+bool
+spirv_to_dxil_validate(void *data, size_t size, char *error,
+                       size_t error_size)
+{
+   struct dxil_validator *validator = dxil_create_validator(NULL);
+   char *validator_error = NULL;
+   bool valid = validator &&
+      dxil_validate_module(validator, data, size, &validator_error);
+
+   if (error && error_size) {
+      if (validator_error)
+         snprintf(error, error_size, "%s", validator_error);
+      else if (!validator)
+         snprintf(error, error_size, "DXIL validator is unavailable");
+      else if (!valid)
+         snprintf(error, error_size, "DXIL validation failed");
+      else
+         error[0] = '\0';
+   }
+
+   dxil_destroy_validator(validator);
+   return valid;
 }
 
 uint64_t

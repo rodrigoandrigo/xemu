@@ -39,6 +39,7 @@ static QemuHostLogCallback host_log_callback;
 static void *host_log_opaque;
 static FILE *host_log_file;
 static char *host_pipeline_cache_file;
+static QemuHostD3D12PresentTarget host_d3d12_present_target;
 static GMutex host_storage_lock;
 static QemuHostStorageCallbacks host_storage_callbacks;
 static void *host_storage_opaque;
@@ -341,6 +342,35 @@ int qemu_host_set_pipeline_cache_file(const char *path)
     host_pipeline_cache_file = copy;
     g_mutex_unlock(&host_state_lock);
     return 0;
+}
+
+int qemu_host_set_d3d12_present_target(
+    uint32_t width, uint32_t height,
+    QemuHostSwapChainAttachCallback attach, void *opaque)
+{
+    if (!width || !height || !attach) {
+        return -EINVAL;
+    }
+
+    g_mutex_lock(&host_state_lock);
+    host_d3d12_present_target.width = width;
+    host_d3d12_present_target.height = height;
+    host_d3d12_present_target.attach = attach;
+    host_d3d12_present_target.opaque = opaque;
+    g_mutex_unlock(&host_state_lock);
+    return 0;
+}
+
+int qemu_host_get_d3d12_present_target(QemuHostD3D12PresentTarget *target)
+{
+    if (!target) {
+        return -EINVAL;
+    }
+
+    g_mutex_lock(&host_state_lock);
+    *target = host_d3d12_present_target;
+    g_mutex_unlock(&host_state_lock);
+    return target->attach ? 0 : -ENODEV;
 }
 
 int qemu_host_get_video_metrics(QemuHostVideoMetrics *metrics)

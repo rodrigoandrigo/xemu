@@ -1009,13 +1009,11 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
     return fpng::fpng_encode_image_to_memory(pixels.data(), width, height, 3, png);
 }
 
-void SaveScreenshot(GLuint tex, bool flip)
+static void SaveScreenshotPng(const std::vector<uint8_t> &png)
 {
     Error *err = NULL;
     char fname[128];
-    std::vector<uint8_t> png;
-
-    if (RenderFramebufferToPng(tex, flip, png)) {
+    if (!png.empty()) {
         time_t t = time(NULL);
         struct tm *tmp = localtime(&t);
         if (tmp) {
@@ -1053,4 +1051,34 @@ void SaveScreenshot(GLuint tex, bool flip)
         xemu_queue_notification(msg);
         free(msg);
     }
+}
+
+void SaveScreenshot(GLuint tex, bool flip)
+{
+    std::vector<uint8_t> png;
+    if (!RenderFramebufferToPng(tex, flip, png)) {
+        png.clear();
+    }
+    SaveScreenshotPng(png);
+}
+
+void SaveScreenshotBgra(const uint8_t *pixels, unsigned int width,
+                        unsigned int height, unsigned int row_pitch)
+{
+    std::vector<uint8_t> rgb;
+    std::vector<uint8_t> png;
+    if (pixels && width && height && row_pitch >= width * 4) {
+        rgb.resize((size_t)width * height * 3);
+        for (unsigned int y = 0; y < height; y++) {
+            const uint8_t *source = pixels + (size_t)y * row_pitch;
+            uint8_t *destination = rgb.data() + (size_t)y * width * 3;
+            for (unsigned int x = 0; x < width; x++) {
+                destination[x * 3] = source[x * 4 + 2];
+                destination[x * 3 + 1] = source[x * 4 + 1];
+                destination[x * 3 + 2] = source[x * 4];
+            }
+        }
+        fpng::fpng_encode_image_to_memory(rgb.data(), width, height, 3, png);
+    }
+    SaveScreenshotPng(png);
 }

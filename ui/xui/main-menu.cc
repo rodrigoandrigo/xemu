@@ -46,7 +46,9 @@
 
 MainMenuScene g_main_menu;
 
-MainMenuTabView::~MainMenuTabView() {}
+MainMenuTabView::~MainMenuTabView()
+{
+}
 void MainMenuTabView::Draw()
 {
 }
@@ -61,8 +63,9 @@ void MainMenuGeneralView::Draw()
 
 #if defined(__x86_64__)
     SectionTitle("Performance");
-    Toggle("Hard FPU emulation", &g_config.perf.hard_fpu,
-           "Use hardware-accelerated floating point emulation (requires restart)");
+    Toggle(
+        "Hard FPU emulation", &g_config.perf.hard_fpu,
+        "Use hardware-accelerated floating point emulation (requires restart)");
 #endif
 
     Toggle("Cache shaders to disk", &g_config.perf.cache_shaders,
@@ -73,7 +76,8 @@ void MainMenuGeneralView::Draw()
            "Skip the full Xbox boot animation sequence");
     FilePicker("Screenshot output directory", g_config.general.screenshot_dir,
                nullptr, 0, true, [](const char *path) {
-                   xemu_settings_set_string(&g_config.general.screenshot_dir, path);
+                   xemu_settings_set_string(&g_config.general.screenshot_dir,
+                                            path);
                });
     FilePicker("Games directory", g_config.general.games_dir, nullptr, 0, true,
                [](const char *path) {
@@ -115,7 +119,7 @@ void MainMenuInputView::Draw()
     float b_x = 0, b_x_stride = 100, b_y = 400;
     float b_w = 68, b_h = 81;
     // Dimensions of controller (rendered at origin)
-    float controller_width  = 477.0f;
+    float controller_width = 477.0f;
     float controller_height = 395.0f;
     // Dimensions of XMU
     float xmu_x = 0, xmu_x_stride = 256, xmu_y = 0;
@@ -157,14 +161,21 @@ void MainMenuInputView::Draw()
         float x = b_x + i * b_x_stride;
         ImGui::PushStyleColor(ImGuiCol_Button,
                               is_selected ? color_active : color_inactive);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                            g_viewport_mgr.Scale(ImVec2(port_padding, port_padding)));
-        bool activated = ImGui::ImageButton(
-            "port_image_button",
-            id,
-            ImVec2(b_w * g_viewport_mgr.m_scale, b_h * g_viewport_mgr.m_scale),
-            ImVec2(x / t_w, (b_y + b_h) / t_h),
-            ImVec2((x + b_w) / t_w, b_y / t_h));
+        ImGui::PushStyleVar(
+            ImGuiStyleVar_FramePadding,
+            g_viewport_mgr.Scale(ImVec2(port_padding, port_padding)));
+        ImVec2 port_size(b_w * g_viewport_mgr.m_scale,
+                         b_h * g_viewport_mgr.m_scale);
+        bool activated;
+        if (xemu_hud_uses_d3d12()) {
+            char label[16];
+            snprintf(label, sizeof(label), "%d", i + 1);
+            activated = ImGui::Button(label, port_size);
+        } else {
+            activated = ImGui::ImageButton("port_image_button", id, port_size,
+                                           ImVec2(x / t_w, (b_y + b_h) / t_h),
+                                           ImVec2((x + b_w) / t_w, b_y / t_h));
+        }
         ImGui::PopStyleVar();
         ImGui::PopStyleColor();
 
@@ -202,7 +213,7 @@ void MainMenuInputView::Draw()
         driver = DRIVER_S_DISPLAY_NAME;
 
     ImGui::Columns(2, "", false);
-    ImGui::SetColumnWidth(0, ImGui::GetWindowWidth()*0.25);
+    ImGui::SetColumnWidth(0, ImGui::GetWindowWidth() * 0.25);
 
     ImGui::Text("Emulated Device");
     ImGui::SameLine(0, 0);
@@ -215,7 +226,8 @@ void MainMenuInputView::Draw()
         const char *driver_display_names[] = { DRIVER_DUKE_DISPLAY_NAME,
                                                DRIVER_S_DISPLAY_NAME };
         bool is_selected = false;
-        int num_drivers = sizeof(driver_display_names) / sizeof(driver_display_names[0]);
+        int num_drivers =
+            sizeof(driver_display_names) / sizeof(driver_display_names[0]);
         for (int i = 0; i < num_drivers; i++) {
             const char *iter = driver_display_names[i];
             is_selected = strcmp(driver, iter) == 0;
@@ -260,8 +272,8 @@ void MainMenuInputView::Draw()
     }
 
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::BeginCombo("###InputDevices", name, ImGuiComboFlags_NoArrowButton))
-    {
+    if (ImGui::BeginCombo("###InputDevices", name,
+                          ImGuiComboFlags_NoArrowButton)) {
         // Handle "Not connected"
         bool is_selected = bound_state == NULL;
         if (ImGui::Selectable(not_connected, is_selected)) {
@@ -274,13 +286,14 @@ void MainMenuInputView::Draw()
 
         // Handle all available input devices
         ControllerState *iter;
-        QTAILQ_FOREACH(iter, &available_controllers, entry) {
+        QTAILQ_FOREACH (iter, &available_controllers, entry) {
             is_selected = bound_state == iter;
             ImGui::PushID(iter);
             const char *selectable_label = iter->name;
             char buf[128];
             if (iter->bound >= 0) {
-                snprintf(buf, sizeof(buf), "%s (Port %d)", iter->name, iter->bound+1);
+                snprintf(buf, sizeof(buf), "%s (Port %d)", iter->name,
+                         iter->bound + 1);
                 selectable_label = buf;
             }
             if (ImGui::Selectable(selectable_label, is_selected)) {
@@ -330,7 +343,8 @@ void MainMenuInputView::Draw()
     ImVec2 cur = ImGui::GetCursorPos();
 
     ImVec2 controller_display_size;
-    if (ImGui::GetContentRegionMax().x < controller_width*g_viewport_mgr.m_scale) {
+    if (ImGui::GetContentRegionMax().x <
+        controller_width * g_viewport_mgr.m_scale) {
         controller_display_size.x = ImGui::GetContentRegionMax().x;
         controller_display_size.y =
             controller_display_size.x * controller_height / controller_width;
@@ -344,16 +358,19 @@ void MainMenuInputView::Draw()
         ImGui::GetCursorPosX() +
         (int)((ImGui::GetColumnWidth() - controller_display_size.x) / 2.0));
 
-    ImGui::Image(id,
-        controller_display_size,
-        ImVec2(0, controller_height/t_h),
-        ImVec2(controller_width/t_w, 0));
+    if (!xemu_hud_uses_d3d12()) {
+        ImGui::Image(id, controller_display_size,
+                     ImVec2(0, controller_height / t_h),
+                     ImVec2(controller_width / t_w, 0));
+    } else {
+        ImGui::Dummy(controller_display_size);
+    }
     ImVec2 pos = ImGui::GetCursorPos();
     if (!device_selected) {
         const char *msg = "Please select an available input device";
         ImVec2 dim = ImGui::CalcTextSize(msg);
-        ImGui::SetCursorPosX(cur.x + (controller_display_size.x-dim.x)/2);
-        ImGui::SetCursorPosY(cur.y + (controller_display_size.y-dim.y)/2);
+        ImGui::SetCursorPosX(cur.x + (controller_display_size.x - dim.x) / 2);
+        ImGui::SetCursorPosY(cur.y + (controller_display_size.y - dim.y) / 2);
         ImGui::Text("%s", msg);
     }
 
@@ -375,8 +392,7 @@ void MainMenuInputView::Draw()
         id = (ImTextureID)(intptr_t)xmu_fbo->Texture();
 
         static const SDL_DialogFileFilter img_file_filters[] = {
-            { ".img Files", "img" },
-            { "All Files", "*" }
+            { ".img Files", "img" }, { "All Files", "*" }
         };
         const char *comboLabels[2] = { "###ExpansionSlotA",
                                        "###ExpansionSlotB" };
@@ -475,26 +491,34 @@ void MainMenuInputView::Draw()
                     (int)((ImGui::GetColumnWidth() - xmu_display_size.x) /
                           2.0));
 
-                ImGui::Image(id, xmu_display_size, ImVec2(0.5f * i, 1),
-                             ImVec2(0.5f * (i + 1), 0));
+                if (!xemu_hud_uses_d3d12()) {
+                    ImGui::Image(id, xmu_display_size, ImVec2(0.5f * i, 1),
+                                 ImVec2(0.5f * (i + 1), 0));
+                } else {
+                    ImGui::Dummy(xmu_display_size);
+                }
 
                 // Button to generate a new XMU
                 ImGui::PushID(i);
                 if (ImGui::Button("New Image", ImVec2(250, 0))) {
                     int port = active;
                     int slot = i;
-                    ShowSaveFileDialog(img_file_filters, 2, nullptr, [port, slot](const char *new_path) {
-                        if (create_fatx_image(new_path, DEFAULT_XMU_SIZE)) {
-                            // XMU was created successfully. Bind it
-                            xemu_input_bind_xmu(port, slot, new_path, false);
-                        } else {
-                            // Show alert message
-                            char *msg = g_strdup_printf(
-                                "Unable to create XMU image at %s", new_path);
-                            xemu_queue_error_message(msg);
-                            g_free(msg);
-                        }
-                    });
+                    ShowSaveFileDialog(
+                        img_file_filters, 2, nullptr,
+                        [port, slot](const char *new_path) {
+                            if (create_fatx_image(new_path, DEFAULT_XMU_SIZE)) {
+                                // XMU was created successfully. Bind it
+                                xemu_input_bind_xmu(port, slot, new_path,
+                                                    false);
+                            } else {
+                                // Show alert message
+                                char *msg = g_strdup_printf(
+                                    "Unable to create XMU image at %s",
+                                    new_path);
+                                xemu_queue_error_message(msg);
+                                g_free(msg);
+                            }
+                        });
                 }
 
                 int port = active;
@@ -608,26 +632,16 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
     // two keys for the positive and negative direction with the
     // exception of the triggers, which only require one each.
     static constexpr const char *keyboard_stick_index_to_name_map[10] = {
-        "Left Stick Up",
-        "Left Stick Left",
-        "Left Stick Right",
-        "Left Stick Down",
-        "Left Trigger",
-        "Right Stick Up",
-        "Right Stick Left",
-        "Right Stick Right",
-        "Right Stick Down",
+        "Left Stick Up",    "Left Stick Left",   "Left Stick Right",
+        "Left Stick Down",  "Left Trigger",      "Right Stick Up",
+        "Right Stick Left", "Right Stick Right", "Right Stick Down",
         "Right Trigger",
     };
 
     // Must match controller axis map below.
     static constexpr const char *gamepad_axis_index_to_name_map[6] = {
-        "Left Stick Axis X",
-        "Left Stick Axis Y",
-        "Right Stick Axis X",
-        "Right Stick Axis Y",
-        "Left Trigger Axis",
-        "Right Trigger Axis",
+        "Left Stick Axis X",  "Left Stick Axis Y", "Right Stick Axis X",
+        "Right Stick Axis Y", "Left Trigger Axis", "Right Trigger Axis",
     };
 
     bool is_keyboard = state->type == INPUT_DEVICE_SDL_KEYBOARD;
@@ -635,11 +649,11 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
     int num_axis_mappings;
     const char *const *axis_index_to_name_map;
     if (is_keyboard) {
-      num_axis_mappings = std::size(keyboard_stick_index_to_name_map);
-      axis_index_to_name_map = keyboard_stick_index_to_name_map;
+        num_axis_mappings = std::size(keyboard_stick_index_to_name_map);
+        axis_index_to_name_map = keyboard_stick_index_to_name_map;
     } else {
-      num_axis_mappings = std::size(gamepad_axis_index_to_name_map);
-      axis_index_to_name_map = gamepad_axis_index_to_name_map;
+        num_axis_mappings = std::size(gamepad_axis_index_to_name_map);
+        axis_index_to_name_map = gamepad_axis_index_to_name_map;
     }
 
     constexpr int num_face_buttons = std::size(face_button_index_to_name_map);
@@ -651,9 +665,9 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
         ImGui::TableSetColumnIndex(0);
 
         if (i < num_face_buttons) {
-          ImGui::Text("%s", face_button_index_to_name_map[i]);
+            ImGui::Text("%s", face_button_index_to_name_map[i]);
         } else {
-          ImGui::Text("%s", axis_index_to_name_map[i - num_face_buttons]);
+            ImGui::Text("%s", axis_index_to_name_map[i - num_face_buttons]);
         }
 
         // Button Binding Column
@@ -666,72 +680,70 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
 
         const char *remap_button_text = "Invalid";
         if (is_keyboard) {
-          // g_keyboard_scancode_map includes both face buttons and axis buttons.
+            // g_keyboard_scancode_map includes both face buttons and axis
+            // buttons.
             int keycode = *(g_keyboard_scancode_map[i]);
             if (keycode != SDL_SCANCODE_UNKNOWN) {
                 remap_button_text =
                     SDL_GetScancodeName(static_cast<SDL_Scancode>(keycode));
             }
         } else if (i < num_face_buttons) {
-                int *button_map[num_face_buttons] = {
-                    &state->controller_map->controller_mapping.a,
-                    &state->controller_map->controller_mapping.b,
-                    &state->controller_map->controller_mapping.x,
-                    &state->controller_map->controller_mapping.y,
-                    &state->controller_map->controller_mapping.back,
-                    &state->controller_map->controller_mapping.guide,
-                    &state->controller_map->controller_mapping.start,
-                    &state->controller_map->controller_mapping.lstick_btn,
-                    &state->controller_map->controller_mapping.rstick_btn,
-                    &state->controller_map->controller_mapping.lshoulder,
-                    &state->controller_map->controller_mapping.rshoulder,
-                    &state->controller_map->controller_mapping.dpad_up,
-                    &state->controller_map->controller_mapping.dpad_down,
-                    &state->controller_map->controller_mapping.dpad_left,
-                    &state->controller_map->controller_mapping.dpad_right,
-                };
+            int *button_map[num_face_buttons] = {
+                &state->controller_map->controller_mapping.a,
+                &state->controller_map->controller_mapping.b,
+                &state->controller_map->controller_mapping.x,
+                &state->controller_map->controller_mapping.y,
+                &state->controller_map->controller_mapping.back,
+                &state->controller_map->controller_mapping.guide,
+                &state->controller_map->controller_mapping.start,
+                &state->controller_map->controller_mapping.lstick_btn,
+                &state->controller_map->controller_mapping.rstick_btn,
+                &state->controller_map->controller_mapping.lshoulder,
+                &state->controller_map->controller_mapping.rshoulder,
+                &state->controller_map->controller_mapping.dpad_up,
+                &state->controller_map->controller_mapping.dpad_down,
+                &state->controller_map->controller_mapping.dpad_left,
+                &state->controller_map->controller_mapping.dpad_right,
+            };
 
-                int button = *(button_map[i]);
-                if (button != SDL_GAMEPAD_BUTTON_INVALID) {
-                    remap_button_text = SDL_GetGamepadStringForButton(
-                        static_cast<SDL_GamepadButton>(button));
-                }
+            int button = *(button_map[i]);
+            if (button != SDL_GAMEPAD_BUTTON_INVALID) {
+                remap_button_text = SDL_GetGamepadStringForButton(
+                    static_cast<SDL_GamepadButton>(button));
+            }
         } else {
-          int *axis_map[6] = {
-            &state->controller_map->controller_mapping.axis_left_x,
-            &state->controller_map->controller_mapping.axis_left_y,
-            &state->controller_map->controller_mapping.axis_right_x,
-            &state->controller_map->controller_mapping.axis_right_y,
-            &state->controller_map->controller_mapping
-              .axis_trigger_left,
-            &state->controller_map->controller_mapping
-              .axis_trigger_right,
-          };
-          int axis = *(axis_map[i - num_face_buttons]);
-          if (axis != SDL_GAMEPAD_AXIS_INVALID) {
-            remap_button_text = SDL_GetGamepadStringForAxis(
-                static_cast<SDL_GamepadAxis>(axis));
-          }
+            int *axis_map[6] = {
+                &state->controller_map->controller_mapping.axis_left_x,
+                &state->controller_map->controller_mapping.axis_left_y,
+                &state->controller_map->controller_mapping.axis_right_x,
+                &state->controller_map->controller_mapping.axis_right_y,
+                &state->controller_map->controller_mapping.axis_trigger_left,
+                &state->controller_map->controller_mapping.axis_trigger_right,
+            };
+            int axis = *(axis_map[i - num_face_buttons]);
+            if (axis != SDL_GAMEPAD_AXIS_INVALID) {
+                remap_button_text = SDL_GetGamepadStringForAxis(
+                    static_cast<SDL_GamepadAxis>(axis));
+            }
         }
 
         ImGui::PushID(i);
         float tw = ImGui::CalcTextSize(remap_button_text).x;
         auto &style = ImGui::GetStyle();
         float max_button_width =
-          tw + g_viewport_mgr.m_scale * 2 * style.FramePadding.x;
+            tw + g_viewport_mgr.m_scale * 2 * style.FramePadding.x;
 
         float min_button_width = ImGui::GetColumnWidth(1) / 2;
         float button_width = std::max(min_button_width, max_button_width);
 
         if (ImGui::Button(remap_button_text, ImVec2(button_width, 0))) {
-          if (is_keyboard) {
-            m_rebinding =
-              std::make_unique<ControllerKeyboardRebindingMap>(i);
-          } else {
-            m_rebinding =
-              std::make_unique<ControllerGamepadRebindingMap>(i,
-                  state);
-          }
+            if (is_keyboard) {
+                m_rebinding =
+                    std::make_unique<ControllerKeyboardRebindingMap>(i);
+            } else {
+                m_rebinding =
+                    std::make_unique<ControllerGamepadRebindingMap>(i, state);
+            }
         }
         ImGui::PopID();
     }
@@ -761,7 +773,7 @@ void MainMenuDisplayView::Draw()
                      "9x\0"
                      "10x\0",
                      "Increase surface scaling factor for higher quality")) {
-        nv2a_set_surface_scale_factor(rendering_scale+1);
+        nv2a_set_surface_scale_factor(rendering_scale + 1);
     }
 
     SectionTitle("Window");
@@ -805,8 +817,10 @@ void MainMenuDisplayView::Draw()
         ui_scale_idx = 0;
     } else {
         ui_scale_idx = g_config.display.ui.scale;
-        if (ui_scale_idx < 1) ui_scale_idx = 1;
-        else if (ui_scale_idx > 2) ui_scale_idx = 2;
+        if (ui_scale_idx < 1)
+            ui_scale_idx = 1;
+        else if (ui_scale_idx > 2)
+            ui_scale_idx = 2;
     }
     if (ChevronCombo("UI scale", &ui_scale_idx,
                      "Auto\0"
@@ -822,11 +836,12 @@ void MainMenuDisplayView::Draw()
     }
     Toggle("Animations", &g_config.display.ui.use_animations,
            "Enable xemu user interface animations");
-    ChevronCombo("Display mode", &g_config.display.ui.fit,
-                 "Center\0"
-                 "Scale\0"
-                 "Stretch\0",
-                 "Select how the framebuffer should fit or scale into the window");
+    ChevronCombo(
+        "Display mode", &g_config.display.ui.fit,
+        "Center\0"
+        "Scale\0"
+        "Stretch\0",
+        "Select how the framebuffer should fit or scale into the window");
     ChevronCombo("Aspect ratio", &g_config.display.ui.aspect_ratio,
                  "Native\0"
                  "Auto (Default)\0"
@@ -846,9 +861,7 @@ void MainMenuAudioView::Draw()
     SectionTitle("Quality");
     Toggle("Real-time DSP processing", &g_config.audio.use_dsp,
            "Enable improved audio accuracy (experimental)");
-    Toggle("DSP JIT engine", &g_config.audio.use_dsp_jit,
-           "Use DSP JIT engine");
-
+    Toggle("DSP JIT engine", &g_config.audio.use_dsp_jit, "Use DSP JIT engine");
 }
 
 NetworkInterface::NetworkInterface(pcap_if_t *pcap_desc, char *_friendlyname)
@@ -900,7 +913,7 @@ void NetworkInterfaceManager::Refresh(void)
         return;
     }
 
-    for (iter=alldevs; iter != NULL; iter=iter->next) {
+    for (iter = alldevs; iter != NULL; iter = iter->next) {
 #if defined(_WIN32)
         char *friendly_name = get_windows_interface_friendly_name(iter->name);
         m_ifaces.emplace_back(new NetworkInterface(iter, friendly_name));
@@ -953,7 +966,8 @@ void MainMenuNetworkView::Draw()
     }
 
     bool appearing = ImGui::IsWindowAppearing();
-    if (enabled) ImGui::BeginDisabled();
+    if (enabled)
+        ImGui::BeginDisabled();
     if (ChevronCombo(
             "Attached to", &g_config.net.backend,
             "NAT\0"
@@ -973,9 +987,11 @@ void MainMenuNetworkView::Draw()
     case CONFIG_NET_BACKEND_UDP:
         DrawUdpOptions(appearing);
         break;
-    default: break;
+    default:
+        break;
     }
-    if (enabled) ImGui::EndDisabled();
+    if (enabled)
+        ImGui::EndDisabled();
 }
 
 void MainMenuNetworkView::DrawPcapOptions(bool appearing)
@@ -990,9 +1006,11 @@ void MainMenuNetworkView::DrawPcapOptions(bool appearing)
         const char *msg = "npcap library could not be loaded.\n"
                           "To use this backend, please install npcap.";
         ImGui::Text("%s", msg);
-        ImGui::Dummy(ImVec2(0,10*g_viewport_mgr.m_scale));
-        ImGui::SetCursorPosX((ImGui::GetWindowWidth()-120*g_viewport_mgr.m_scale)/2);
-        if (ImGui::Button("Install npcap", ImVec2(120*g_viewport_mgr.m_scale, 0))) {
+        ImGui::Dummy(ImVec2(0, 10 * g_viewport_mgr.m_scale));
+        ImGui::SetCursorPosX(
+            (ImGui::GetWindowWidth() - 120 * g_viewport_mgr.m_scale) / 2);
+        if (ImGui::Button("Install npcap",
+                          ImVec2(120 * g_viewport_mgr.m_scale, 0))) {
             SDL_OpenURL("https://nmap.org/npcap/");
         }
 #endif
@@ -1024,7 +1042,8 @@ void MainMenuNetworkView::DrawPcapOptions(bool appearing)
                                       is_selected)) {
                     iface_mgr->Select((*iface));
                 }
-                if (is_selected) ImGui::SetItemDefaultFocus();
+                if (is_selected)
+                    ImGui::SetItemDefaultFocus();
                 ImGui::PopID();
             }
             ImGui::EndCombo();
@@ -1038,22 +1057,22 @@ void MainMenuNetworkView::DrawPcapOptions(bool appearing)
 
 void MainMenuNetworkView::DrawNatOptions(bool appearing)
 {
-    static ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg;
+    static ImGuiTableFlags flags =
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg;
     WidgetTitleDescriptionItem(
         "Port Forwarding",
         "Configure xemu to forward connections to guest on these ports");
     float p = ImGui::GetFrameHeight() * 0.3;
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(p, p));
-    if (ImGui::BeginTable("port_forward_tbl", 4, flags))
-    {
+    if (ImGui::BeginTable("port_forward_tbl", 4, flags)) {
         ImGui::TableSetupColumn("Host Port");
         ImGui::TableSetupColumn("Guest Port");
         ImGui::TableSetupColumn("Protocol");
         ImGui::TableSetupColumn("Action");
         ImGui::TableHeadersRow();
 
-        for (unsigned int row = 0; row < g_config.net.nat.forward_ports_count; row++)
-        {
+        for (unsigned int row = 0; row < g_config.net.nat.forward_ports_count;
+             row++) {
             ImGui::TableNextRow();
 
             ImGui::TableSetColumnIndex(0);
@@ -1065,10 +1084,13 @@ void MainMenuNetworkView::DrawNatOptions(bool appearing)
             ImGui::TableSetColumnIndex(2);
             switch (g_config.net.nat.forward_ports[row].protocol) {
             case CONFIG_NET_NAT_FORWARD_PORTS_PROTOCOL_TCP:
-                ImGui::TextUnformatted("TCP"); break;
+                ImGui::TextUnformatted("TCP");
+                break;
             case CONFIG_NET_NAT_FORWARD_PORTS_PROTOCOL_UDP:
-                ImGui::TextUnformatted("UDP"); break;
-            default: assert(0);
+                ImGui::TextUnformatted("UDP");
+                break;
+            default:
+                assert(0);
             }
 
             ImGui::TableSetColumnIndex(3);
@@ -1082,12 +1104,12 @@ void MainMenuNetworkView::DrawNatOptions(bool appearing)
         ImGui::TableNextRow();
 
         ImGui::TableSetColumnIndex(0);
-        static char buf[8] = {"1234"};
+        static char buf[8] = { "1234" };
         ImGui::SetNextItemWidth(ImGui::GetColumnWidth());
         ImGui::InputText("###hostport", buf, sizeof(buf));
 
         ImGui::TableSetColumnIndex(1);
-        static char buf2[8] = {"1234"};
+        static char buf2[8] = { "1234" };
         ImGui::SetNextItemWidth(ImGui::GetColumnWidth());
         ImGui::InputText("###guestport", buf2, sizeof(buf2));
 
@@ -1221,7 +1243,9 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
                thumbnail_min.y + (thumbnail_size.y - scaled_height) / 2);
     ImVec2 img_max =
         ImVec2(img_min.x + scaled_width, img_min.y + scaled_height);
-    draw_list->AddImage((ImTextureID)(uint64_t)thumbnail, img_min, img_max);
+    if (!xemu_hud_uses_d3d12()) {
+        draw_list->AddImage((ImTextureID)(uint64_t)thumbnail, img_min, img_max);
+    }
 
     // Snapshot title
     ImGui::PushFont(g_font_mgr.m_menu_font_medium);
@@ -1522,13 +1546,10 @@ MainMenuSystemView::MainMenuSystemView() : m_dirty(false)
 void MainMenuSystemView::Draw()
 {
     static const SDL_DialogFileFilter rom_file_filters[] = {
-        { ".bin Files", "bin" },
-        { ".rom Files", "rom" },
-        { "All Files", "*" }
+        { ".bin Files", "bin" }, { ".rom Files", "rom" }, { "All Files", "*" }
     };
     static const SDL_DialogFileFilter qcow_file_filters[] = {
-        { ".qcow2 Files", "qcow2" },
-        { "All Files", "*" }
+        { ".qcow2 Files", "qcow2" }, { "All Files", "*" }
     };
 
     if (m_dirty) {
@@ -1537,7 +1558,8 @@ void MainMenuSystemView::Draw()
     }
 
     if ((int)g_config.sys.avpack == CONFIG_SYS_AVPACK_NONE) {
-        ImGui::TextColored(ImVec4(1,0,0,1), "Setting AV Pack to NONE disables video output.");
+        ImGui::TextColored(ImVec4(1, 0, 0, 1),
+                           "Setting AV Pack to NONE disables video output.");
     }
 
     SectionTitle("System Configuration");
@@ -1560,24 +1582,27 @@ void MainMenuSystemView::Draw()
     SectionTitle("Files");
     FilePicker("MCPX Boot ROM", g_config.sys.files.bootrom_path,
                rom_file_filters, 3, false, [this](const char *path) {
-                   xemu_settings_set_string(&g_config.sys.files.bootrom_path, path);
+                   xemu_settings_set_string(&g_config.sys.files.bootrom_path,
+                                            path);
                    m_dirty = true;
                    g_main_menu.UpdateAboutViewConfigInfo();
                });
     FilePicker("Flash ROM (BIOS)", g_config.sys.files.flashrom_path,
                rom_file_filters, 3, false, [this](const char *path) {
-                   xemu_settings_set_string(&g_config.sys.files.flashrom_path, path);
+                   xemu_settings_set_string(&g_config.sys.files.flashrom_path,
+                                            path);
                    m_dirty = true;
                    g_main_menu.UpdateAboutViewConfigInfo();
                });
-    FilePicker("Hard Disk", g_config.sys.files.hdd_path,
-               qcow_file_filters, 2, false, [this](const char *path) {
+    FilePicker("Hard Disk", g_config.sys.files.hdd_path, qcow_file_filters, 2,
+               false, [this](const char *path) {
                    xemu_settings_set_string(&g_config.sys.files.hdd_path, path);
                    m_dirty = true;
                });
-    FilePicker("EEPROM", g_config.sys.files.eeprom_path,
-               rom_file_filters, 3, false, [this](const char *path) {
-                   xemu_settings_set_string(&g_config.sys.files.eeprom_path, path);
+    FilePicker("EEPROM", g_config.sys.files.eeprom_path, rom_file_filters, 3,
+               false, [this](const char *path) {
+                   xemu_settings_set_string(&g_config.sys.files.eeprom_path,
+                                            path);
                    m_dirty = true;
                });
 }
@@ -1615,11 +1640,10 @@ void MainMenuAboutView::Draw()
 {
     static const char *build_info_text = NULL;
     if (build_info_text == NULL) {
-        build_info_text =
-            g_strdup_printf("Version:      %s\n"
-                            "Commit:       %s\n"
-                            "Date:         %s",
-                            xemu_version, xemu_commit, xemu_date);
+        build_info_text = g_strdup_printf("Version:      %s\n"
+                                          "Commit:       %s\n"
+                                          "Date:         %s",
+                                          xemu_version, xemu_commit, xemu_date);
     }
 
     static const char *sys_info_text = NULL;

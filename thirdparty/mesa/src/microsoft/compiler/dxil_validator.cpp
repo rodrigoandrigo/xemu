@@ -323,11 +323,26 @@ dxil_validate_module(struct dxil_validator *val, void *data, size_t size, char *
    ShaderBlob source(data, size);
 
    ComPtr<IDxcOperationResult> result;
-   val->dxc_validator->Validate(&source, DxcValidatorFlags_InPlaceEdit,
-                                &result);
+   HRESULT call_hr = val->dxc_validator->Validate(
+      &source, DxcValidatorFlags_InPlaceEdit, &result);
+   if (FAILED(call_hr) || !result) {
+      if (error)
+         *error = ralloc_asprintf(val,
+                                  "IDxcValidator::Validate failed (0x%08lx)",
+                                  (unsigned long)call_hr);
+      return false;
+   }
 
    HRESULT hr;
-   result->GetStatus(&hr);
+   call_hr = result->GetStatus(&hr);
+   if (FAILED(call_hr)) {
+      if (error)
+         *error = ralloc_asprintf(val,
+                                  "IDxcOperationResult::GetStatus failed "
+                                  "(0x%08lx)",
+                                  (unsigned long)call_hr);
+      return false;
+   }
 
    if (FAILED(hr) && error) {
       /* try to resolve error message */

@@ -25,10 +25,13 @@
 
 #include <SDL3/SDL.h>
 #include <epoxy/gl.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define XEMU_HUD_D3D12_DESCRIPTOR_COUNT 1024
 
 // Implemented in xemu.c
 int xemu_is_fullscreen(void);
@@ -47,6 +50,21 @@ void xemu_hud_render(void);
 void xemu_hud_process_sdl_events(SDL_Event *event);
 void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
 void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip);
+bool xemu_hud_uses_d3d12(void);
+bool xemu_hud_d3d12_is_initialized(void);
+bool xemu_hud_d3d12_init(void *device, void *command_queue,
+                         void *srv_descriptor_heap,
+                         uintptr_t font_srv_cpu_handle,
+                         uint64_t font_srv_gpu_handle,
+                         unsigned int frames_in_flight,
+                         unsigned int render_target_format);
+void xemu_hud_d3d12_shutdown(void);
+void xemu_hud_d3d12_prepare_frame(void);
+void xemu_hud_d3d12_render(void *command_list);
+void xemu_hud_d3d12_capture_frame(const void *bgra, unsigned int width,
+                                  unsigned int height,
+                                  unsigned int row_pitch);
+void xemu_hud_opengl_activate(void *sdl_gl_context);
 
 #ifdef __cplusplus
 }

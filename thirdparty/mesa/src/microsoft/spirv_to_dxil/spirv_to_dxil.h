@@ -192,6 +192,13 @@ struct dxil_spirv_runtime_conf {
    // Force sample rate shading on a fragment shader
    bool force_sample_rate_shading;
 
+   /* Preserve this many Vulkan generic input/output locations as DXIL
+    * TEXCOORD semantic indices and signature rows when stages are compiled
+    * independently. Normally the pipeline linker compacts both sides
+    * together; standalone callers must opt out of per-stage compaction or
+    * sparse interfaces will not link. Zero keeps the default behavior. */
+   uint32_t preserve_generic_io_location_count;
+
    // View index needs to be lowered to a UBO lookup
    bool lower_view_index;
    // View index also needs to be forwarded to RT layer output
@@ -240,6 +247,14 @@ spirv_to_dxil(const uint32_t *words, size_t word_count,
  */
 void
 spirv_to_dxil_free(struct dxil_spirv_object *dxil);
+
+/**
+ * Validate and sign a DXIL container in place with the platform validator.
+ * The generated container is intentionally unsigned until this succeeds.
+ */
+bool
+spirv_to_dxil_validate(void *data, size_t size, char *error,
+                       size_t error_size);
 
 uint64_t
 spirv_to_dxil_get_version(void);

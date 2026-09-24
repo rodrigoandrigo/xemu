@@ -32,6 +32,9 @@
 #include <stb_image.h>
 
 #include "qemu/osdep.h"
+#ifdef CONFIG_UWP
+#include <imgui_impl_dx12.h>
+#endif
 
 extern "C" {
 // Include necessary QEMU headers

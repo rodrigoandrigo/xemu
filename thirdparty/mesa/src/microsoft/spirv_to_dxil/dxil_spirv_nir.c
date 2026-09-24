@@ -996,6 +996,42 @@ merge_ubos_and_ssbos(nir_shader *nir)
    return progress;
 }
 
+static void
+preserve_generic_io_locations(nir_shader *nir, nir_variable_mode modes,
+                              unsigned declared_location_count)
+{
+   unsigned generic_span = declared_location_count;
+   nir_foreach_variable_with_modes(var, nir, modes) {
+      if (var->data.location < VARYING_SLOT_VAR0 ||
+          var->data.location > VARYING_SLOT_VAR31)
+         continue;
+
+      const struct glsl_type *type = var->type;
+      if (nir_is_arrayed_io(var, nir->info.stage) && glsl_type_is_array(type))
+         type = glsl_get_array_element(type);
+      generic_span = MAX2(generic_span,
+                          var->data.location - VARYING_SLOT_VAR0 +
+                          glsl_count_vec4_slots(type, false, false));
+   }
+
+   unsigned system_location = generic_span;
+   nir_foreach_variable_with_modes(var, nir, modes) {
+      if (var->data.location >= VARYING_SLOT_VAR0 &&
+          var->data.location <= VARYING_SLOT_VAR31) {
+         var->data.driver_location =
+            var->data.location - VARYING_SLOT_VAR0;
+         continue;
+      }
+
+      var->data.driver_location = system_location;
+      const struct glsl_type *type = var->type;
+      if (nir_is_arrayed_io(var, nir->info.stage) && glsl_type_is_array(type))
+         type = glsl_get_array_element(type);
+      system_location += glsl_count_vec4_slots(type, false, false);
+   }
+   dxil_sort_by_driver_location(nir, modes);
+}
+
 void
 dxil_spirv_nir_passes(nir_shader *nir,
                       const struct dxil_spirv_runtime_conf *conf,
@@ -1231,6 +1267,10 @@ dxil_spirv_nir_passes(nir_shader *nir,
        * pipeline. The real linking happens in dxil_spirv_nir_link().
        */
       dxil_reassign_driver_locations(nir, nir_var_shader_out, 0, NULL);
+      if (conf->preserve_generic_io_location_count)
+         preserve_generic_io_locations(
+            nir, nir_var_shader_out,
+            conf->preserve_generic_io_location_count);
    }
 
    if (nir->info.stage == MESA_SHADER_VERTEX) {
@@ -1243,6 +1283,10 @@ dxil_spirv_nir_passes(nir_shader *nir,
       dxil_sort_by_driver_location(nir, nir_var_shader_in);
    } else {
       dxil_reassign_driver_locations(nir, nir_var_shader_in, 0, NULL);
+      if (conf->preserve_generic_io_location_count)
+         preserve_generic_io_locations(
+            nir, nir_var_shader_in,
+            conf->preserve_generic_io_location_count);
    }
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));

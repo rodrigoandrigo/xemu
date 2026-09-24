@@ -22,9 +22,11 @@
 #include "font-manager.hh"
 #include "input-manager.hh"
 #include "viewport-manager.hh"
+#include "xemu-hud.h"
 
-BackgroundGradient::BackgroundGradient()
-: m_animation(0.2, 0.2) {}
+BackgroundGradient::BackgroundGradient() : m_animation(0.2, 0.2)
+{
+}
 
 void BackgroundGradient::Show()
 {
@@ -46,16 +48,20 @@ void BackgroundGradient::Draw()
     m_animation.Step();
 
     float a = m_animation.GetSinInterpolatedValue();
-    ImU32 top_color = ImGui::GetColorU32(ImVec4(0,0,0,a));
-    ImU32 bottom_color = ImGui::GetColorU32(ImVec4(0,0,0,fmax(0, fmin(a-0.125, 0.125))));
+    ImU32 top_color = ImGui::GetColorU32(ImVec4(0, 0, 0, a));
+    ImU32 bottom_color =
+        ImGui::GetColorU32(ImVec4(0, 0, 0, fmax(0, fmin(a - 0.125, 0.125))));
 
     ImGuiIO &io = ImGui::GetIO();
     auto dl = ImGui::GetBackgroundDrawList();
-    dl->AddRectFilledMultiColor(ImVec2(0, 0), io.DisplaySize, top_color, top_color, bottom_color, bottom_color);
+    dl->AddRectFilledMultiColor(ImVec2(0, 0), io.DisplaySize, top_color,
+                                top_color, bottom_color, bottom_color);
 }
 
 NavControlItem::NavControlItem(std::string icon, std::string text)
-: m_icon(icon), m_text(text) {}
+    : m_icon(icon), m_text(text)
+{
+}
 
 void NavControlItem::Draw()
 {
@@ -65,8 +71,7 @@ void NavControlItem::Draw()
     ImGui::PopFont();
 }
 
-NavControlAnnotation::NavControlAnnotation()
-: m_animation(0.12,0.12)
+NavControlAnnotation::NavControlAnnotation() : m_animation(0.12, 0.12)
 {
     m_show = false;
     m_visible = false;
@@ -126,7 +131,8 @@ void NavControlAnnotation::Draw()
                          ImGuiWindowFlags_NoInputs)) {
         int i = 0;
         for (auto &button : m_items) {
-            if (i++) ImGui::SameLine();
+            if (i++)
+                ImGui::SameLine();
             button.Draw();
         }
     }
@@ -259,7 +265,14 @@ public:
             ImVec2 p0 = ImGui::GetItemRectMin();
             ImVec2 p1 = ImGui::GetItemRectMax();
             ImDrawList *draw_list = ImGui::GetWindowDrawList();
-            draw_list->AddImageRounded((ImTextureID)screenshot, p0, p1, ImVec2(0, 0), ImVec2(1, 1), ImGui::GetColorU32(ImVec4(1,1,1,m_animation.getSinInterpolatedValue())), 3*g_viewport_mgr.m_scale);
+            if (!xemu_hud_uses_d3d12()) {
+                draw_list->AddImageRounded(
+                    (ImTextureID)screenshot, p0, p1, ImVec2(0, 0),
+                    ImVec2(1, 1),
+                    ImGui::GetColorU32(ImVec4(
+                        1, 1, 1, m_animation.getSinInterpolatedValue())),
+                    3 * g_viewport_mgr.m_scale);
+            }
 
             ImGui::NextColumn();
 

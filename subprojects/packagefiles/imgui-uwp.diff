@@ -29,6 +29,15 @@ index e2f7992..defd5e6 100644
  # if host_machine.system() == 'darwin'
  #   add_languages('objcpp')
  # endif
+@@ -45,8 +49,7 @@ if dx11_dep.found()
+ endif
+ dx12_dep = cpp.find_library('d3d12', required: get_option('dx12'))
+-# MinGW does not work. See https://github.com/ocornut/imgui/pull/4604
+-if dx12_dep.found() and cpp.get_argument_syntax() == 'msvc'
++if dx12_dep.found()
+   sources += 'backends/imgui_impl_dx12.cpp'
+   dependencies += dx12_dep
+ endif
 diff --git a/meson_options.txt b/meson_options.txt
 index d594168..73f3084 100644
 --- a/meson_options.txt
@@ -41,4 +50,25 @@ index d594168..73f3084 100644
  
  # frameworks (renderer + platform)
  option('allegro5', type : 'feature', value : 'auto')
-
+diff --git a/backends/imgui_impl_dx12.cpp b/backends/imgui_impl_dx12.cpp
+index 940f601..b46b2d1 100644
+--- a/backends/imgui_impl_dx12.cpp
++++ b/backends/imgui_impl_dx12.cpp
+@@ -519,6 +519,9 @@ bool ImGui_ImplDX12_CreateDeviceObjects()
+ 
+         // Load d3d12.dll and D3D12SerializeRootSignature() function address dynamically to facilitate using with D3D12On7.
+         // See if any version of d3d12.dll is already loaded in the process. If so, give preference to that.
++#ifdef XBOX
++        PFN_D3D12_SERIALIZE_ROOT_SIGNATURE D3D12SerializeRootSignatureFn = D3D12SerializeRootSignature;
++#else
+         static HINSTANCE d3d12_dll = ::GetModuleHandleA("d3d12.dll");
+         if (d3d12_dll == nullptr)
+         {
+@@ -543,6 +546,7 @@ bool ImGui_ImplDX12_CreateDeviceObjects()
+         PFN_D3D12_SERIALIZE_ROOT_SIGNATURE D3D12SerializeRootSignatureFn = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)::GetProcAddress(d3d12_dll, "D3D12SerializeRootSignature");
+         if (D3D12SerializeRootSignatureFn == nullptr)
+             return false;
++#endif
+ 
+         ID3DBlob* blob = nullptr;
+         if (D3D12SerializeRootSignatureFn(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr) != S_OK)

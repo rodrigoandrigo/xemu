@@ -18,6 +18,7 @@
 //
 #include "font-manager.hh"
 #include "viewport-manager.hh"
+#include "xemu-hud.h"
 
 #include "data/Roboto-Medium.ttf.h"
 #include "data/RobotoCondensed-Regular.ttf.h"
@@ -46,8 +47,8 @@ void FontManager::Rebuild()
         config.FontDataOwnedByAtlas = false;
         config.RasterizerDensity = pixel_density;
         m_default_font = io.Fonts->AddFontFromMemoryTTF(
-            (void *)Roboto_Medium_data, Roboto_Medium_size,
-            16.0f * scale, &config);
+            (void *)Roboto_Medium_data, Roboto_Medium_size, 16.0f * scale,
+            &config);
         m_menu_font_small = io.Fonts->AddFontFromMemoryTTF(
             (void *)RobotoCondensed_Regular_data, RobotoCondensed_Regular_size,
             22.0f * scale, &config);
@@ -57,13 +58,11 @@ void FontManager::Rebuild()
         config.FontDataOwnedByAtlas = false;
         config.RasterizerDensity = pixel_density;
         config.MergeMode = true;
-        config.GlyphOffset =
-            ImVec2(0, 13 * scale);
+        config.GlyphOffset = ImVec2(0, 13 * scale);
         config.GlyphMaxAdvanceX = 24.0f * scale;
         static const ImWchar icon_ranges[] = { 0xf900, 0xf903, 0 };
         io.Fonts->AddFontFromMemoryTTF((void *)abxy_data, abxy_size,
-                                       40.0f * scale,
-                                       &config, icon_ranges);
+                                       40.0f * scale, &config, icon_ranges);
     }
     {
         ImFontConfig config;
@@ -81,14 +80,13 @@ void FontManager::Rebuild()
         config.FontDataOwnedByAtlas = false;
         config.RasterizerDensity = pixel_density;
         config.MergeMode = true;
-        config.GlyphOffset =
-            ImVec2(0, -3 * scale);
+        config.GlyphOffset = ImVec2(0, -3 * scale);
         config.GlyphMinAdvanceX = 32.0f * scale;
         static const ImWchar icon_ranges[] = { ICON_MIN_FA, ICON_MAX_FA, 0 };
-        io.Fonts->AddFontFromMemoryTTF((void *)font_awesome_6_1_1_solid_min_data,
-                                       font_awesome_6_1_1_solid_min_size,
-                                       18.0f * scale,
-                                       &config, icon_ranges);
+        io.Fonts->AddFontFromMemoryTTF(
+            (void *)font_awesome_6_1_1_solid_min_data,
+            font_awesome_6_1_1_solid_min_size, 18.0f * scale, &config,
+            icon_ranges);
     }
     {
         ImFontConfig config = ImFontConfig();
@@ -99,8 +97,17 @@ void FontManager::Rebuild()
         m_fixed_width_font = io.Fonts->AddFontDefault(&config);
     }
 
-    ImGui_ImplOpenGL3_DestroyFontsTexture();
-    ImGui_ImplOpenGL3_CreateFontsTexture();
+    if (xemu_hud_uses_d3d12()) {
+#ifdef CONFIG_UWP
+        if (xemu_hud_d3d12_is_initialized()) {
+            ImGui_ImplDX12_InvalidateDeviceObjects();
+            ImGui_ImplDX12_CreateDeviceObjects();
+        }
+#endif
+    } else {
+        ImGui_ImplOpenGL3_DestroyFontsTexture();
+        ImGui_ImplOpenGL3_CreateFontsTexture();
+    }
 }
 
 void FontManager::Update()

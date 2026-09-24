@@ -53,4 +53,6 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip);
 void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[2]);
 bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, int max_width = 0, int max_height = 0);
 void SaveScreenshot(GLuint tex, bool flip);
+void SaveScreenshotBgra(const uint8_t *pixels, unsigned int width,
+                        unsigned int height, unsigned int row_pitch);
 void ScaleDimensions(int src_width, int src_height, int max_width, int max_height, int *out_width, int *out_height);

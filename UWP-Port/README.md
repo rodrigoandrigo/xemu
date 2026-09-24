@@ -139,7 +139,7 @@ UWP-Port/AppPackages/UWP-Port/<package-version>_x64_Test/
 Increment the four-part `Identity Version` in `Package.appxmanifest` before
 creating an update for an already installed PC or Xbox package.
 
-The current source manifest version is `1.0.0.100`.
+The current source manifest version is `1.0.0.110`.
 
 ## GitHub Actions
 

@@ -321,6 +321,10 @@
       <Link>vulkan_dzn.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="..\build-uwp\mesa\src\microsoft\spirv_to_dxil\spirv_to_dxil.dll">
+      <Link>spirv_to_dxil.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="$(SDL3UwpRoot)\VisualC-WinRT\x64\$(Configuration)\SDL-UWP\SDL3.dll">
       <Link>SDL3.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

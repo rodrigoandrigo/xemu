@@ -176,8 +176,7 @@ static void window_resize(struct xemu_console *scon)
         return;
     }
 
-    SDL_SetWindowSize(scon->real_window,
-                      surface_width(scon->surface),
+    SDL_SetWindowSize(scon->real_window, surface_width(scon->surface),
                       surface_height(scon->surface));
 }
 
@@ -205,8 +204,8 @@ static void show_cursor(struct xemu_console *scon)
         SDL_SetWindowRelativeMouseMode(scon->real_window, false);
     }
 
-    if (guest_cursor &&
-        (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled)) {
+    if (guest_cursor && (gui_grab || qemu_input_is_absolute(scon->dcl.con) ||
+                         absolute_enabled)) {
         SDL_SetCursor(guest_sprite);
     } else {
         SDL_SetCursor(sdl_cursor_normal);
@@ -233,8 +232,8 @@ static void absolute_mouse_grab(struct xemu_console *scon)
     int scr_w, scr_h;
     SDL_GetMouseState(&mouse_x, &mouse_y);
     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
-    if (mouse_x > 0 && mouse_x < scr_w - 1 &&
-        mouse_y > 0 && mouse_y < scr_h - 1) {
+    if (mouse_x > 0 && mouse_x < scr_w - 1 && mouse_y > 0 &&
+        mouse_y < scr_h - 1) {
         grab_start(scon);
     }
 }
@@ -255,13 +254,13 @@ static void mouse_mode_change(Notifier *notify, void *data)
     }
 }
 
-static void send_mouse_event(struct xemu_console *scon, int dx, int dy,
-                                 int x, int y, int state)
+static void send_mouse_event(struct xemu_console *scon, int dx, int dy, int x,
+                             int y, int state)
 {
     static uint32_t bmap[INPUT_BUTTON__MAX] = {
-        [INPUT_BUTTON_LEFT]       = SDL_BUTTON_MASK(SDL_BUTTON_LEFT),
-        [INPUT_BUTTON_MIDDLE]     = SDL_BUTTON_MASK(SDL_BUTTON_MIDDLE),
-        [INPUT_BUTTON_RIGHT]      = SDL_BUTTON_MASK(SDL_BUTTON_RIGHT),
+        [INPUT_BUTTON_LEFT] = SDL_BUTTON_MASK(SDL_BUTTON_LEFT),
+        [INPUT_BUTTON_MIDDLE] = SDL_BUTTON_MASK(SDL_BUTTON_MIDDLE),
+        [INPUT_BUTTON_RIGHT] = SDL_BUTTON_MASK(SDL_BUTTON_RIGHT),
     };
     static uint32_t prev_state;
 
@@ -271,10 +270,10 @@ static void send_mouse_event(struct xemu_console *scon, int dx, int dy,
     }
 
     if (qemu_input_is_absolute(scon->dcl.con)) {
-        qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_X,
-                             x, 0, surface_width(scon->surface));
-        qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_Y,
-                             y, 0, surface_height(scon->surface));
+        qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_X, x, 0,
+                             surface_width(scon->surface));
+        qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_Y, y, 0,
+                             surface_height(scon->surface));
     } else {
         if (guest_cursor) {
             x -= guest_x;
@@ -303,14 +302,20 @@ static void set_full_screen(struct xemu_console *scon, bool set)
                 int num_modes = 0;
                 modes = SDL_GetFullscreenDisplayModes(display, &num_modes);
                 if (modes && num_modes > 0) {
-                    // First mode is the highest resolution, typically the native resolution
+                    // First mode is the highest resolution, typically the
+                    // native resolution
                     mode = modes[0];
                 }
             }
             if (mode) {
-                fprintf(stderr, "Selected exclusive fullscreen mode: %dx%d pixel_density=%f refresh_rate=%f\n", mode->w, mode->h, mode->pixel_density, mode->refresh_rate);
+                fprintf(stderr,
+                        "Selected exclusive fullscreen mode: %dx%d "
+                        "pixel_density=%f refresh_rate=%f\n",
+                        mode->w, mode->h, mode->pixel_density,
+                        mode->refresh_rate);
             } else {
-                fprintf(stderr, "Failed to get fullscreen display mode: %s\n", SDL_GetError());
+                fprintf(stderr, "Failed to get fullscreen display mode: %s\n",
+                        SDL_GetError());
             }
         }
         SDL_SetWindowFullscreenMode(scon->real_window, mode);
@@ -347,7 +352,7 @@ static int get_mod_state(void)
 
     if (alt_grab) {
         return (mod & (gui_grab_code | SDL_KMOD_LSHIFT)) ==
-            (gui_grab_code | SDL_KMOD_LSHIFT);
+               (gui_grab_code | SDL_KMOD_LSHIFT);
     } else if (ctrl_grab) {
         return (mod & SDL_KMOD_RCTRL) == SDL_KMOD_RCTRL;
     } else {
@@ -370,7 +375,8 @@ static void handle_keydown(SDL_Event *ev)
 {
     int win;
     struct xemu_console *scon = get_scon_from_window(ev->key.windowID);
-    if (scon == NULL) return;
+    if (scon == NULL)
+        return;
     int gui_key_modifier_pressed = get_mod_state();
     int gui_keysym = 0;
 
@@ -429,7 +435,8 @@ static void handle_keydown(SDL_Event *ev)
 static void handle_keyup(SDL_Event *ev)
 {
     struct xemu_console *scon = get_scon_from_window(ev->key.windowID);
-    if (!scon) return;
+    if (!scon)
+        return;
 
     scon->ignore_hotkeys = false;
     process_key(scon, &ev->key);
@@ -449,20 +456,19 @@ static void handle_mousemotion(SDL_Event *ev)
         SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
         max_x = scr_w - 1;
         max_y = scr_h - 1;
-        if (gui_grab && !gui_fullscreen
-            && (ev->motion.x == 0 || ev->motion.y == 0 ||
-                ev->motion.x == max_x || ev->motion.y == max_y)) {
+        if (gui_grab && !gui_fullscreen &&
+            (ev->motion.x == 0 || ev->motion.y == 0 || ev->motion.x == max_x ||
+             ev->motion.y == max_y)) {
             grab_end(scon);
         }
-        if (!gui_grab &&
-            (ev->motion.x > 0 && ev->motion.x < max_x &&
-             ev->motion.y > 0 && ev->motion.y < max_y)) {
+        if (!gui_grab && (ev->motion.x > 0 && ev->motion.x < max_x &&
+                          ev->motion.y > 0 && ev->motion.y < max_y)) {
             grab_start(scon);
         }
     }
     if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
-        send_mouse_event(scon, ev->motion.xrel, ev->motion.yrel,
-                             ev->motion.x, ev->motion.y, ev->motion.state);
+        send_mouse_event(scon, ev->motion.xrel, ev->motion.yrel, ev->motion.x,
+                         ev->motion.y, ev->motion.state);
     }
 }
 
@@ -478,7 +484,8 @@ static void handle_mousebutton(SDL_Event *ev)
 
     bev = &ev->button;
     if (!gui_grab && !qemu_input_is_absolute(scon->dcl.con)) {
-        if (ev->type == SDL_EVENT_MOUSE_BUTTON_UP && bev->button == SDL_BUTTON_LEFT) {
+        if (ev->type == SDL_EVENT_MOUSE_BUTTON_UP &&
+            bev->button == SDL_BUTTON_LEFT) {
             /* start grabbing all events */
             grab_start(scon);
         }
@@ -526,34 +533,32 @@ static void handle_windowevent(SDL_Event *ev)
     }
 
     switch (ev->type) {
-    case SDL_EVENT_WINDOW_RESIZED:
-        {
-            QemuUIInfo info;
-            memset(&info, 0, sizeof(info));
-            info.width = ev->window.data1;
-            info.height = ev->window.data2;
-            dpy_set_ui_info(scon->dcl.con, &info, true);
+    case SDL_EVENT_WINDOW_RESIZED: {
+        QemuUIInfo info;
+        memset(&info, 0, sizeof(info));
+        info.width = ev->window.data1;
+        info.height = ev->window.data2;
+        dpy_set_ui_info(scon->dcl.con, &info, true);
 
-            if (!gui_fullscreen) {
-                g_config.display.window.last_width = ev->window.data1;
-                g_config.display.window.last_height = ev->window.data2;
-            }
+        if (!gui_fullscreen) {
+            g_config.display.window.last_width = ev->window.data1;
+            g_config.display.window.last_height = ev->window.data2;
+        }
 
 #ifdef _WIN32
-            if (win32_dxgi_present_is_active()) {
-                int width;
-                int height;
-                if (!SDL_GetWindowSizeInPixels(scon->real_window, &width,
-                                               &height)) {
-                    fprintf(stderr, "SDL_GetWindowSizeInPixels failed "
-                                    "responding to resize event.\n");
-                } else {
-                    win32_dxgi_present_resize(width, height);
-                }
+        if (win32_dxgi_present_is_active()) {
+            int width;
+            int height;
+            if (!SDL_GetWindowSizeInPixels(scon->real_window, &width,
+                                           &height)) {
+                fprintf(stderr, "SDL_GetWindowSizeInPixels failed "
+                                "responding to resize event.\n");
+            } else {
+                win32_dxgi_present_resize(width, height);
             }
-#endif
         }
-        break;
+#endif
+    } break;
 #ifdef _WIN32
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
         if (win32_dxgi_present_is_active()) {
@@ -564,7 +569,8 @@ static void handle_windowevent(SDL_Event *ev)
 
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
     case SDL_EVENT_WINDOW_MOUSE_ENTER:
-        if (!gui_grab && (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled)) {
+        if (!gui_grab &&
+            (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled)) {
             absolute_mouse_grab(scon);
         }
         /* If a new console window opened using a hotkey receives the
@@ -604,8 +610,7 @@ static void handle_windowevent(SDL_Event *ev)
     }
 }
 
-static void mouse_warp(DisplayChangeListener *dcl,
-                       int x, int y, bool on)
+static void mouse_warp(DisplayChangeListener *dcl, int x, int y, bool on)
 {
     struct xemu_console *scon = container_of(dcl, struct xemu_console, dcl);
 
@@ -617,7 +622,8 @@ static void mouse_warp(DisplayChangeListener *dcl,
         if (!guest_cursor) {
             show_cursor(scon);
         }
-        if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
+        if (gui_grab || qemu_input_is_absolute(scon->dcl.con) ||
+            absolute_enabled) {
             SDL_SetCursor(guest_sprite);
             if (!qemu_input_is_absolute(scon->dcl.con) && !absolute_enabled) {
                 SDL_WarpMouseInWindow(scon->real_window, x, y);
@@ -630,10 +636,8 @@ static void mouse_warp(DisplayChangeListener *dcl,
     guest_x = x, guest_y = y;
 }
 
-static void mouse_define(DisplayChangeListener *dcl,
-                             QEMUCursor *c)
+static void mouse_define(DisplayChangeListener *dcl, QEMUCursor *c)
 {
-
     if (guest_sprite) {
         SDL_DestroyCursor(guest_sprite);
     }
@@ -642,15 +646,15 @@ static void mouse_define(DisplayChangeListener *dcl,
         SDL_DestroySurface(guest_sprite_surface);
     }
 
-    guest_sprite_surface =
-        SDL_CreateSurfaceFrom(c->width, c->height, SDL_PIXELFORMAT_ARGB8888, c->data, c->width * 4);
+    guest_sprite_surface = SDL_CreateSurfaceFrom(
+        c->width, c->height, SDL_PIXELFORMAT_ARGB8888, c->data, c->width * 4);
 
     if (!guest_sprite_surface) {
         fprintf(stderr, "Failed to make rgb surface from %p\n", c);
         return;
     }
-    guest_sprite = SDL_CreateColorCursor(guest_sprite_surface,
-                                         c->hot_x, c->hot_y);
+    guest_sprite =
+        SDL_CreateColorCursor(guest_sprite_surface, c->hot_x, c->hot_y);
     if (!guest_sprite) {
         fprintf(stderr, "Failed to make color cursor from %p\n", c);
         return;
@@ -663,7 +667,8 @@ static void mouse_define(DisplayChangeListener *dcl,
 
 static void xb_surface_gl_create_texture(DisplaySurface *surface)
 {
-    assert(QEMU_IS_ALIGNED(surface_stride(surface), surface_bytes_per_pixel(surface)));
+    assert(QEMU_IS_ALIGNED(surface_stride(surface),
+                           surface_bytes_per_pixel(surface)));
 
     switch (surface_format(surface)) {
     case PIXMAN_BE_b8g8r8x8:
@@ -690,10 +695,8 @@ static void xb_surface_gl_create_texture(DisplaySurface *surface)
     glBindTexture(GL_TEXTURE_2D, surface->texture);
     glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT,
                   surface_stride(surface) / surface_bytes_per_pixel(surface));
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
-                 surface_width(surface),
-                 surface_height(surface),
-                 0, surface->glformat, surface->gltype,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, surface_width(surface),
+                 surface_height(surface), 0, surface->glformat, surface->gltype,
                  surface_data(surface));
     glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
 
@@ -723,16 +726,18 @@ static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
     }
 }
 
-static void gl_switch(DisplayChangeListener *dcl,
-                      DisplaySurface *new_surface)
+static void gl_switch(DisplayChangeListener *dcl, DisplaySurface *new_surface)
 {
     struct xemu_console *scon = container_of(dcl, struct xemu_console, dcl);
     scon->surface = new_surface;
 }
 
-static float update_avg(float avg, float ms, float r) {
-    if (fabs(avg-ms) > 0.25*avg) avg = ms;
-    else avg = avg*(1.0-r)+ms*r;
+static float update_avg(float avg, float ms, float r)
+{
+    if (fabs(avg - ms) > 0.25 * avg)
+        avg = ms;
+    else
+        avg = avg * (1.0 - r) + ms * r;
     return avg;
 }
 
@@ -747,10 +752,10 @@ static void update_fps(void)
         last_update = now;
         return;
     }
-    float ms = ((float)(now-last_update)/1000000.0);
+    float ms = ((float)(now - last_update) / 1000000.0);
     last_update = now;
     avg = update_avg(avg, ms, 0.5);
-    fps = 1000.0/avg;
+    fps = 1000.0 / avg;
 }
 
 static void process_vblank(struct xemu_console *scon)
@@ -819,7 +824,9 @@ static void report_stats(void)
     if (delta_ms >= 1000) {
         DPRINTF("[[ ");
         DPRINTF("vblank @%fHz avg", fps);
-        DPRINTF(" - bql %"PRId64"ns/iter, %g%% time avg", lock_held_acc/num_frames, (double)lock_held_acc/(double)(delta_ms * 10000.0));
+        DPRINTF(" - bql %" PRId64 "ns/iter, %g%% time avg",
+                lock_held_acc / num_frames,
+                (double)lock_held_acc / (double)(delta_ms * 10000.0));
         DPRINTF(" ]]\n");
         lock_held_acc = 0;
         last_reported = now;
@@ -840,6 +847,9 @@ static void gl_render_frame(struct xemu_console *scon)
     }
 
 #ifdef CONFIG_UWP
+    if (xemu_hud_uses_d3d12()) {
+        xemu_hud_d3d12_prepare_frame();
+    }
     if (nv2a_present_frame()) {
         qatomic_set(&rendering, false);
         return;
@@ -847,6 +857,9 @@ static void gl_render_frame(struct xemu_console *scon)
 #endif
 
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+#ifdef CONFIG_UWP
+    xemu_hud_opengl_activate(scon->winctx);
+#endif
 
     bool flip_required = false;
     bool release_surface_texture = false;
@@ -978,8 +991,9 @@ static void poll_events(struct xemu_console *scon)
 
     while (SDL_PollEvent(ev)) {
         if (first_embedded_poll) {
-            qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
-                               "xemu display: SDL event received; event lock begin");
+            qemu_host_emit_log(
+                QEMU_HOST_LOG_DEBUG,
+                "xemu display: SDL event received; event lock begin");
         }
         xemu_main_loop_lock();
         if (first_embedded_poll) {
@@ -994,11 +1008,13 @@ static void poll_events(struct xemu_console *scon)
 
         switch (ev->type) {
         case SDL_EVENT_KEY_DOWN:
-            if (kbd) break;
+            if (kbd)
+                break;
             handle_keydown(ev);
             break;
         case SDL_EVENT_KEY_UP:
-            if (kbd) break;
+            if (kbd)
+                break;
             handle_keyup(ev);
             break;
         case SDL_EVENT_QUIT:
@@ -1011,16 +1027,19 @@ static void poll_events(struct xemu_console *scon)
             }
             break;
         case SDL_EVENT_MOUSE_MOTION:
-            if (mouse) break;
+            if (mouse)
+                break;
             handle_mousemotion(ev);
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP:
-            if (mouse) break;
+            if (mouse)
+                break;
             handle_mousebutton(ev);
             break;
         case SDL_EVENT_MOUSE_WHEEL:
-            if (mouse) break;
+            if (mouse)
+                break;
             handle_mousewheel(ev);
             break;
         case SDL_EVENT_WINDOW_FIRST ... SDL_EVENT_WINDOW_LAST:
@@ -1091,7 +1110,8 @@ static void display_very_early_init(DisplayOptions *o)
     qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
                        "xemu display: SDL video initialized");
 
-#ifdef SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR /* only available since SDL 2.0.8 */
+#ifdef SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR /* only available since \
+                                                      SDL 2.0.8 */
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
 #endif
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
@@ -1105,16 +1125,16 @@ static void display_very_early_init(DisplayOptions *o)
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-    SDL_GL_SetAttribute(
-        SDL_GL_CONTEXT_PROFILE_MASK,
-        SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                        SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
     char *title = g_strdup_printf("xemu | v%s"
 #ifdef XEMU_DEBUG_BUILD
                                   " Debug"
 #endif
-                                  , xemu_version);
+                                  ,
+                                  xemu_version);
 
     // Decide window size
     int min_window_width = 640;
@@ -1122,25 +1142,18 @@ static void display_very_early_init(DisplayOptions *o)
     int window_width = min_window_width;
     int window_height = min_window_height;
 
-    const int res_table[][2] = {
-        {640,  480},
-        {720,  480},
-        {1280, 720},
-        {1280, 800},
-        {1280, 960},
-        {1920, 1080},
-        {2560, 1440},
-        {2560, 1600},
-        {2560, 1920},
-        {3840, 2160}
-    };
+    const int res_table[][2] = { { 640, 480 },   { 720, 480 },   { 1280, 720 },
+                                 { 1280, 800 },  { 1280, 960 },  { 1920, 1080 },
+                                 { 2560, 1440 }, { 2560, 1600 }, { 2560, 1920 },
+                                 { 3840, 2160 } };
 
-    if (g_config.display.window.startup_size == CONFIG_DISPLAY_WINDOW_STARTUP_SIZE_LAST_USED) {
-        window_width  = g_config.display.window.last_width;
+    if (g_config.display.window.startup_size ==
+        CONFIG_DISPLAY_WINDOW_STARTUP_SIZE_LAST_USED) {
+        window_width = g_config.display.window.last_width;
         window_height = g_config.display.window.last_height;
     } else {
-        window_width  = res_table[g_config.display.window.startup_size-1][0];
-        window_height = res_table[g_config.display.window.startup_size-1][1];
+        window_width = res_table[g_config.display.window.startup_size - 1][0];
+        window_height = res_table[g_config.display.window.startup_size - 1][1];
     }
 
     if (window_width < min_window_width) {
@@ -1150,21 +1163,23 @@ static void display_very_early_init(DisplayOptions *o)
         window_height = min_window_height;
     }
 
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_WindowFlags window_flags =
+        (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                          SDL_WINDOW_HIGH_PIXEL_DENSITY);
 
     // Create main window
     qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
                        "xemu display: window creation begin");
-    m_window = SDL_CreateWindow(
-        title, window_width, window_height,
-        window_flags);
+    m_window =
+        SDL_CreateWindow(title, window_width, window_height, window_flags);
     if (m_window == NULL) {
         char *sdl_error = g_strdup(SDL_GetError());
         fprintf(stderr, "Failed to create main window: %s\n", sdl_error);
 #ifdef CONFIG_UWP
         qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
-                           sdl_error && sdl_error[0] ? sdl_error :
-                           "SDL_CreateWindow failed without an SDL error");
+                           sdl_error && sdl_error[0] ?
+                               sdl_error :
+                               "SDL_CreateWindow failed without an SDL error");
 #endif
         SDL_Quit();
         g_free(title);
@@ -1176,15 +1191,17 @@ static void display_very_early_init(DisplayOptions *o)
         exit(1);
 #endif
     }
-    qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
-                       "xemu display: window created");
+    qemu_host_emit_log(QEMU_HOST_LOG_DEBUG, "xemu display: window created");
     g_free(title);
     SDL_SetWindowMinimumSize(m_window, min_window_width, min_window_height);
 
-    const SDL_DisplayMode *disp_mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(m_window));
-    if (disp_mode && (disp_mode->w < window_width || disp_mode->h < window_height)) {
+    const SDL_DisplayMode *disp_mode =
+        SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(m_window));
+    if (disp_mode &&
+        (disp_mode->w < window_width || disp_mode->h < window_height)) {
         SDL_SetWindowSize(m_window, min_window_width, min_window_height);
-        SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED,
+                              SDL_WINDOWPOS_CENTERED);
     }
 
     qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
@@ -1200,12 +1217,14 @@ static void display_very_early_init(DisplayOptions *o)
     if (m_context == NULL) {
         char *sdl_error = g_strdup(SDL_GetError());
 #ifdef CONFIG_UWP
-        qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
-                           sdl_error && sdl_error[0] ? sdl_error :
-                           "SDL_GL_CreateContext failed without an SDL error");
+        qemu_host_emit_log(
+            QEMU_HOST_LOG_ERROR,
+            sdl_error && sdl_error[0] ?
+                sdl_error :
+                "SDL_GL_CreateContext failed without an SDL error");
 #endif
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-            "Unable to create OpenGL context",
+        SDL_ShowSimpleMessageBox(
+            SDL_MESSAGEBOX_ERROR, "Unable to create OpenGL context",
             "Unable to create OpenGL context. This usually means the\r\n"
             "graphics device on this system does not support OpenGL 4.0.\r\n"
             "\r\n"
@@ -1227,9 +1246,11 @@ static void display_very_early_init(DisplayOptions *o)
 
     int width, height, channels = 0;
     stbi_set_flip_vertically_on_load(0);
-    unsigned char *icon_data = stbi_load_from_memory(xemu_64x64_data, xemu_64x64_size, &width, &height, &channels, 4);
+    unsigned char *icon_data = stbi_load_from_memory(
+        xemu_64x64_data, xemu_64x64_size, &width, &height, &channels, 4);
     if (icon_data) {
-        SDL_Surface *icon = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon_data, width*4);
+        SDL_Surface *icon = SDL_CreateSurfaceFrom(
+            width, height, SDL_PIXELFORMAT_RGBA32, icon_data, width * 4);
         if (icon) {
             SDL_SetWindowIcon(m_window, icon);
             SDL_DestroySurface(icon);
@@ -1242,7 +1263,8 @@ static void display_very_early_init(DisplayOptions *o)
     fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
     fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
     fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
-    fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+    fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n",
+            glGetString(GL_SHADING_LANGUAGE_VERSION));
 
     // Initialize offscreen rendering context now
     qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
@@ -1351,11 +1373,11 @@ static void display_early_init(DisplayOptions *o)
 }
 
 static const DisplayChangeListenerOps dcl_gl_ops = {
-    .dpy_name                = "xemu-gl",
-    .dpy_gfx_switch          = gl_switch,
-    .dpy_gfx_check_format    = xb_console_gl_check_format,
-    .dpy_mouse_set           = mouse_warp,
-    .dpy_cursor_define       = mouse_define,
+    .dpy_name = "xemu-gl",
+    .dpy_gfx_switch = gl_switch,
+    .dpy_gfx_check_format = xb_console_gl_check_format,
+    .dpy_mouse_set = mouse_warp,
+    .dpy_cursor_define = mouse_define,
 };
 
 static void display_init(DisplayState *ds, DisplayOptions *o)
@@ -1380,12 +1402,10 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     for (i = 0; i < num_outputs; i++) {
         QemuConsole *con = qemu_console_lookup_by_index(i);
         assert(con != NULL);
-        qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
-                           "xemu display: console found");
+        qemu_host_emit_log(QEMU_HOST_LOG_DEBUG, "xemu display: console found");
         scon_list[i].real_window = m_window;
         scon_list[i].winctx = m_context;
-        if (!qemu_console_is_graphic(con) &&
-            qemu_console_get_index(con) != 0) {
+        if (!qemu_console_is_graphic(con) && qemu_console_get_index(con) != 0) {
             scon_list[i].hidden = true;
         }
         scon_list[i].idx = i;
@@ -1402,12 +1422,16 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
                            "xemu display: display listener registered");
 
 #if defined(SDL_VIDEO_DRIVER_WINDOWS)
-        HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(scon_list[i].real_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+        HWND hwnd = (HWND)SDL_GetPointerProperty(
+            SDL_GetWindowProperties(scon_list[i].real_window),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
         if (hwnd) {
             qemu_console_set_window_id(con, (uintptr_t)hwnd);
         }
 #elif defined(SDL_VIDEO_DRIVER_X11)
-        Window xwindow = (Window)SDL_GetNumberProperty(SDL_GetWindowProperties(scon_list[i].real_window), SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+        Window xwindow = (Window)SDL_GetNumberProperty(
+            SDL_GetWindowProperties(scon_list[i].real_window),
+            SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
         if (xwindow) {
             qemu_console_set_window_id(con, xwindow);
         }
@@ -1436,8 +1460,10 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
         qemu_thread_create(&vblank_thread, "vblank-timer", vblank_timer_thread,
                            &scon_list[0], QEMU_THREAD_JOINABLE);
     } else {
-        vblank_timer = timer_new_ns(QEMU_CLOCK_REALTIME, vblank_timer_callback, &scon_list[0]);
-        timer_mod_ns(vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + vblank_interval_ns);
+        vblank_timer = timer_new_ns(QEMU_CLOCK_REALTIME, vblank_timer_callback,
+                                    &scon_list[0]);
+        timer_mod_ns(vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                                       vblank_interval_ns);
     }
     qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
                        "xemu display: vblank source initialized");
@@ -1503,9 +1529,9 @@ void xemu_shutdown_embedded_display(void)
 }
 
 static QemuDisplay qemu_display_xemu = {
-    .type       = DISPLAY_TYPE_XEMU,
+    .type = DISPLAY_TYPE_XEMU,
     .early_init = display_early_init,
-    .init       = display_init,
+    .init = display_init,
 };
 
 static void register_xemu_display(void)
@@ -1609,9 +1635,9 @@ int main(int argc, char **argv)
         }
     } else {
         // Launched without a console. Redirect stdout and stderr to a log file.
-        HANDLE logfile = CreateFileA("xemu.log",
-            GENERIC_WRITE, FILE_SHARE_WRITE|FILE_SHARE_READ,
-            NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        HANDLE logfile = CreateFileA(
+            "xemu.log", GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ, NULL,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (logfile != INVALID_HANDLE_VALUE) {
             freopen("xemu.log", "a", stdout);
             freopen("xemu.log", "a", stderr);
@@ -1633,9 +1659,9 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strcmp(argv[i], "-config_path") == 0) {
             argv[i] = NULL;
-            if (i < argc - 1 && argv[i+1]) {
-                xemu_settings_set_path(argv[i+1]);
-                argv[i+1] = NULL;
+            if (i < argc - 1 && argv[i + 1]) {
+                xemu_settings_set_path(argv[i + 1]);
+                argv[i + 1] = NULL;
             }
             break;
         }
@@ -1645,8 +1671,8 @@ int main(int argc, char **argv)
         const char *err_msg = xemu_settings_get_error_message();
         fprintf(stderr, "%s", err_msg);
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-            "Failed to load xemu config file", err_msg,
-            m_window);
+                                 "Failed to load xemu config file", err_msg,
+                                 m_window);
         SDL_Quit();
         exit(1);
     }
@@ -1662,8 +1688,8 @@ int main(int argc, char **argv)
 
     qemu_sem_init(&display_init_sem, 0);
     qemu_sem_init(&display_shutdown_sem, 0);
-    qemu_thread_create(&thread, "qemu_main", qemu_main,
-                       NULL, QEMU_THREAD_JOINABLE);
+    qemu_thread_create(&thread, "qemu_main", qemu_main, NULL,
+                       QEMU_THREAD_JOINABLE);
     qemu_sem_wait(&display_init_sem);
 
     gui_grab = 0;

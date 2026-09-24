@@ -138,7 +138,8 @@ XemuHost::XemuHost()
       m_running(false), m_stop(false), m_firstFrameLogged(false),
       m_attachMesa(nullptr), m_setMesaSwapChainAttach(nullptr),
       m_attachDzn(nullptr), m_setDznSwapChainAttach(nullptr),
-      m_updateSDLPanelSize(nullptr), m_attachVirtualJoystick(nullptr),
+      m_updateSDLPanelSize(nullptr), m_setD3D12PresentTarget(nullptr),
+      m_attachVirtualJoystick(nullptr),
       m_detachVirtualJoystick(nullptr), m_openJoystick(nullptr),
       m_closeJoystick(nullptr), m_setVirtualAxis(nullptr),
       m_setVirtualButton(nullptr), m_setEmbeddedCursorHidden(nullptr),
@@ -147,6 +148,7 @@ XemuHost::XemuHost()
       m_virtualJoystick(nullptr), m_uwpGamepad(nullptr),
       m_gamepadErrorLogged(false), m_lastGamepadTimestamp(0),
       m_gamepadChangeLogs(0), m_renderPanel(nullptr),
+      m_renderWidth(0), m_renderHeight(0),
       m_getApiVersion(nullptr), m_getVideoMetrics(nullptr),
       m_init(nullptr), m_start(nullptr),
       m_renderFrame(nullptr), m_step(nullptr), m_isHostRunning(nullptr),
@@ -286,6 +288,8 @@ bool XemuHost::AttachRenderPanel(Windows::UI::Xaml::Controls::SwapChainPanel^ pa
         WriteDiagnostic("[loader] Optional Mesa DZN log callback is unavailable");
     }
     m_renderPanel = panel;
+    m_renderWidth = static_cast<uint32_t>(width);
+    m_renderHeight = static_cast<uint32_t>(height);
     m_setMesaSwapChainAttach(&XemuHost::AttachMesaSwapChain, this);
     m_setDznSwapChainAttach(&XemuHost::AttachMesaSwapChain, this);
     m_attachMesa(inspectable, width, height);
@@ -604,6 +608,12 @@ bool XemuHost::UpdateRenderPanelSize(
                  pixelWidth, pixelHeight);
     m_attachDzn(reinterpret_cast<IInspectable *>(panel),
                 pixelWidth, pixelHeight);
+    m_renderWidth = static_cast<uint32_t>(pixelWidth);
+    m_renderHeight = static_cast<uint32_t>(pixelHeight);
+    if (m_setD3D12PresentTarget) {
+        m_setD3D12PresentTarget(m_renderWidth, m_renderHeight,
+                                &XemuHost::AttachMesaSwapChain, this);
+    }
     if (!m_updateSDLPanelSize(logicalWidth, logicalHeight,
                               pixelWidth, pixelHeight)) {
         return false;
@@ -691,6 +701,7 @@ bool XemuHost::Load()
               Resolve(m_registerLog, "qemu_host_register_log_callback") &&
               Resolve(m_setLogFile, "qemu_host_set_log_file") &&
               Resolve(m_setPipelineCacheFile, "qemu_host_set_pipeline_cache_file") &&
+              Resolve(m_setD3D12PresentTarget, "qemu_host_set_d3d12_present_target") &&
               Resolve(m_setGamepadState, "qemu_host_set_gamepad_state") &&
               Resolve(m_registerBrokeredStorage, "qemu_host_register_brokered_storage_callbacks") &&
               Resolve(m_mountFile, "qemu_host_mount_brokered_file") &&
@@ -700,6 +711,12 @@ bool XemuHost::Load()
         return false;
     }
     WriteDiagnostic("[loader] Embedding API is compatible");
+    if (!m_renderWidth || !m_renderHeight ||
+        m_setD3D12PresentTarget(m_renderWidth, m_renderHeight,
+                                &XemuHost::AttachMesaSwapChain, this) != 0) {
+        SetError("Failed to register the D3D12 SwapChainPanel target");
+        return false;
+    }
     m_registerLog(&XemuHost::Log, this);
     WriteDiagnostic("[loader] xemu log callback registered");
     auto pipelineCachePath = ApplicationData::Current->LocalFolder->Path +

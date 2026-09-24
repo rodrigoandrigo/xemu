@@ -113,11 +113,14 @@ namespace UWP_Port
         using SetMesaSwapChainAttach = void (__cdecl *)(
             long (__cdecl *)(void*, void*), void*);
         using UpdateSDLPanelSize = bool (__cdecl *)(int, int, int, int);
+        using SetD3D12PresentTarget = int (__cdecl *)(
+            uint32_t, uint32_t, QemuHostSwapChainAttachCallback, void*);
         AttachMesa m_attachMesa;
         SetMesaSwapChainAttach m_setMesaSwapChainAttach;
         AttachMesa m_attachDzn;
         SetMesaSwapChainAttach m_setDznSwapChainAttach;
         UpdateSDLPanelSize m_updateSDLPanelSize;
+        SetD3D12PresentTarget m_setD3D12PresentTarget;
         using AttachVirtualJoystick = SDL_JoystickID (__cdecl *)(
             const SDL_VirtualJoystickDesc*);
         using DetachVirtualJoystick = bool (__cdecl *)(SDL_JoystickID);
@@ -142,6 +145,8 @@ namespace UWP_Port
         unsigned int m_gamepadChangeLogs;
         Windows::UI::Xaml::Controls::SwapChainPanel^ m_renderPanel;
         Microsoft::WRL::ComPtr<IDXGISwapChain2> m_swapChain;
+        uint32_t m_renderWidth;
+        uint32_t m_renderHeight;
 
         decltype(&qemu_host_get_api_version) m_getApiVersion;
         decltype(&qemu_host_get_video_metrics) m_getVideoMetrics;
