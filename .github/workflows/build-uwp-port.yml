@@ -235,6 +235,7 @@ jobs:
             'build-uwp\mesa\src\gallium\targets\libgl-gdi\opengl32.dll',
             'build-uwp\mesa\src\gallium\targets\wgl\gallium_wgl.dll',
             'build-uwp\mesa\src\microsoft\vulkan\vulkan_dzn.dll'
+            'build-uwp\mesa\src\microsoft\spirv_to_dxil\spirv_to_dxil.dll'
           )
           foreach ($file in $required) {
             if (-not (Test-Path -LiteralPath $file)) {
