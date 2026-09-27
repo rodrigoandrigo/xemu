@@ -15,6 +15,7 @@ using namespace Windows::Foundation;
 using namespace Windows::Foundation::Collections;
 using namespace Windows::Storage;
 using namespace Windows::System::Profile;
+using namespace Windows::System;
 using namespace Windows::UI::Xaml;
 using namespace Windows::UI::Xaml::Controls;
 using namespace Windows::UI::Xaml::Controls::Primitives;
@@ -50,6 +51,10 @@ App::App()
 	InitializeComponent();
 	Suspending += ref new SuspendingEventHandler(this, &App::OnSuspending);
 	Resuming += ref new EventHandler<Object^>(this, &App::OnResuming);
+	m_memoryIncreasedToken = MemoryManager::AppMemoryUsageIncreased +=
+		ref new EventHandler<Object^>(this, &App::OnMemoryUsageChanged);
+	m_memoryDecreasedToken = MemoryManager::AppMemoryUsageDecreased +=
+		ref new EventHandler<Object^>(this, &App::OnMemoryUsageChanged);
 }
 
 /// <summary>
@@ -159,9 +164,13 @@ void App::ConfigureWindowBounds()
 void App::OnSuspending(Object^ sender, SuspendingEventArgs^ e)
 {
 	(void) sender;	// Parâmetro não usado
-	(void) e;	// Parâmetro não usado
-
-	m_directXPage->SaveInternalState(ApplicationData::Current->LocalSettings->Values);
+	auto deferral = e->SuspendingOperation->GetDeferral();
+	if (m_directXPage != nullptr)
+	{
+		m_directXPage->SaveInternalState(
+			ApplicationData::Current->LocalSettings->Values);
+	}
+	deferral->Complete();
 }
 
 /// <summary>
@@ -174,7 +183,39 @@ void App::OnResuming(Object ^sender, Object ^args)
 	(void) sender; // Parâmetro não usado
 	(void) args; // Parâmetro não usado
 
-	m_directXPage->LoadInternalState(ApplicationData::Current->LocalSettings->Values);
+	if (m_directXPage != nullptr)
+	{
+		m_directXPage->LoadInternalState(
+			ApplicationData::Current->LocalSettings->Values);
+	}
+}
+
+void App::OnMemoryUsageChanged(Object^ sender, Object^ args)
+{
+	(void)sender;
+	(void)args;
+	if (m_directXPage == nullptr)
+	{
+		return;
+	}
+
+	QemuHostMemoryPressure pressure = QEMU_HOST_MEMORY_PRESSURE_NORMAL;
+	switch (MemoryManager::AppMemoryUsageLevel)
+	{
+	case AppMemoryUsageLevel::Medium:
+		pressure = QEMU_HOST_MEMORY_PRESSURE_MODERATE;
+		break;
+	case AppMemoryUsageLevel::High:
+		pressure = QEMU_HOST_MEMORY_PRESSURE_HIGH;
+		break;
+	case AppMemoryUsageLevel::OverLimit:
+		pressure = QEMU_HOST_MEMORY_PRESSURE_CRITICAL;
+		break;
+	case AppMemoryUsageLevel::Low:
+	default:
+		break;
+	}
+	m_directXPage->HandleMemoryPressure(pressure);
 }
 
 /// <summary>
@@ -186,4 +227,3 @@ void App::OnNavigationFailed(Platform::Object ^sender, Windows::UI::Xaml::Naviga
 {
 	throw ref new FailureException("Failed to load Page " + e->SourcePageType.Name);
 }
-

@@ -23,7 +23,10 @@ namespace UWP_Port
 		void ConfigureWindowBounds();
 		void OnSuspending(Platform::Object^ sender, Windows::ApplicationModel::SuspendingEventArgs^ e);
 		void OnResuming(Platform::Object ^sender, Platform::Object ^args);
+		void OnMemoryUsageChanged(Platform::Object^ sender, Platform::Object^ args);
 		void OnNavigationFailed(Platform::Object ^sender, Windows::UI::Xaml::Navigation::NavigationFailedEventArgs ^e);
 		DirectXPage^ m_directXPage;
+		Windows::Foundation::EventRegistrationToken m_memoryIncreasedToken;
+		Windows::Foundation::EventRegistrationToken m_memoryDecreasedToken;
 	};
 }

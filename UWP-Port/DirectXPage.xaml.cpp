@@ -267,6 +267,7 @@ void DirectXPage::UpdateFpsOverlay()
 void DirectXPage::SaveInternalState(IPropertySet^ state)
 {
 	m_xemu->Pause();
+	m_xemu->SuspendGraphics();
 
 	// Coloque aqui o código para salvar o estado do aplicativo.
 }
@@ -276,7 +277,16 @@ void DirectXPage::LoadInternalState(IPropertySet^ state)
 {
 	// Coloque aqui o código para carregar o estado do aplicativo.
 
-	m_xemu->Resume();
+	if (m_xemu->ResumeGraphics()) {
+		m_xemu->Resume();
+	}
+}
+
+void DirectXPage::HandleMemoryPressure(QemuHostMemoryPressure pressure)
+{
+	if (m_xemu) {
+		m_xemu->NotifyMemoryPressure(pressure);
+	}
 }
 
 // Manipuladores de eventos da janela.
@@ -504,7 +514,11 @@ void DirectXPage::LoadSettings()
 	port3SlotB->SelectedIndex = ClampIndex(ReadInt("input.port3.slot_b", 0), 2, 0);
 	port4SlotA->SelectedIndex = ClampIndex(ReadInt("input.port4.slot_a", 0), 2, 0);
 	port4SlotB->SelectedIndex = ClampIndex(ReadInt("input.port4.slot_b", 0), 2, 0);
-	renderer->SelectedIndex = ClampIndex(ReadInt("display.renderer", 1) - 1, 3, 0);
+	// UWP-Port currently exposes the production OpenGL path and the native
+	// D3D11 renderer while it is being brought up. Other persisted renderer
+	// values are normalized to OpenGL.
+	renderer->SelectedIndex =
+		ReadInt("display.renderer", 1) == 4 ? 1 : 0;
 	surfaceScale->SelectedIndex = ClampIndex(ReadInt("display.quality.surface_scale", 1) - 1, 6, 0);
 	filtering->SelectedIndex = ClampIndex(ReadInt("display.filtering", 0), 2, 0);
 	displayFit->SelectedIndex = ClampIndex(ReadInt("display.ui.fit", 1), 3, 1);
@@ -693,7 +707,7 @@ bool DirectXPage::SaveSettings(bool saveNetwork)
 	SAVE_INT("input.port3.slot_b", port3SlotB->SelectedIndex);
 	SAVE_INT("input.port4.slot_a", port4SlotA->SelectedIndex);
 	SAVE_INT("input.port4.slot_b", port4SlotB->SelectedIndex);
-	SAVE_INT("display.renderer", renderer->SelectedIndex + 1);
+	SAVE_INT("display.renderer", renderer->SelectedIndex == 1 ? 4 : 1);
 	SAVE_INT("display.quality.surface_scale", surfaceScale->SelectedIndex + 1);
 	SAVE_INT("display.filtering", filtering->SelectedIndex);
 	SAVE_INT("display.ui.fit", displayFit->SelectedIndex);
@@ -797,9 +811,8 @@ bool DirectXPage::SaveSettings(bool saveNetwork)
 	       << "[input.peripherals.port3]\nperipheral_type_0 = " << port3SlotA->SelectedIndex << "\nperipheral_param_0 = \"/broker/xmu-p3a\"\nperipheral_type_1 = " << port3SlotB->SelectedIndex << "\nperipheral_param_1 = \"/broker/xmu-p3b\"\n"
 	       << "[input.peripherals.port4]\nperipheral_type_0 = " << port4SlotA->SelectedIndex << "\nperipheral_param_0 = \"/broker/xmu-p4a\"\nperipheral_type_1 = " << port4SlotB->SelectedIndex << "\nperipheral_param_1 = \"/broker/xmu-p4b\"\n"
 	       << "[display]\nrenderer = \""
-	       << (renderer->SelectedIndex == 2 ? "D3D12" :
-	           renderer->SelectedIndex == 1 ? "VULKAN" : "OPENGL")
-	       << "\"\nfiltering = \"" << filterValues[filtering->SelectedIndex] << "\"\n"
+	       << (renderer->SelectedIndex == 1 ? "D3D11" : "OPENGL") << "\""
+	       << "\nfiltering = \"" << filterValues[filtering->SelectedIndex] << "\"\n"
 	       << "[display.quality]\nsurface_scale = " << surfaceScale->SelectedIndex + 1 << "\n"
 	       << "[display.window]\nfullscreen_on_startup = false"
 	       << "\nfullscreen_exclusive = false"

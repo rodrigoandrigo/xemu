@@ -421,6 +421,50 @@ bool nv2a_present_frame(void)
     return presented;
 }
 
+void nv2a_renderer_suspend(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d) {
+        return;
+    }
+    PGRAPHState *pg = &d->pgraph;
+    qemu_mutex_lock(&pg->renderer_lock);
+    if (pg->renderer && pg->renderer->ops.suspend) {
+        pg->renderer->ops.suspend(d);
+    }
+    qemu_mutex_unlock(&pg->renderer_lock);
+}
+
+bool nv2a_renderer_resume(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d) {
+        return false;
+    }
+    PGRAPHState *pg = &d->pgraph;
+    bool resumed = true;
+    qemu_mutex_lock(&pg->renderer_lock);
+    if (pg->renderer && pg->renderer->ops.resume) {
+        resumed = pg->renderer->ops.resume(d);
+    }
+    qemu_mutex_unlock(&pg->renderer_lock);
+    return resumed;
+}
+
+void nv2a_renderer_memory_pressure(unsigned int level)
+{
+    NV2AState *d = g_nv2a;
+    if (!d) {
+        return;
+    }
+    PGRAPHState *pg = &d->pgraph;
+    qemu_mutex_lock(&pg->renderer_lock);
+    if (pg->renderer && pg->renderer->ops.memory_pressure) {
+        pg->renderer->ops.memory_pressure(d, level);
+    }
+    qemu_mutex_unlock(&pg->renderer_lock);
+}
+
 void nv2a_set_surface_scale_factor(unsigned int scale)
 {
     NV2AState *d = g_nv2a;

@@ -24,6 +24,9 @@ namespace UWP_Port
 		void SaveInternalState(Windows::Foundation::Collections::IPropertySet^ state);
 		void LoadInternalState(Windows::Foundation::Collections::IPropertySet^ state);
 
+	internal:
+		void HandleMemoryPressure(QemuHostMemoryPressure pressure);
+
 	private:
 		// Manipulador de eventos de renderização de baixo nível XAML.
 		void OnRendering(Platform::Object^ sender, Platform::Object^ args);

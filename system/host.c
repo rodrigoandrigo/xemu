@@ -9,6 +9,7 @@
 #include "qemu/qemu-host.h"
 #include "qemu/thread.h"
 #include "hw/xbox/nv2a/debug.h"
+#include "hw/xbox/nv2a/nv2a.h"
 #include "system/replay.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
@@ -1036,6 +1037,40 @@ int qemu_host_render_frame(void)
                            "embedding: first render API call complete");
         first_frame = false;
     }
+    return 0;
+}
+
+int qemu_host_graphics_suspend(void)
+{
+    if (!host_is_ready()) {
+        return -EINVAL;
+    }
+    nv2a_renderer_suspend();
+    qemu_host_emit_log(QEMU_HOST_LOG_INFO,
+                       "embedding: graphics suspended");
+    return 0;
+}
+
+int qemu_host_graphics_resume(void)
+{
+    if (!host_is_ready()) {
+        return -EINVAL;
+    }
+    if (!nv2a_renderer_resume()) {
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
+                           "embedding: graphics resume failed");
+        return -EIO;
+    }
+    qemu_host_emit_log(QEMU_HOST_LOG_INFO, "embedding: graphics resumed");
+    return 0;
+}
+
+int qemu_host_notify_memory_pressure(QemuHostMemoryPressure pressure)
+{
+    if (!host_is_ready() || pressure > QEMU_HOST_MEMORY_PRESSURE_CRITICAL) {
+        return -EINVAL;
+    }
+    nv2a_renderer_memory_pressure(pressure);
     return 0;
 }
 

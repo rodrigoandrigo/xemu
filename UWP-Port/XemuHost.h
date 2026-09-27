@@ -32,6 +32,9 @@ namespace UWP_Port
         void Stop();
         void Pause();
         void Resume();
+        void SuspendGraphics();
+        bool ResumeGraphics();
+        void NotifyMemoryPressure(QemuHostMemoryPressure pressure);
         void Reset();
         void Shutdown();
         bool RenderFrame();
@@ -158,6 +161,9 @@ namespace UWP_Port
         decltype(&qemu_host_request_stop) m_requestStop;
         decltype(&qemu_host_pause) m_pause;
         decltype(&qemu_host_resume) m_resume;
+        decltype(&qemu_host_graphics_suspend) m_graphicsSuspend;
+        decltype(&qemu_host_graphics_resume) m_graphicsResume;
+        decltype(&qemu_host_notify_memory_pressure) m_notifyMemoryPressure;
         decltype(&qemu_host_reset) m_reset;
         decltype(&qemu_host_request_shutdown) m_shutdown;
         decltype(&qemu_host_join) m_join;

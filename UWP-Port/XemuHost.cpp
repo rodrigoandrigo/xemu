@@ -153,7 +153,9 @@ XemuHost::XemuHost()
       m_init(nullptr), m_start(nullptr),
       m_renderFrame(nullptr), m_step(nullptr), m_isHostRunning(nullptr),
       m_requestStop(nullptr), m_pause(nullptr),
-      m_resume(nullptr), m_reset(nullptr), m_shutdown(nullptr), m_join(nullptr), m_cleanup(nullptr),
+      m_resume(nullptr), m_graphicsSuspend(nullptr), m_graphicsResume(nullptr),
+      m_notifyMemoryPressure(nullptr), m_reset(nullptr), m_shutdown(nullptr),
+      m_join(nullptr), m_cleanup(nullptr),
       m_registerLog(nullptr), m_setLogFile(nullptr),
       m_setPipelineCacheFile(nullptr),
       m_registerBrokeredStorage(nullptr), m_mountFile(nullptr),
@@ -694,6 +696,10 @@ bool XemuHost::Load()
               Resolve(m_requestStop, "qemu_host_request_stop") &&
               Resolve(m_pause, "qemu_host_pause") &&
               Resolve(m_resume, "qemu_host_resume") &&
+              Resolve(m_graphicsSuspend, "qemu_host_graphics_suspend") &&
+              Resolve(m_graphicsResume, "qemu_host_graphics_resume") &&
+              Resolve(m_notifyMemoryPressure,
+                      "qemu_host_notify_memory_pressure") &&
               Resolve(m_reset, "qemu_host_reset") &&
               Resolve(m_shutdown, "qemu_host_request_shutdown") &&
               Resolve(m_join, "qemu_host_join") &&
@@ -850,6 +856,22 @@ void XemuHost::Stop()
 
 void XemuHost::Pause() { if (m_running.load()) m_pause(); }
 void XemuHost::Resume() { if (m_running.load()) m_resume(); }
+void XemuHost::SuspendGraphics()
+{
+    if (m_running.load() && m_graphicsSuspend) {
+        m_graphicsSuspend();
+    }
+}
+bool XemuHost::ResumeGraphics()
+{
+    return !m_running.load() || !m_graphicsResume || m_graphicsResume() == 0;
+}
+void XemuHost::NotifyMemoryPressure(QemuHostMemoryPressure pressure)
+{
+    if (m_running.load() && m_notifyMemoryPressure) {
+        m_notifyMemoryPressure(pressure);
+    }
+}
 void XemuHost::Reset() { if (m_running.load()) m_reset(); }
 void XemuHost::Shutdown() { if (m_running.load()) m_shutdown(); }
 

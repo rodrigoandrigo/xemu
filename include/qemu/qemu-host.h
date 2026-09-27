@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 #define QEMU_HOST_API_VERSION_MAJOR 1U
-#define QEMU_HOST_API_VERSION_MINOR 6U
+#define QEMU_HOST_API_VERSION_MINOR 7U
 #define QEMU_HOST_API_VERSION \
     ((QEMU_HOST_API_VERSION_MAJOR << 16) | QEMU_HOST_API_VERSION_MINOR)
 
@@ -85,6 +85,13 @@ typedef struct QemuHostVideoMetrics {
     uint32_t fps;
     uint32_t mspf;
 } QemuHostVideoMetrics;
+
+typedef enum QemuHostMemoryPressure {
+    QEMU_HOST_MEMORY_PRESSURE_NORMAL = 0,
+    QEMU_HOST_MEMORY_PRESSURE_MODERATE = 1,
+    QEMU_HOST_MEMORY_PRESSURE_HIGH = 2,
+    QEMU_HOST_MEMORY_PRESSURE_CRITICAL = 3,
+} QemuHostMemoryPressure;
 
 typedef void (*QemuHostLogCallback)(void *opaque, QemuHostLogLevel level,
                                     const char *message);
@@ -220,6 +227,10 @@ QEMU_HOST_EXPORT bool qemu_host_is_running(void);
 QEMU_HOST_EXPORT int qemu_host_get_exit_status(void);
 QEMU_HOST_EXPORT int qemu_host_get_video_metrics(
     QemuHostVideoMetrics *metrics);
+QEMU_HOST_EXPORT int qemu_host_graphics_suspend(void);
+QEMU_HOST_EXPORT int qemu_host_graphics_resume(void);
+QEMU_HOST_EXPORT int qemu_host_notify_memory_pressure(
+    QemuHostMemoryPressure pressure);
 QEMU_HOST_EXPORT int qemu_host_set_d3d12_present_target(
     uint32_t width, uint32_t height,
     QemuHostSwapChainAttachCallback attach, void *opaque);

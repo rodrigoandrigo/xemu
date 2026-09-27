@@ -133,11 +133,15 @@ typedef struct PGRAPHRenderer {
         unsigned int (*get_surface_scale_factor)(NV2AState *d);
         int (*get_framebuffer_surface)(NV2AState *d);
         bool (*present_frame)(NV2AState *d);
+        void (*suspend)(NV2AState *d);
+        bool (*resume)(NV2AState *d);
+        void (*memory_pressure)(NV2AState *d, unsigned int level);
         GPUProperties *(*get_gpu_properties)(void);
     } ops;
 } PGRAPHRenderer;
 
 typedef struct PGRAPHD3D12State PGRAPHD3D12State;
+typedef struct PGRAPHD3D11State PGRAPHD3D11State;
 
 typedef struct PGRAPHState {
     QemuMutex lock;
@@ -274,6 +278,7 @@ typedef struct PGRAPHState {
         PGRAPHGLState *gl_renderer_state;
         PGRAPHVkState *vk_renderer_state;
         PGRAPHD3D12State *d3d12_renderer_state;
+        PGRAPHD3D11State *d3d11_renderer_state;
     };
 } PGRAPHState;
 
