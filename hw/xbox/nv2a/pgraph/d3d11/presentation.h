@@ -20,10 +20,15 @@ typedef struct PGRAPHD3D11PresentationState {
     ID3D11ShaderResourceView *scanout_srv;
     uint32_t scanout_width;
     uint32_t scanout_height;
+    ID3D11Texture2D *retained_texture;
+    ID3D11ShaderResourceView *retained_srv;
+    uint32_t retained_width;
+    uint32_t retained_height;
 } PGRAPHD3D11PresentationState;
 
 bool pgraph_d3d11_presentation_init(PGRAPHD3D11State *r, Error **errp);
 void pgraph_d3d11_presentation_finalize(PGRAPHD3D11State *r);
+bool pgraph_d3d11_retain_color_scanout(NV2AState *d, Error **errp);
 bool pgraph_d3d11_present_color(NV2AState *d, Error **errp);
 
 #endif

@@ -46,6 +46,9 @@ struct PGRAPHD3D11State {
     bool memory_suspended;
     bool logged_draw_prepared;
     bool logged_draw_submitted;
+    bool logged_surface_update;
+    bool logged_surface_clear;
+    bool logged_flip_stall;
     bool logged_present_without_color;
     bool logged_present_with_color;
     int64_t next_recovery_us;

@@ -372,6 +372,13 @@ static void pgraph_d3d11_clear_surface(NV2AState *d, uint32_t parameter)
         r->memory_suspended) {
         return;
     }
+    if (!r->logged_surface_clear) {
+        char *message = g_strdup_printf(
+            "D3D11: first NV2A surface clear parameter=0x%08x", parameter);
+        qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
+        g_free(message);
+        r->logged_surface_clear = true;
+    }
     Error *error = NULL;
     if (!pgraph_d3d11_render_targets_clear(d, parameter, &error)) {
         qemu_host_emit_log(QEMU_HOST_LOG_ERROR, error_get_pretty(error));
@@ -465,18 +472,49 @@ static void pgraph_d3d11_draw_end(NV2AState *d)
 static void pgraph_d3d11_surface_update(NV2AState *d, bool upload,
                                         bool color_write, bool zeta_write)
 {
+    PGRAPHState *pg = &d->pgraph;
     PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
     if (!r || !r->resources_ready || r->device_lost || r->app_suspended ||
         r->memory_suspended) {
         return;
     }
+    if (!r->logged_surface_update) {
+        char *message = g_strdup_printf(
+            "D3D11: first NV2A surface update upload=%d color=%d zeta=%d",
+            upload, color_write, zeta_write);
+        qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
+        g_free(message);
+        r->logged_surface_update = true;
+    }
     Error *error = NULL;
+    color_write =
+        color_write && (pg->clearing || pgraph_color_write_enabled(pg));
+    zeta_write = zeta_write && (pg->clearing || pgraph_zeta_write_enabled(pg));
+
+    if (!upload) {
+        bool flush_color =
+            (color_write || pg->surface_color.write_enabled_cache) &&
+            pg->surface_color.draw_dirty;
+        bool flush_zeta =
+            (zeta_write || pg->surface_zeta.write_enabled_cache) &&
+            pg->surface_zeta.draw_dirty;
+        if ((flush_color || flush_zeta) &&
+            !pgraph_d3d11_surface_flush(d, &error)) {
+            qemu_host_emit_log(QEMU_HOST_LOG_ERROR, error_get_pretty(error));
+            error_free(error);
+            d3d11_check_device_removed(r, "surface transition readback");
+        }
+        return;
+    }
+
     if (!pgraph_d3d11_render_targets_update(d, color_write, zeta_write,
                                             &error)) {
         qemu_host_emit_log(QEMU_HOST_LOG_ERROR, error_get_pretty(error));
         error_free(error);
         d3d11_check_device_removed(r, "render-target update");
+        return;
     }
+    pg->draw_time++;
 }
 
 static void pgraph_d3d11_sync(NV2AState *d)
@@ -495,6 +533,23 @@ static void pgraph_d3d11_wait_and_resolve(NV2AState *d)
     if (r && r->resources_ready) {
         d3d11_wait_idle(r);
     }
+}
+
+static void pgraph_d3d11_flip_stall(NV2AState *d)
+{
+    PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
+    if (r && !r->logged_flip_stall) {
+        uint32_t surface = pgraph_reg_r(&d->pgraph, NV_PGRAPH_SURFACE);
+        char *message = g_strdup_printf(
+            "D3D11: first NV2A flip stall read=%u write=%u modulo=%u",
+            GET_MASK(surface, NV_PGRAPH_SURFACE_READ_3D),
+            GET_MASK(surface, NV_PGRAPH_SURFACE_WRITE_3D),
+            GET_MASK(surface, NV_PGRAPH_SURFACE_MODULO_3D));
+        qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
+        g_free(message);
+        r->logged_flip_stall = true;
+    }
+    pgraph_d3d11_wait_and_resolve(d);
 }
 
 static void pgraph_d3d11_surface_flush_op(NV2AState *d)
@@ -704,7 +759,7 @@ static PGRAPHRenderer pgraph_d3d11_renderer = {
         .clear_surface = pgraph_d3d11_clear_surface,
         .draw_begin = pgraph_d3d11_draw_begin,
         .draw_end = pgraph_d3d11_draw_end,
-        .flip_stall = pgraph_d3d11_wait_and_resolve,
+        .flip_stall = pgraph_d3d11_flip_stall,
         .flush_draw = pgraph_d3d11_wait_and_resolve,
         .get_report = pgraph_d3d11_get_report,
         .image_blit = pgraph_d3d11_image_blit,

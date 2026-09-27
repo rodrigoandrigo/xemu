@@ -28,12 +28,16 @@
 #include <d3dcompiler.h>
 #include "shaders.h"
 
-#define D3D11_SHADER_CACHE_VERSION 4
+#define D3D11_SHADER_CACHE_VERSION 6
 #define D3D11_SHADER_CACHE_MAGIC 0x31485358U /* XSH1 */
 #define D3D11_SHADER_CACHE_MAX_BYTECODE (16 * MiB)
 #define D3D11_SHADER_MEMORY_CACHE_LIMIT 2048
 #define D3D11_SHADER_FAILURE_CACHE_LIMIT 256
 #define D3D11_PIXEL_CONSTANT_BUFFER_SIZE 656
+#define D3D11_VERTEX_CONSTANT_BUFFER_SIZE                            \
+    ((NV2A_VERTEXSHADER_CONSTANTS + 2 + 4 * NV2A_MAX_LIGHTS +        \
+      NV2A_LTC1_COUNT + NV2A_LTCTXA_COUNT + NV2A_LTCTXB_COUNT + 3) * \
+     4 * sizeof(float))
 
 typedef enum D3D11ShaderStage {
     D3D11_SHADER_STAGE_VERTEX = 1,
@@ -155,7 +159,17 @@ static const char d3d11_vsh_preamble[] =
     "  float4 C[192];\n"
     "  float4 clipRange;\n"
     "  float2 surfaceSize;\n"
-    "  float2 _constantPadding;\n"
+    "  float2 fogParam;\n"
+    "  float4 lightInfiniteDirection[8];\n"
+    "  float4 lightInfiniteHalfVector[8];\n"
+    "  float4 lightLocalAttenuation[8];\n"
+    "  float4 lightLocalPosition[8];\n"
+    "  float4 ltc1[20];\n"
+    "  float4 ltctxa[26];\n"
+    "  float4 ltctxb[52];\n"
+    "  float4 pointParams0;\n"
+    "  float4 pointParams1;\n"
+    "  float materialAlpha; float specularPower; float2 _constantPadding;\n"
     "};\n"
     "struct VSIn {\n"
     "  float4 v0 : ATTRIBUTE0; float4 v1 : ATTRIBUTE1;\n"
@@ -219,7 +233,12 @@ static const char d3d11_vsh_preamble[] =
     "  float w=clamp(a.w,-127.99609375,127.99609375);\n"
     "  float x=max(a.x,0), y=max(a.y,0);\n"
     "  return float4(1,x,x>0 ? exp2(w*log2(y)) : 0,1);\n"
-    "}\n";
+    "}\n"
+    "float4 xf_mul4(float4 v, uint base) {\n"
+    "  return float4(dot(v,C[base]),dot(v,C[base+1]),"
+    "dot(v,C[base+2]),dot(v,C[base+3]));\n"
+    "}\n"
+    "float3 xf_mul3(float4 v, uint base) { return xf_mul4(v,base).xyz; }\n";
 
 static void d3d11_vertex_shader_destroy(gpointer opaque)
 {
@@ -267,8 +286,7 @@ bool pgraph_d3d11_shaders_init(PGRAPHD3D11State *r, Error **errp)
         qemu_mkdir(r->shaders->cache_directory);
     }
     D3D11_BUFFER_DESC desc = {
-        .ByteWidth =
-            NV2A_VERTEXSHADER_CONSTANTS * 4 * sizeof(float) + 8 * sizeof(float),
+        .ByteWidth = D3D11_VERTEX_CONSTANT_BUFFER_SIZE,
         .Usage = D3D11_USAGE_DYNAMIC,
         .BindFlags = D3D11_BIND_CONSTANT_BUFFER,
         .CPUAccessFlags = D3D11_CPU_ACCESS_WRITE,
@@ -612,6 +630,311 @@ static char *d3d11_translate_vertex_program(const ProgrammableVshState *program,
     return g_string_free(s, FALSE);
 }
 
+static char *d3d11_translate_fixed_function_vertex(const VshState *state,
+                                                   Error **errp)
+{
+    const FixedFunctionVshState *ff = &state->fixed_function;
+    GString *s = g_string_new(d3d11_vsh_preamble);
+
+    /*
+     * The NV2A fixed-function transform consumes the same XF context vectors
+     * exposed through C[] as the programmable path.  Keep the initial D3D11
+     * implementation deliberately expressed in terms of those verified xemu
+     * constants instead of reconstructing desktop D3D fixed-function state.
+     */
+    g_string_append_printf(
+        s, "VSOut main(VSIn input) {\n"
+           "  float4 position=input.v0, diffuse=input.v3, specular=input.v4;\n"
+           "  float4 backDiffuse=input.v7, backSpecular=input.v8;\n"
+           "  float4 oT0=input.v9, oT1=input.v10;\n"
+           "  float4 oT2=input.v11, oT3=input.v12;\n"
+           "  float4 tPosition=0; float3 tNormal=0;\n");
+
+    unsigned int skin_count = 0;
+    bool generated_last_weight = false;
+    switch (ff->skinning) {
+    case SKINNING_OFF:
+        break;
+    case SKINNING_1WEIGHTS:
+        skin_count = 2;
+        generated_last_weight = true;
+        break;
+    case SKINNING_2WEIGHTS2MATRICES:
+        skin_count = 2;
+        break;
+    case SKINNING_2WEIGHTS:
+        skin_count = 3;
+        generated_last_weight = true;
+        break;
+    case SKINNING_3WEIGHTS3MATRICES:
+        skin_count = 3;
+        break;
+    case SKINNING_3WEIGHTS:
+        skin_count = 4;
+        generated_last_weight = true;
+        break;
+    case SKINNING_4WEIGHTS4MATRICES:
+        skin_count = 4;
+        break;
+    default:
+        error_setg(errp, "D3D11: invalid fixed-function skinning mode %u",
+                   ff->skinning);
+        g_string_free(s, TRUE);
+        return NULL;
+    }
+    if (!skin_count) {
+        g_string_append_printf(s,
+                               "  tPosition=xf_mul4(position,%u);"
+                               " tNormal=xf_mul3(float4(input.v2.xyz,0),%u);\n",
+                               NV_IGRAPH_XF_XFCTX_MMAT0,
+                               NV_IGRAPH_XF_XFCTX_IMMAT0);
+    } else {
+        g_string_append(s, "  float remainingWeight=1.0;\n");
+        for (unsigned int i = 0; i < skin_count; i++) {
+            char component = "xyzw"[i];
+            if (generated_last_weight && i == skin_count - 1) {
+                g_string_append(s, "  float skinWeight=remainingWeight;\n");
+            } else {
+                g_string_append_printf(s,
+                                       "  float skinWeight%u=input.v1.%c;"
+                                       " remainingWeight-=skinWeight%u;\n",
+                                       i, component, i);
+            }
+            const char *weight_name =
+                generated_last_weight && i == skin_count - 1 ? "skinWeight" :
+                                                               NULL;
+            if (weight_name) {
+                g_string_append_printf(
+                    s,
+                    "  tPosition+=xf_mul4(position,%u)*%s;"
+                    " tNormal+=xf_mul3(float4(input.v2.xyz,0),%u)*%s;\n",
+                    NV_IGRAPH_XF_XFCTX_MMAT0 + i * 8, weight_name,
+                    NV_IGRAPH_XF_XFCTX_IMMAT0 + i * 8, weight_name);
+            } else {
+                g_string_append_printf(
+                    s,
+                    "  tPosition+=xf_mul4(position,%u)*skinWeight%u;"
+                    " tNormal+=xf_mul3(float4(input.v2.xyz,0),%u)*"
+                    "skinWeight%u;\n",
+                    NV_IGRAPH_XF_XFCTX_MMAT0 + i * 8, i,
+                    NV_IGRAPH_XF_XFCTX_IMMAT0 + i * 8, i);
+            }
+        }
+    }
+    if (ff->normalization) {
+        g_string_append(s, "  tNormal=normalize(tNormal);\n");
+    }
+
+    for (unsigned int stage = 0; stage < NV2A_MAX_TEXTURES; stage++) {
+        const char *tex = stage == 0 ? "oT0" :
+                          stage == 1 ? "oT1" :
+                          stage == 2 ? "oT2" :
+                                       "oT3";
+        const char *input = stage == 0 ? "input.v9" :
+                            stage == 1 ? "input.v10" :
+                            stage == 2 ? "input.v11" :
+                                         "input.v12";
+        unsigned int plane = NV_IGRAPH_XF_XFCTX_TG0MAT + stage * 8;
+        for (unsigned int component = 0; component < 4; component++) {
+            char channel = "xyzw"[component];
+            switch (ff->texgen[stage][component]) {
+            case TEXGEN_DISABLE:
+                break;
+            case TEXGEN_EYE_LINEAR:
+                g_string_append_printf(s, "  %s.%c=dot(tPosition,C[%u]);\n",
+                                       tex, channel, plane + component);
+                break;
+            case TEXGEN_OBJECT_LINEAR:
+                g_string_append_printf(s, "  %s.%c=dot(position,C[%u]);\n", tex,
+                                       channel, plane + component);
+                break;
+            case TEXGEN_NORMAL_MAP:
+                if (component < 3) {
+                    g_string_append_printf(s, "  %s.%c=input.v2.%c;\n", tex,
+                                           channel, channel);
+                }
+                break;
+            case TEXGEN_SPHERE_MAP:
+            case TEXGEN_REFLECTION_MAP:
+                /* Filled below as a vector so the reflection is shared. */
+                break;
+            default:
+                error_setg(errp, "D3D11: unsupported fixed-function texgen %u",
+                           ff->texgen[stage][component]);
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+        }
+        bool sphere = ff->texgen[stage][0] == TEXGEN_SPHERE_MAP ||
+                      ff->texgen[stage][1] == TEXGEN_SPHERE_MAP;
+        bool reflection = sphere;
+        for (unsigned int component = 0; component < 3; component++) {
+            reflection |= ff->texgen[stage][component] == TEXGEN_REFLECTION_MAP;
+        }
+        if (reflection) {
+            g_string_append_printf(
+                s,
+                "  { float3 n=normalize(input.v2.xyz);"
+                " float3 u=normalize(tPosition.xyz); float3 r=reflect(u,n);\n");
+            if (sphere) {
+                g_string_append_printf(
+                    s,
+                    "    float invM=1.0/(2.0*length(r+float3(0,0,1)));"
+                    " %s.xy=r.xy*invM+0.5;\n",
+                    tex);
+            }
+            if (!sphere) {
+                g_string_append_printf(s, "    %s.xyz=r;\n", tex);
+            }
+            g_string_append(s, "  }\n");
+        }
+        if (ff->texture_matrix_enable[stage]) {
+            unsigned int matrix = NV_IGRAPH_XF_XFCTX_T0MAT + stage * 8;
+            g_string_append_printf(s,
+                                   "  %s=float4(dot(%s,C[%u]),dot(%s,C[%u]),"
+                                   "dot(%s,C[%u]),dot(%s,C[%u]));\n",
+                                   tex, tex, matrix + 0, tex, matrix + 1, tex,
+                                   matrix + 2, tex, matrix + 3);
+        }
+        (void)input;
+    }
+
+    if (ff->lighting) {
+        const char *alpha =
+            ff->diffuse_src == MATERIAL_COLOR_SRC_MATERIAL ? "materialAlpha" :
+            ff->diffuse_src == MATERIAL_COLOR_SRC_SPECULAR ? "specular.a" :
+                                                             "diffuse.a";
+        const char *ambient =
+            ff->ambient_src == MATERIAL_COLOR_SRC_DIFFUSE  ? "diffuse.rgb" :
+            ff->ambient_src == MATERIAL_COLOR_SRC_SPECULAR ? "specular.rgb" :
+                                                             "ltctxa[17].rgb";
+        const char *emission =
+            ff->emission_src == MATERIAL_COLOR_SRC_DIFFUSE  ? "diffuse.rgb" :
+            ff->emission_src == MATERIAL_COLOR_SRC_SPECULAR ? "specular.rgb" :
+                                                              "ltctxa[17].rgb";
+        g_string_append_printf(
+            s,
+            "  float4 litDiffuse=float4(%s,%s);"
+            " litDiffuse.rgb*=ltctxa[%u].rgb; litDiffuse.rgb+=%s;\n"
+            "  float4 litSpecular=float4(0,0,0,specular.a);\n",
+            ambient, alpha, NV_IGRAPH_XF_LTCTXA_CM_COL, emission);
+        if (ff->local_eye) {
+            g_string_append_printf(
+                s,
+                "  float3 eyeVector=normalize(C[%u].xyz/C[%u].w-"
+                "tPosition.xyz/tPosition.w);\n",
+                NV_IGRAPH_XF_XFCTX_EYEP, NV_IGRAPH_XF_XFCTX_EYEP);
+        } else {
+            g_string_append(s, "  float3 eyeVector=float3(0,0,0);\n");
+        }
+        for (unsigned int i = 0; i < NV2A_MAX_LIGHTS; i++) {
+            if (ff->light[i] == LIGHT_OFF) {
+                continue;
+            }
+            g_string_append_printf(s, "  { // NV2A light %u\n", i);
+            if (ff->light[i] == LIGHT_INFINITE) {
+                g_string_append_printf(
+                    s,
+                    "    float attenuation=1.0;"
+                    " float3 "
+                    "lightVector=normalize(lightInfiniteDirection[%u].xyz);\n",
+                    i);
+                if (ff->local_eye) {
+                    g_string_append(
+                        s, "    float3 "
+                           "halfVector=normalize(lightVector+eyeVector);\n");
+                } else {
+                    g_string_append_printf(
+                        s,
+                        "    float3 "
+                        "halfVector=lightInfiniteHalfVector[%u].xyz;\n",
+                        i);
+                }
+            } else {
+                g_string_append_printf(
+                    s,
+                    "    float3 delta=lightLocalPosition[%u].xyz-"
+                    "tPosition.xyz/tPosition.w; float "
+                    "distanceToLight=length(delta);\n"
+                    "    float3 lightVector=normalize(delta);"
+                    " float attenuation=distanceToLight<=ltc1[%u].x ?"
+                    " 1.0/(lightLocalAttenuation[%u].x+"
+                    "lightLocalAttenuation[%u].y*distanceToLight+"
+                    "lightLocalAttenuation[%u].z*distanceToLight*"
+                    "distanceToLight) : 0.0;\n"
+                    "    float3 halfVector=normalize(lightVector+eyeVector);\n",
+                    i, NV_IGRAPH_XF_LTC1_r0 + i, i, i, i);
+                if (ff->light[i] == LIGHT_SPOT) {
+                    g_string_append_printf(
+                        s,
+                        "    float4 spot=ltctxa[%u]; float invScale=1.0/"
+                        "length(spot.xyz); float rho=invScale*dot(spot.xyz,"
+                        "lightVector); float outer=-invScale*spot.w;"
+                        " float inner=invScale+outer; attenuation*=rho>inner ?"
+                        " 1.0 : (rho<=outer ? 0.0 : dot(spot.xyz,lightVector)+"
+                        "spot.w);\n",
+                        NV_IGRAPH_XF_LTCTXA_L0_SPT + i * 2);
+                }
+            }
+            const char *diffuse_factor =
+                ff->diffuse_src == MATERIAL_COLOR_SRC_DIFFUSE ?
+                    "diffuse.rgb*" :
+                ff->diffuse_src == MATERIAL_COLOR_SRC_SPECULAR ?
+                    "specular.rgb*" :
+                    "";
+            const char *specular_factor =
+                ff->specular_src == MATERIAL_COLOR_SRC_DIFFUSE ?
+                    "diffuse.rgb*" :
+                ff->specular_src == MATERIAL_COLOR_SRC_SPECULAR ?
+                    "specular.rgb*" :
+                    "";
+            g_string_append_printf(
+                s,
+                "    float ndl=max(0.0,dot(tNormal,lightVector));"
+                " float ndh=max(0.0,dot(tNormal,halfVector));\n"
+                "    float power=(ndl==0.0||ndh==0.0) ? 0.0 :"
+                " pow(ndh,specularPower);\n"
+                "    litDiffuse.rgb+=ltctxb[%u].rgb*attenuation;\n"
+                "    litDiffuse.rgb+=%sltctxb[%u].rgb*attenuation*ndl;\n"
+                "    litSpecular.rgb+=%sltctxb[%u].rgb*attenuation*power;\n"
+                "  }\n",
+                NV_IGRAPH_XF_LTCTXB_L0_AMB + i * 6, diffuse_factor,
+                NV_IGRAPH_XF_LTCTXB_L0_DIF + i * 6, specular_factor,
+                NV_IGRAPH_XF_LTCTXB_L0_SPC + i * 6);
+        }
+        if (!state->separate_specular) {
+            g_string_append(s, "  litDiffuse.rgb+=litSpecular.rgb;"
+                               " litSpecular=specular;\n");
+        }
+        g_string_append(s, "  diffuse=litDiffuse; specular=litSpecular;\n");
+    }
+
+    if (!skin_count) {
+        g_string_append(s, "  tPosition=position;\n");
+    }
+    g_string_append_printf(s, "  float4 oPos=xf_mul4(tPosition,%u);\n",
+                           NV_IGRAPH_XF_XFCTX_CMAT0);
+
+    g_string_append_printf(
+        s,
+        "  oPos.w=nv_clamp_away(oPos.w);\n"
+        "  oPos.xy+=C[%u].xy;\n"
+        "  oPos.xy=trunc(oPos.xy*16.0)/16.0;\n"
+        "  oPos.xy=(2.0*oPos.xy-surfaceSize)/surfaceSize;\n"
+        "  oPos.z=oPos.z/clipRange.y; oPos.xyz*=oPos.w;\n"
+        "  VSOut output; output.position=oPos; output.diffuse=diffuse;\n"
+        "  output.specular=%s; output.backDiffuse=backDiffuse;\n"
+        "  output.backSpecular=%s; output.fog=%s;\n"
+        "  output.pointSize=%ff; output.tex0=oT0; output.tex1=oT1;\n"
+        "  output.tex2=oT2; output.tex3=oT3; return output;\n}\n",
+        NV_IGRAPH_XF_XFCTX_VPOFF,
+        state->specular_enable ? "specular" : "float4(0,0,0,1)",
+        state->specular_enable ? "backSpecular" : "float4(0,0,0,1)",
+        state->fog_enable ? "input.v5.x" : "1.0",
+        MAX(1.0f, state->point_size) * state->surface_scale_factor);
+    return g_string_free(s, FALSE);
+}
+
 static PGRAPHD3D11VertexShader *d3d11_compile_vertex_shader(PGRAPHD3D11State *r,
                                                             const char *source,
                                                             Error **errp)
@@ -700,12 +1023,25 @@ typedef struct PGRAPHD3D11VertexConstants {
     float c[NV2A_VERTEXSHADER_CONSTANTS][4];
     float clip_range[4];
     float surface_size[2];
+    float fog_param[2];
+    float light_infinite_direction[NV2A_MAX_LIGHTS][4];
+    float light_infinite_half_vector[NV2A_MAX_LIGHTS][4];
+    float light_local_attenuation[NV2A_MAX_LIGHTS][4];
+    float light_local_position[NV2A_MAX_LIGHTS][4];
+    float ltc1[NV2A_LTC1_COUNT][4];
+    float ltctxa[NV2A_LTCTXA_COUNT][4];
+    float ltctxb[NV2A_LTCTXB_COUNT][4];
+    float point_params[8];
+    float material_alpha;
+    float specular_power;
     float padding[2];
 } PGRAPHD3D11VertexConstants;
 
 static bool d3d11_update_vertex_constants(PGRAPHState *pg,
                                           const VshState *state, Error **errp)
 {
+    QEMU_BUILD_BUG_ON(sizeof(PGRAPHD3D11VertexConstants) !=
+                      D3D11_VERTEX_CONSTANT_BUFFER_SIZE);
     PGRAPHD3D11State *r = pg->d3d11_renderer_state;
     VshUniformLocs locs;
     for (unsigned int i = 0; i < ARRAY_SIZE(locs); i++) {
@@ -714,6 +1050,17 @@ static bool d3d11_update_vertex_constants(PGRAPHState *pg,
     locs[VshUniform_c] = 0;
     locs[VshUniform_clipRange] = 0;
     locs[VshUniform_surfaceSize] = 0;
+    locs[VshUniform_fogParam] = 0;
+    locs[VshUniform_lightInfiniteDirection] = 0;
+    locs[VshUniform_lightInfiniteHalfVector] = 0;
+    locs[VshUniform_lightLocalAttenuation] = 0;
+    locs[VshUniform_lightLocalPosition] = 0;
+    locs[VshUniform_ltc1] = 0;
+    locs[VshUniform_ltctxa] = 0;
+    locs[VshUniform_ltctxb] = 0;
+    locs[VshUniform_material_alpha] = 0;
+    locs[VshUniform_pointParams] = 0;
+    locs[VshUniform_specularPower] = 0;
     VshUniformValues values = { 0 };
     pgraph_glsl_set_vsh_uniform_values(pg, state, locs, &values);
     PGRAPHD3D11VertexConstants constants = { 0 };
@@ -722,6 +1069,25 @@ static bool d3d11_update_vertex_constants(PGRAPHState *pg,
            sizeof(constants.clip_range));
     memcpy(constants.surface_size, values.surfaceSize[0],
            sizeof(constants.surface_size));
+    memcpy(constants.fog_param, values.fogParam[0],
+           sizeof(constants.fog_param));
+    for (unsigned int i = 0; i < NV2A_MAX_LIGHTS; i++) {
+        memcpy(constants.light_infinite_direction[i],
+               values.lightInfiniteDirection[i], 3 * sizeof(float));
+        memcpy(constants.light_infinite_half_vector[i],
+               values.lightInfiniteHalfVector[i], 3 * sizeof(float));
+        memcpy(constants.light_local_attenuation[i],
+               values.lightLocalAttenuation[i], 3 * sizeof(float));
+        memcpy(constants.light_local_position[i], values.lightLocalPosition[i],
+               3 * sizeof(float));
+    }
+    memcpy(constants.ltc1, values.ltc1, sizeof(constants.ltc1));
+    memcpy(constants.ltctxa, values.ltctxa, sizeof(constants.ltctxa));
+    memcpy(constants.ltctxb, values.ltctxb, sizeof(constants.ltctxb));
+    memcpy(constants.point_params, values.pointParams,
+           sizeof(constants.point_params));
+    constants.material_alpha = values.material_alpha[0];
+    constants.specular_power = values.specularPower[0];
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr = ID3D11DeviceContext_Map(
@@ -747,20 +1113,21 @@ bool pgraph_d3d11_bind_vertex_shader(PGRAPHState *pg, Error **errp)
     PGRAPHD3D11State *r = pg->d3d11_renderer_state;
     VshState state = { 0 };
     pgraph_glsl_set_vsh_state(pg, &state);
-    if (state.is_fixed_function) {
-        error_setg(errp, "D3D11: fixed-function NV2A vertex translation is not "
-                         "implemented");
-        return false;
-    }
     const ProgrammableVshState *program = &state.programmable;
-    GByteArray *key_data = g_byte_array_sized_new(
-        sizeof(program->program_length) +
-        program->program_length * sizeof(program->program_data[0]));
-    g_byte_array_append(key_data, (const uint8_t *)&program->program_length,
-                        sizeof(program->program_length));
-    g_byte_array_append(key_data, (const uint8_t *)program->program_data,
-                        program->program_length *
-                            sizeof(program->program_data[0]));
+    GByteArray *key_data;
+    if (state.is_fixed_function) {
+        key_data = g_byte_array_sized_new(sizeof(state));
+        g_byte_array_append(key_data, (const uint8_t *)&state, sizeof(state));
+    } else {
+        key_data = g_byte_array_sized_new(sizeof(program->program_length) +
+                                          program->program_length *
+                                              sizeof(program->program_data[0]));
+        g_byte_array_append(key_data, (const uint8_t *)&program->program_length,
+                            sizeof(program->program_length));
+        g_byte_array_append(key_data, (const uint8_t *)program->program_data,
+                            program->program_length *
+                                sizeof(program->program_data[0]));
+    }
     GBytes *key = g_byte_array_free_to_bytes(key_data);
     PGRAPHD3D11VertexShader *shader =
         g_hash_table_lookup(r->shaders->vertex_cache, key);
@@ -773,7 +1140,9 @@ bool pgraph_d3d11_bind_vertex_shader(PGRAPHState *pg, Error **errp)
         shader = d3d11_create_cached_vertex_shader(r, key);
     }
     if (!shader) {
-        char *source = d3d11_translate_vertex_program(program, errp);
+        char *source = state.is_fixed_function ?
+                           d3d11_translate_fixed_function_vertex(&state, errp) :
+                           d3d11_translate_vertex_program(program, errp);
         if (!source) {
             if (g_hash_table_size(r->shaders->failed_vertex_cache) >=
                 D3D11_SHADER_FAILURE_CACHE_LIMIT) {

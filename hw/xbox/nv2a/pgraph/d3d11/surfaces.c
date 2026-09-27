@@ -789,6 +789,10 @@ static bool d3d11_create_target(NV2AState *d, bool color, Error **errp)
     }
 
     ID3D11DeviceContext_OMSetRenderTargets(r->context, 0, NULL, NULL);
+    if (color && target->texture &&
+        !pgraph_d3d11_retain_color_scanout(d, errp)) {
+        return false;
+    }
     d3d11_release_target(target);
     D3D11_TEXTURE2D_DESC desc = {
         .Width = width,

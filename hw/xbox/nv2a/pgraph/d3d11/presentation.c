@@ -135,6 +135,12 @@ void pgraph_d3d11_presentation_finalize(PGRAPHD3D11State *r)
     if (presentation->scanout_texture) {
         ID3D11Texture2D_Release(presentation->scanout_texture);
     }
+    if (presentation->retained_srv) {
+        ID3D11ShaderResourceView_Release(presentation->retained_srv);
+    }
+    if (presentation->retained_texture) {
+        ID3D11Texture2D_Release(presentation->retained_texture);
+    }
     if (presentation->nearest_sampler) {
         ID3D11SamplerState_Release(presentation->nearest_sampler);
     }
@@ -149,6 +155,69 @@ void pgraph_d3d11_presentation_finalize(PGRAPHD3D11State *r)
     }
     g_free(presentation);
     r->presentation = NULL;
+}
+
+static bool d3d11_retain_scanout(PGRAPHD3D11State *r,
+                                 PGRAPHD3D11RenderTarget *color, Error **errp)
+{
+    PGRAPHD3D11PresentationState *presentation = r->presentation;
+    if (!color->texture || !color->srv || !color->width || !color->height) {
+        return false;
+    }
+    if (!presentation->retained_texture ||
+        presentation->retained_width != color->width ||
+        presentation->retained_height != color->height) {
+        if (presentation->retained_srv) {
+            ID3D11ShaderResourceView_Release(presentation->retained_srv);
+            presentation->retained_srv = NULL;
+        }
+        if (presentation->retained_texture) {
+            ID3D11Texture2D_Release(presentation->retained_texture);
+            presentation->retained_texture = NULL;
+        }
+        D3D11_TEXTURE2D_DESC desc;
+        ID3D11Texture2D_GetDesc(color->texture, &desc);
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+        HRESULT hr = ID3D11Device_CreateTexture2D(
+            r->device, &desc, NULL, &presentation->retained_texture);
+        if (SUCCEEDED(hr)) {
+            hr = ID3D11Device_CreateShaderResourceView(
+                r->device, (ID3D11Resource *)presentation->retained_texture,
+                NULL, &presentation->retained_srv);
+        }
+        if (FAILED(hr)) {
+            error_setg(errp,
+                       "D3D11: failed to retain PCRTC render target "
+                       "(HRESULT 0x%08lx)",
+                       (unsigned long)hr);
+            return false;
+        }
+        presentation->retained_width = color->width;
+        presentation->retained_height = color->height;
+    }
+    ID3D11DeviceContext_CopyResource(
+        r->context, (ID3D11Resource *)presentation->retained_texture,
+        (ID3D11Resource *)color->texture);
+    return true;
+}
+
+bool pgraph_d3d11_retain_color_scanout(NV2AState *d, Error **errp)
+{
+    PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
+    PGRAPHD3D11RenderTarget *color = &r->render_targets.color;
+    if (!r->presentation || !color->srv) {
+        return true;
+    }
+    VGADisplayParams params;
+    d->vga.get_params(&d->vga, &params);
+    hwaddr scanout_address = d->pcrtc.start + params.line_offset;
+    bool contains_scanout =
+        scanout_address >= color->vram_address &&
+        scanout_address - color->vram_address < color->storage_length;
+    return !contains_scanout || d3d11_retain_scanout(r, color, errp);
 }
 
 static bool d3d11_prepare_raw_scanout(NV2AState *d,
@@ -322,15 +391,6 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     ID3D11DeviceContext_RSSetState(r->context, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(r->context, r->backbuffer_rtv,
                                               black);
-    if (nv2a_get_screen_off()) {
-        if (!r->logged_present_without_color) {
-            qemu_host_emit_log(QEMU_HOST_LOG_INFO,
-                               "D3D11: presentation suppressed by screen-off");
-            r->logged_present_without_color = true;
-        }
-        return true;
-    }
-
     VGADisplayParams params;
     d->vga.get_params(&d->vga, &params);
     hwaddr scanout_address = d->pcrtc.start + params.line_offset;
@@ -341,7 +401,18 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
         color_contains_scanout ? color->srv : NULL;
     uint32_t source_width = color->width;
     uint32_t source_height = color->height;
+    PGRAPHD3D11PresentationState *presentation = r->presentation;
+    bool retained_scanout = false;
     bool raw_scanout = false;
+    if (color_contains_scanout && !d3d11_retain_scanout(r, color, errp)) {
+        return false;
+    }
+    if (!source_view && presentation->retained_srv) {
+        source_view = presentation->retained_srv;
+        source_width = presentation->retained_width;
+        source_height = presentation->retained_height;
+        retained_scanout = true;
+    }
     if (!source_view) {
         raw_scanout = d3d11_prepare_raw_scanout(d, &source_view, &source_width,
                                                 &source_height, errp);
@@ -371,7 +442,10 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
             " line-offset=%u",
             color_contains_scanout ?
                 "render-target" :
-                (raw_scanout ? "raw PCRTC" : "current render-target fallback"),
+                (retained_scanout ?
+                     "retained render-target" :
+                     (raw_scanout ? "raw PCRTC" :
+                                    "current render-target fallback")),
             source_width, source_height, d->pcrtc.start, params.line_offset);
         qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
         g_free(message);
@@ -382,7 +456,6 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     scanout.width = source_width;
     scanout.height = source_height;
     D3D11_VIEWPORT viewport = d3d11_presentation_viewport(r, &scanout);
-    PGRAPHD3D11PresentationState *presentation = r->presentation;
     ID3D11SamplerState *sampler =
         g_config.display.filtering == CONFIG_DISPLAY_FILTERING_LINEAR ?
             presentation->linear_sampler :

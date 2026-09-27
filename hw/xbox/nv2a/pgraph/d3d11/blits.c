@@ -115,15 +115,18 @@ static bool d3d11_blit_rows(PGRAPHState *pg, uint8_t *destination,
 
 static bool d3d11_blit_range_valid(hwaddr offset, size_t pitch, size_t width,
                                    size_t height, unsigned int bpp,
-                                   hwaddr dma_length)
+                                   hwaddr dma_limit)
 {
     uint64_t row_bytes;
     uint64_t last_row;
     uint64_t end;
+    uint64_t dma_size;
     return !__builtin_mul_overflow((uint64_t)width, bpp, &row_bytes) &&
            !__builtin_mul_overflow((uint64_t)(height - 1), pitch, &last_row) &&
            !__builtin_add_overflow((uint64_t)offset, last_row, &end) &&
-           !__builtin_add_overflow(end, row_bytes, &end) && end <= dma_length;
+           !__builtin_add_overflow(end, row_bytes, &end) &&
+           !__builtin_add_overflow((uint64_t)dma_limit, 1, &dma_size) &&
+           end <= dma_size;
 }
 
 void pgraph_d3d11_image_blit(NV2AState *d)
@@ -175,9 +178,10 @@ void pgraph_d3d11_image_blit(NV2AState *d)
     hwaddr destination_dma_length;
     uint8_t *destination_base =
         nv_dma_map(d, surfaces->dma_image_dest, &destination_dma_length);
+    /* nv_dma_map returns the NV2A DMA limit, which is inclusive. */
     if (!source_base || !destination_base ||
-        surfaces->source_offset >= source_dma_length ||
-        surfaces->dest_offset >= destination_dma_length) {
+        surfaces->source_offset > source_dma_length ||
+        surfaces->dest_offset > destination_dma_length) {
         qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
                            "D3D11: image blit DMA mapping is invalid");
         return;

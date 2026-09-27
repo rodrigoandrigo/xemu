@@ -5,17 +5,19 @@ an embedded DLL on Windows and Xbox in Developer Mode. It owns the application
 lifecycle, brokered file access, controller input, settings, logs, and the XAML
 render surface.
 
-The two graphics paths are:
+The supported graphics path is:
 
 ```text
 xemu NV2A -> OpenGL -> Mesa Gallium D3D12 -> D3D12/DXGI -> SwapChainPanel
-xemu NV2A -> Vulkan -> Mesa DZN -> D3D12/DXGI -> SwapChainPanel
 ```
 
 SDL3 supplies the UWP platform and input integration. Mesa supplies OpenGL
-through Gallium D3D12 and a native Vulkan ICD through DZN. The Vulkan path
-creates a composition swapchain and attaches it directly to the XAML
-`SwapChainPanel`; it does not pass Vulkan frames through OpenGL.
+through Gallium D3D12. OpenGL is currently the only renderer that works with
+acceptable correctness and stability in UWP-Port. Native D3D11, native D3D12,
+and Vulkan/DZN were implemented or evaluated experimentally, but did not
+render xemu correctly and reliably enough for normal use. They are therefore
+not exposed in the UWP-Port interface and must not be considered supported
+rendering paths.
 
 ## Requirements
 
@@ -98,13 +100,16 @@ Build Mesa for Windows/UWP x64 with:
 - OpenGL enabled
 - Gallium D3D12 graphics enabled
 - Gallium D3D12 video enabled
-- Vulkan DZN (`microsoft-experimental`) enabled
+- Vulkan DZN (`microsoft-experimental`) enabled only when required by the
+  existing build workflow; it is not a supported UWP-Port renderer
 - LLVM disabled when the internal DXIL compiler is available
 
 Place or configure the Mesa outputs so the host project can package
-`opengl32.dll`, `gallium_wgl.dll`, and `vulkan_dzn.dll` from the expected build
-tree. DZN is loaded as the packaged Vulkan ICD when Vulkan is selected in the
-Settings page; it does not depend on the desktop Vulkan loader or registry.
+`opengl32.dll` and `gallium_wgl.dll` from the expected build tree. The current
+workflow may also package `vulkan_dzn.dll` as an experimental build artifact,
+but Vulkan cannot be selected in the UWP-Port Settings page. Runtime settings
+are normalized to OpenGL, including configurations saved by older builds with
+an experimental renderer selected.
 
 ## Build and package UWP-Port
 
@@ -146,7 +151,8 @@ The current source manifest version is `1.0.0.110`.
 The `Build UWP-Port` workflow performs the complete x64 Release build on a
 Windows runner. It checks out `rodrigoandrigo/SDL3_UWP`, builds its WinRT
 project, builds the xemu embedding DLL, strips unneeded symbols from that DLL,
-builds Mesa Gallium D3D12 and Vulkan DZN, packages UWP-Port, and uploads the
+builds Mesa Gallium D3D12 and the existing experimental Vulkan DZN artifact,
+packages UWP-Port, and uploads the
 MSIX, certificate, symbols, and framework dependencies as the
 `UWP-Port-x64-Release` artifact.
 
@@ -182,10 +188,8 @@ Windows Future Access List and overrides the LocalState default on later runs.
 
 OpenGL shader compilation and cache-file writes do not hold the renderer cache
 mutex. Mesa performs NIR-to-DXIL compilation and D3D12 pipeline creation on its
-compiler workers. Vulkan/DZN also persists its native pipeline cache in
-`LocalState`, reducing compilation work on later launches. Cache files may be
-removed to force a clean shader and pipeline rebuild when diagnosing renderer
-problems.
+compiler workers. Cache files may be removed to force a clean shader and
+pipeline rebuild when diagnosing renderer problems.
 
 The MCPX APU produces audio on its own thread. On UWP, PCI interrupt updates are
 forwarded to the QEMU main loop without blocking that real-time producer on the
@@ -199,8 +203,8 @@ The small performance overlay displayed over the emulation surface reports:
 - **MSPF**: average milliseconds spent per video frame.
 
 A temporary MSPF increase is expected while a new shader or pipeline is first
-compiled. Persistent increases should be investigated with `xemu.log`, a cold
-and warm cache comparison, and the same scene in both OpenGL and Vulkan/DZN.
+compiled. Persistent increases should be investigated with `xemu.log` and a
+cold and warm OpenGL cache comparison.
 
 ## VLan/VPN rooms
 
@@ -261,6 +265,9 @@ not require access to unrestricted desktop paths.
 - Rendering must remain attached to the XAML `SwapChainPanel`; desktop window
   ownership and desktop DXGI debug interfaces are not available on Xbox retail
   environments.
+- OpenGL through Mesa Gallium D3D12 is the only supported renderer. The native
+  D3D11, native D3D12, and Vulkan/DZN experiments did not provide correct and
+  stable xemu rendering and are intentionally unavailable in the interface.
 - Video settings that operate on the guest framebuffer or xemu HUD are
   supported: internal resolution, filtering, display fit, aspect ratio, VSync,
   notifications, animations, and HUD scale. Desktop window size, exclusive
