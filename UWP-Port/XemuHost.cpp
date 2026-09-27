@@ -612,10 +612,6 @@ bool XemuHost::UpdateRenderPanelSize(
                 pixelWidth, pixelHeight);
     m_renderWidth = static_cast<uint32_t>(pixelWidth);
     m_renderHeight = static_cast<uint32_t>(pixelHeight);
-    if (m_setD3D12PresentTarget) {
-        m_setD3D12PresentTarget(m_renderWidth, m_renderHeight,
-                                &XemuHost::AttachMesaSwapChain, this);
-    }
     if (!m_updateSDLPanelSize(logicalWidth, logicalHeight,
                               pixelWidth, pixelHeight)) {
         return false;
@@ -717,12 +713,6 @@ bool XemuHost::Load()
         return false;
     }
     WriteDiagnostic("[loader] Embedding API is compatible");
-    if (!m_renderWidth || !m_renderHeight ||
-        m_setD3D12PresentTarget(m_renderWidth, m_renderHeight,
-                                &XemuHost::AttachMesaSwapChain, this) != 0) {
-        SetError("Failed to register the D3D12 SwapChainPanel target");
-        return false;
-    }
     m_registerLog(&XemuHost::Log, this);
     WriteDiagnostic("[loader] xemu log callback registered");
     auto pipelineCachePath = ApplicationData::Current->LocalFolder->Path +
