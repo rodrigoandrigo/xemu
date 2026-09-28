@@ -131,6 +131,9 @@ DirectXPage::DirectXPage():
 	m_flashMountPending(false),
 	m_bootromMountPending(false),
 	m_hddMountPending(false),
+	m_protocolAutoStart(false),
+	m_previousRunning(false),
+	m_frontendReturnUri(nullptr),
 	m_savedSystemPointerCursor(nullptr),
 	m_systemPointerHidden(false),
 	m_logRefreshFrames(0),
@@ -170,6 +173,9 @@ DirectXPage::DirectXPage():
 
 	m_xemu = std::unique_ptr<XemuHost>(new XemuHost());
 	m_vlan = std::unique_ptr<VLanManager>(new VLanManager());
+	m_streamReceiver = ref new H264RtpReceiver();
+	m_screenScraper = ref new ScreenScraperApi();
+	m_screenScraper->RestoreRepository();
 	LoadSettings();
 	WireAutomaticSettings();
 	RestorePersistedFiles();
@@ -198,6 +204,7 @@ DirectXPage::DirectXPage():
 
 DirectXPage::~DirectXPage()
 {
+	if (m_streamReceiver) m_streamReceiver->Stop();
 	if (m_vlan) m_vlan->Stop();
 	// Interrompa a renderização e o processamento de eventos em destruição.
 	Windows::UI::Xaml::Media::CompositionTarget::Rendering -= m_renderingToken;
@@ -216,6 +223,76 @@ DirectXPage::~DirectXPage()
 	}
 }
 
+void DirectXPage::StartStream_Click(Object^, RoutedEventArgs^)
+{
+	unsigned long port = wcstoul(streamPort->Text->Data(), nullptr, 10);
+	unsigned long width = wcstoul(streamWidth->Text->Data(), nullptr, 10);
+	unsigned long height = wcstoul(streamHeight->Text->Data(), nullptr, 10);
+	if (port < 1 || port > 65535 || width < 16 || width > 3840 ||
+	    height < 16 || height > 2160) {
+		streamStatus->Text = "Enter a valid port and dimensions up to 3840x2160.";
+		return;
+	}
+	try {
+		ApplicationData::Current->LocalSettings->Values->Insert(
+			"stream.rtp.bind", streamBindAddress->Text);
+		ApplicationData::Current->LocalSettings->Values->Insert(
+			"stream.rtp.port", streamPort->Text);
+		ApplicationData::Current->LocalSettings->Values->Insert(
+			"stream.rtp.width", streamWidth->Text);
+		ApplicationData::Current->LocalSettings->Values->Insert(
+			"stream.rtp.height", streamHeight->Text);
+		m_streamReceiver->Start(streamBindAddress->Text,
+			static_cast<unsigned short>(port), static_cast<unsigned int>(width),
+			static_cast<unsigned int>(height), streamVideo);
+		streamVideo->Visibility = Windows::UI::Xaml::Visibility::Visible;
+		launcherPanel->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+		streamStatus->Text = "Starting RTP/H.264 receiver...";
+	} catch (Platform::Exception^ exception) {
+		streamStatus->Text = "Failed to start receiver: " + exception->Message;
+	}
+}
+
+void DirectXPage::StopStream_Click(Object^, RoutedEventArgs^)
+{
+	m_streamReceiver->Stop();
+	streamVideo->Visibility = Windows::UI::Xaml::Visibility::Collapsed;
+	if (!m_xemu->IsRunning())
+		launcherPanel->Visibility = Windows::UI::Xaml::Visibility::Visible;
+	streamStatus->Text = "Stopped";
+}
+
+void DirectXPage::SelectMediaRepository_Click(Object^, RoutedEventArgs^)
+{
+	auto picker = ref new Windows::Storage::Pickers::FolderPicker();
+	picker->FileTypeFilter->Append("*");
+	create_task(picker->PickSingleFolderAsync()).then([this](StorageFolder^ folder) {
+		if (!folder) return;
+		m_screenScraper->SetRepository(folder, true);
+		scraperRepository->Text = folder->Path;
+		scraperStatus->Text = m_screenScraper->Status;
+	});
+}
+
+void DirectXPage::ScrapeGame_Click(Object^, RoutedEventArgs^)
+{
+	auto selectedRegion = dynamic_cast<ComboBoxItem^>(scraperRegion->SelectedItem);
+	auto region = selectedRegion ? selectedRegion->Tag->ToString() : "wor";
+	unsigned long systemId = wcstoul(scraperSystemId->Text->Data(), nullptr, 10);
+	m_screenScraper->Configure(scraperDeveloperId->Text,
+		scraperDeveloperPassword->Password, scraperSoftwareName->Text,
+		scraperUser->Text, scraperPassword->Password);
+	m_screenScraper->ScrapeGame(static_cast<unsigned int>(systemId),
+		scraperGameName->Text, region, scraperDownloadVideo->IsChecked->Value);
+	scraperStatus->Text = m_screenScraper->Status;
+}
+
+void DirectXPage::CancelScrape_Click(Object^, RoutedEventArgs^)
+{
+	m_screenScraper->Cancel();
+	scraperStatus->Text = m_screenScraper->Status;
+}
+
 void DirectXPage::OnRendering(Object^, Object^)
 {
 	if (++m_logRefreshFrames >= 60) {
@@ -229,6 +306,12 @@ void DirectXPage::OnRendering(Object^, Object^)
 					std::wstring(status.begin(), status.end()).c_str());
 			}
 		}
+		if (m_streamReceiver && toolTabs->SelectedIndex == 7)
+			streamStatus->Text = m_streamReceiver->Status;
+		if (m_screenScraper && toolTabs->SelectedIndex == 8) {
+			scraperStatus->Text = m_screenScraper->Status;
+			scraperRepository->Text = m_screenScraper->RepositoryPath;
+		}
 	}
 	if (m_windowVisible && m_xemu) {
 		if (m_xemu->IsRunning()) {
@@ -237,6 +320,11 @@ void DirectXPage::OnRendering(Object^, Object^)
 		m_xemu->RenderFrame();
 		UpdateFpsOverlay();
 	}
+	bool running = m_xemu && m_xemu->IsRunning();
+	if (m_previousRunning && !running && m_frontendReturnUri) {
+		ReturnToFrontend();
+	}
+	m_previousRunning = running;
 }
 
 void DirectXPage::UpdateFpsOverlay()
@@ -459,6 +547,79 @@ void DirectXPage::UpdateStartButtonState()
 	requiredFilesStatus->Foreground = ref new SolidColorBrush(
 		ready ? Windows::UI::ColorHelper::FromArgb(255, 76, 195, 138) :
 		        Windows::UI::ColorHelper::FromArgb(255, 255, 200, 87));
+	TryProtocolAutoStart();
+}
+
+void DirectXPage::TryProtocolAutoStart()
+{
+	if (!m_protocolAutoStart || !m_flashReady || !m_bootromReady ||
+	    !m_hddReady || m_xemu->IsRunning()) {
+		return;
+	}
+	m_protocolAutoStart = false;
+	StartXemu_Click(nullptr, nullptr);
+}
+
+void DirectXPage::ReturnToFrontend()
+{
+	auto uri = m_frontendReturnUri;
+	m_frontendReturnUri = nullptr;
+	if (uri) {
+		create_task(Windows::System::Launcher::LaunchUriAsync(uri));
+	}
+}
+
+void DirectXPage::HandleProtocolActivation(Uri^ uri)
+{
+	if (!uri || uri->SchemeName != "xemu-uwp") return;
+	String^ path = nullptr;
+	String^ token = nullptr;
+	try {
+		auto query = ref new WwwFormUrlDecoder(uri->Query);
+		for (auto entry : query) {
+			if (entry->Name == "path" || entry->Name == "dvd") path = entry->Value;
+			else if (entry->Name == "token") token = entry->Value;
+			else if (entry->Name == "return") {
+				try { m_frontendReturnUri = ref new Uri(entry->Value); }
+				catch (Platform::Exception^) { m_frontendReturnUri = nullptr; }
+			}
+		}
+	} catch (Platform::Exception^ exception) {
+		errorText->Text = "Invalid xemu-uwp URI: " + exception->Message;
+		toolTabs->SelectedIndex = 6;
+		return;
+	}
+	m_protocolAutoStart = true;
+	if (token && StorageApplicationPermissions::FutureAccessList->ContainsItem(token)) {
+		create_task(StorageApplicationPermissions::FutureAccessList->GetFileAsync(token))
+			.then([this](StorageFile^ file) { MountXboxFile(file, "dvd", false); });
+		return;
+	}
+	if (path && !path->IsEmpty()) {
+		try {
+			if (path->Length() > 7 && _wcsnicmp(path->Data(), L"file://", 7) == 0) {
+				auto fileUri = ref new Uri(path);
+				path = fileUri->Path;
+			}
+		} catch (Platform::Exception^) {
+			errorText->Text = "Invalid DVD/XISO path in xemu-uwp URI.";
+			toolTabs->SelectedIndex = 6;
+			m_protocolAutoStart = false;
+			return;
+		}
+		create_task(StorageFile::GetFileFromPathAsync(path)).then(
+			[this, path](task<StorageFile^> result) {
+				try { MountXboxFile(result.get(), "dvd", false); }
+				catch (Platform::Exception^ exception) {
+					errorText->Text = "Unable to open protocol DVD/XISO " + path +
+					                  ": " + exception->Message;
+					toolTabs->SelectedIndex = 6;
+					m_protocolAutoStart = false;
+				}
+			});
+		return;
+	}
+	TryProtocolAutoStart();
 }
 
 void DirectXPage::StartXemu_Click(Object^, RoutedEventArgs^)
@@ -542,6 +703,10 @@ void DirectXPage::LoadSettings()
 	vlanRole->SelectedIndex = ClampIndex(ReadInt("net.vlan.role", 0), 2, 0);
 	vlanCoordinator->Text = ReadString("net.vlan.coordinator", "");
 	vlanRoomCode->Text = ReadString("net.vlan.room_code", "");
+	streamBindAddress->Text = ReadString("stream.rtp.bind", "0.0.0.0");
+	streamPort->Text = ReadString("stream.rtp.port", "5004");
+	streamWidth->Text = ReadString("stream.rtp.width", "1280");
+	streamHeight->Text = ReadString("stream.rtp.height", "720");
 	memoryLimit->SelectedIndex = ClampIndex(ReadInt("sys.mem_limit", 0), 2, 0);
 	avPack->SelectedIndex = ClampIndex(ReadInt("sys.avpack", 1), 7, 1);
 }

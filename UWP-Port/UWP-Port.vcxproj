@@ -271,6 +271,8 @@
     <ClInclude Include="Common\DeviceResources.h" />
     <ClInclude Include="UWP_PortMain.h" />
     <ClInclude Include="XemuHost.h" />
+    <ClInclude Include="H264RtpReceiver.h" />
+    <ClInclude Include="ScreenScraperApi.h" />
     <ClInclude Include="VLanManager.h" />
     <ClInclude Include="DirectXPage.xaml.h">
       <DependentUpon>DirectXPage.xaml</DependentUpon>
@@ -286,6 +288,8 @@
     <ClCompile Include="Common\DeviceResources.cpp" />
     <ClCompile Include="UWP_PortMain.cpp" />
     <ClCompile Include="XemuHost.cpp" />
+    <ClCompile Include="H264RtpReceiver.cpp" />
+    <ClCompile Include="ScreenScraperApi.cpp" />
     <ClCompile Include="VLanManager.cpp" />
     <ClCompile Include="DirectXPage.xaml.cpp">
       <DependentUpon>DirectXPage.xaml</DependentUpon>

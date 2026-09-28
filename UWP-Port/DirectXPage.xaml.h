@@ -9,6 +9,8 @@
 
 #include "XemuHost.h"
 #include "VLanManager.h"
+#include "H264RtpReceiver.h"
+#include "ScreenScraperApi.h"
 
 namespace UWP_Port
 {
@@ -23,6 +25,7 @@ namespace UWP_Port
 
 		void SaveInternalState(Windows::Foundation::Collections::IPropertySet^ state);
 		void LoadInternalState(Windows::Foundation::Collections::IPropertySet^ state);
+		void HandleProtocolActivation(Windows::Foundation::Uri^ uri);
 
 	internal:
 		void HandleMemoryPressure(QemuHostMemoryPressure pressure);
@@ -46,6 +49,8 @@ namespace UWP_Port
 		void HideSystemPointer();
 		void UpdateFpsOverlay();
 		void UpdateStartButtonState();
+		void TryProtocolAutoStart();
+		void ReturnToFrontend();
 		void RefreshLogView();
 
 		// Outros manipuladores de eventos.
@@ -59,6 +64,11 @@ namespace UWP_Port
 		void SaveSettings_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void SaveVlanSettings_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void CreateVlanRoom_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void StartStream_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void StopStream_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void SelectMediaRepository_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void ScrapeGame_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
+		void CancelScrape_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
 		void UdpServer_SelectionChanged(Platform::Object^ sender,
 			Windows::UI::Xaml::Controls::SelectionChangedEventArgs^ e);
 		void AutoSaveSettings_Click(Platform::Object^ sender, Windows::UI::Xaml::RoutedEventArgs^ e);
@@ -81,6 +91,8 @@ namespace UWP_Port
 		                               Platform::String^ tagValue);
 		std::unique_ptr<XemuHost> m_xemu;
 		std::unique_ptr<VLanManager> m_vlan;
+		H264RtpReceiver^ m_streamReceiver;
+		ScreenScraperApi^ m_screenScraper;
 		Windows::Foundation::EventRegistrationToken m_renderingToken;
 		Windows::Foundation::EventRegistrationToken m_visibilityChangedToken;
 		Windows::Foundation::EventRegistrationToken m_backRequestedToken;
@@ -98,6 +110,9 @@ namespace UWP_Port
 		bool m_flashMountPending;
 		bool m_bootromMountPending;
 		bool m_hddMountPending;
+		bool m_protocolAutoStart;
+		bool m_previousRunning;
+		Windows::Foundation::Uri^ m_frontendReturnUri;
 		Windows::UI::Core::CoreCursor^ m_savedSystemPointerCursor;
 		bool m_systemPointerHidden;
 		unsigned int m_logRefreshFrames;

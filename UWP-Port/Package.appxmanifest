@@ -5,12 +5,13 @@
   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
-  IgnorableNamespaces="uap mp uap3">
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap mp uap3 rescap">
 
   <Identity
     Name="f89b901b-d39e-47cd-96f6-5ea74d53d2a9"
     Publisher="CN=rodri"
-    Version="1.0.0.113" />
+    Version="1.0.0.114" />
 
   <mp:PhoneIdentity PhoneProductId="f89b901b-d39e-47cd-96f6-5ea74d53d2a9" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
@@ -42,6 +43,13 @@
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
         <uap:LockScreen BadgeLogo="Assets\BadgeLogo.png" Notification="badge"/>
       </uap:VisualElements>
+      <Extensions>
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="xemu-uwp">
+            <uap:DisplayName>xemu UWP</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
+      </Extensions>
     </Application>
   </Applications>
 
@@ -49,6 +57,7 @@
     <Capability Name="internetClient" />
     <Capability Name="internetClientServer"/>
     <Capability Name="privateNetworkClientServer"/>
+    <rescap:Capability Name="broadFileSystemAccess"/>
     <uap3:Capability Name="backgroundMediaPlayback"/>
     <Capability Name="codeGeneration"/>
   </Capabilities>

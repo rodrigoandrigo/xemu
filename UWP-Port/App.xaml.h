@@ -18,9 +18,11 @@ namespace UWP_Port
 	public:
 		App();
 		virtual void OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEventArgs^ e) override;
+		virtual void OnActivated(Windows::ApplicationModel::Activation::IActivatedEventArgs^ e) override;
 
 	private:
 		void ConfigureWindowBounds();
+		void EnsureMainPage(Platform::Object^ parameter);
 		void OnSuspending(Platform::Object^ sender, Windows::ApplicationModel::SuspendingEventArgs^ e);
 		void OnResuming(Platform::Object ^sender, Platform::Object ^args);
 		void OnMemoryUsageChanged(Platform::Object^ sender, Platform::Object^ args);

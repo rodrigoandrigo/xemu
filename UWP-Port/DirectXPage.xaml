@@ -5,12 +5,15 @@
   </Page.Resources>
   <Grid>
     <SwapChainPanel x:Name="swapChainPanel"/>
+    <MediaElement x:Name="streamVideo" Visibility="Collapsed" Stretch="Uniform"
+                  AreTransportControlsEnabled="False" AutoPlay="True"
+                  RealTimePlayback="True"/>
     <Grid x:Name="launcherPanel" Background="#E60D1117">
       <Grid.ColumnDefinitions><ColumnDefinition Width="230"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
       <Border Background="{StaticResource Panel}" BorderBrush="#FF334152" BorderThickness="0,0,1,0" Padding="22">
         <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
           <StackPanel><TextBlock Text="XEMU UWP" FontFamily="Consolas" FontSize="13" Foreground="{StaticResource Accent}"/><TextBlock Text="Original Xbox" FontSize="24" FontWeight="SemiBold" Foreground="White" Margin="0,6,0,30"/></StackPanel>
-          <StackPanel Grid.Row="1"><Button Content="Home" Tag="0" Click="NavigationButton_Click"/><Button Content="Files" Tag="1" Click="NavigationButton_Click"/><Button Content="Storage" Tag="2" Click="NavigationButton_Click"/><Button Content="Settings" Tag="3" Click="NavigationButton_Click"/><Button Content="Network" Tag="4" Click="NavigationButton_Click"/><Button Content="VLan/VPN" Tag="5" Click="NavigationButton_Click"/><Button Content="Logs" Tag="6" Click="NavigationButton_Click"/></StackPanel>
+          <StackPanel Grid.Row="1"><Button Content="Home" Tag="0" Click="NavigationButton_Click"/><Button Content="Files" Tag="1" Click="NavigationButton_Click"/><Button Content="Storage" Tag="2" Click="NavigationButton_Click"/><Button Content="Settings" Tag="3" Click="NavigationButton_Click"/><Button Content="Network" Tag="4" Click="NavigationButton_Click"/><Button Content="VLan/VPN" Tag="5" Click="NavigationButton_Click"/><Button Content="Logs" Tag="6" Click="NavigationButton_Click"/><Button Content="Streaming" Tag="7" Click="NavigationButton_Click"/><Button Content="Metadata" Tag="8" Click="NavigationButton_Click"/></StackPanel>
           <StackPanel Grid.Row="2"><TextBlock x:Name="hostStatus" Text="● READY" Foreground="{StaticResource Accent}" FontFamily="Consolas"/><TextBlock Text="Mesa · D3D12" Foreground="#FFAAB8C5" FontSize="12"/></StackPanel>
         </Grid>
       </Border>
@@ -172,6 +175,43 @@
             <TextBlock x:Name="errorText" Grid.Row="2" Foreground="#FFFF8A80" TextWrapping="Wrap"/>
             <TextBox x:Name="logText" Grid.Row="3" FontFamily="Consolas" IsReadOnly="True" AcceptsReturn="True" TextWrapping="NoWrap" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
           </Grid>
+        </PivotItem>
+        <PivotItem>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel Padding="38" Spacing="12" MaxWidth="900" HorizontalAlignment="Left">
+              <TextBlock Text="RTP/H.264 streaming" FontSize="30" FontWeight="SemiBold" Foreground="White"/>
+              <TextBlock Text="Receive an RFC 6184 H.264 stream on a dedicated UDP port. This endpoint is independent from Xbox networking and VLan/VPN." Foreground="#FFC6D0DA" TextWrapping="Wrap"/>
+              <TextBlock Text="Bind address" Foreground="White"/><TextBox x:Name="streamBindAddress" Text="0.0.0.0"/>
+              <TextBlock Text="UDP port" Foreground="White"/><TextBox x:Name="streamPort" Text="5004" InputScope="Number"/>
+              <TextBlock Text="Decoded width" Foreground="White"/><TextBox x:Name="streamWidth" Text="1280" InputScope="Number"/>
+              <TextBlock Text="Decoded height" Foreground="White"/><TextBox x:Name="streamHeight" Text="720" InputScope="Number"/>
+              <StackPanel Orientation="Horizontal" Spacing="12"><Button Content="Start receiver" Click="StartStream_Click" Background="{StaticResource Accent}"/><Button Content="Stop receiver" Click="StopStream_Click"/></StackPanel>
+              <TextBlock x:Name="streamStatus" Text="Stopped" Foreground="#FFAAB8C5" TextWrapping="Wrap"/>
+              <TextBlock Text="Payload type is dynamic. Packetization mode 1 is supported: single NAL units, STAP-A and FU-A. The sender must use a 90 kHz RTP clock and include SPS/PPS before IDR frames." Foreground="#FFAAB8C5" TextWrapping="Wrap"/>
+            </StackPanel>
+          </ScrollViewer>
+        </PivotItem>
+        <PivotItem>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel Padding="38" Spacing="12" MaxWidth="900" HorizontalAlignment="Left">
+              <TextBlock Text="ScreenScraper metadata" FontSize="30" FontWeight="SemiBold" Foreground="White"/>
+              <TextBlock Text="Download metadata and media into a user-selected repository. Other applications can use the catalog after the user grants them access to the same folder." Foreground="#FFC6D0DA" TextWrapping="Wrap"/>
+              <TextBlock Text="Media repository" Foreground="White"/>
+              <StackPanel Orientation="Horizontal" Spacing="12"><Button Content="Select repository folder" Click="SelectMediaRepository_Click" Background="{StaticResource Accent}"/><TextBlock x:Name="scraperRepository" Text="Not selected" Foreground="#FFAAB8C5" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="520"/></StackPanel>
+              <TextBlock Text="ScreenScraper developer ID" Foreground="White"/><TextBox x:Name="scraperDeveloperId"/>
+              <TextBlock Text="ScreenScraper developer password" Foreground="White"/><PasswordBox x:Name="scraperDeveloperPassword"/>
+              <TextBlock Text="Software name" Foreground="White"/><TextBox x:Name="scraperSoftwareName" Text="xemu-uwp"/>
+              <TextBlock Text="ScreenScraper user (optional)" Foreground="White"/><TextBox x:Name="scraperUser"/>
+              <TextBlock Text="ScreenScraper password (optional)" Foreground="White"/><PasswordBox x:Name="scraperPassword"/>
+              <TextBlock Text="System ID" Foreground="White"/><TextBox x:Name="scraperSystemId" Text="32" InputScope="Number"/>
+              <TextBlock Text="Game name" Foreground="White"/><TextBox x:Name="scraperGameName" PlaceholderText="Game title or ROM name"/>
+              <TextBlock Text="Preferred region" Foreground="White"/><ComboBox x:Name="scraperRegion" SelectedIndex="0"><ComboBoxItem Content="World" Tag="wor"/><ComboBoxItem Content="United States" Tag="us"/><ComboBoxItem Content="Europe" Tag="eu"/><ComboBoxItem Content="Japan" Tag="jp"/></ComboBox>
+              <CheckBox x:Name="scraperDownloadVideo" Content="Download dynamic video background" Foreground="White"/>
+              <StackPanel Orientation="Horizontal" Spacing="12"><Button Content="Download metadata and media" Click="ScrapeGame_Click" Background="{StaticResource Accent}"/><Button Content="Cancel" Click="CancelScrape_Click"/></StackPanel>
+              <TextBlock x:Name="scraperStatus" Text="Select a media repository" Foreground="#FFAAB8C5" TextWrapping="Wrap"/>
+              <TextBlock Text="Repository format: catalog.json plus one directory per game containing metadata.json, media.json, box art, fan art, screenshot, logo, and optional video.mp4." Foreground="#FFAAB8C5" TextWrapping="Wrap"/>
+            </StackPanel>
+          </ScrollViewer>
         </PivotItem>
       </Pivot>
     </Grid>

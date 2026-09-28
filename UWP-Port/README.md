@@ -249,6 +249,82 @@ the log.
 Renderer shader and pipeline caches are also stored under `LocalState`; they do
 not require access to unrestricted desktop paths.
 
+## Front-end launch protocol
+
+UWP-Port registers the `xemu-uwp` URI scheme so launchers such as ES-DE,
+RetroPass, and LaunchPass can start a selected Xbox image. The file path and
+optional return URI must be percent encoded:
+
+```text
+xemu-uwp://launch?path=E%3A%5CGames%5CXbox%5Cgame.iso&return=retropass%3A%2F%2F
+```
+
+`dvd` is accepted as an alias for `path`. A Future Access List token created by
+UWP-Port can be supplied as `token` instead of a path. BIOS, MCPX, and hard-disk
+files still come from the saved UWP-Port configuration. Once those required
+files are ready, protocol activation mounts the requested DVD/XISO and starts
+xemu. When emulation ends, UWP-Port launches the optional `return` URI.
+
+Access to a raw external path is subject to the UWP/Xbox storage broker. A
+Future Access List token is the reliable choice for content outside package
+storage when the platform does not grant direct path access.
+
+## RTP/H.264 receiver
+
+The **Streaming** page receives a standard RTP/H.264 stream over a dedicated
+UDP port and presents it through the Windows media pipeline. It accepts RFC
+6184 packetization mode 1 single NAL units, STAP-A aggregation, and FU-A
+fragmentation. RTP timestamps use the H.264 90 kHz clock. The sender must send
+SPS/PPS before an IDR frame and set the RTP marker bit on the last packet of an
+access unit.
+
+The receiver uses `MediaStreamSource` and `MediaElement`, allowing the Windows
+media stack to select its available H.264 hardware decoder on PC or Xbox. This
+stream socket is independent of xemu's Xbox UDP tunnel and the VLan/VPN socket.
+The default endpoint is `0.0.0.0:5004`; bind address, port, and coded dimensions
+are stored in application settings.
+
+Example sender command for an existing H.264 source:
+
+```console
+ffmpeg -re -i input.mp4 -an -c:v copy -f rtp rtp://XBOX_IP:5004?pkt_size=1200
+```
+
+If the input is not already H.264, encode it with settings suitable for live
+decoding and periodic keyframes before packetizing it as RTP.
+
+## ScreenScraper media repository
+
+The **Metadata** page provides a reusable ScreenScraper client and writes its
+results to a folder selected through the UWP folder picker. Access to that
+folder is retained with the `screenscraper-media-root` Future Access List token.
+Developer identity, optional user credentials, ScreenScraper system ID, title,
+region, and optional video download are supplied by the user.
+
+The root contains a versioned `catalog.json`. Each title has a stable sanitized
+directory containing the original `metadata.json` response, a normalized
+`media.json` manifest, and available normalized media names:
+
+```text
+catalog.json
+Game_Name/
+  metadata.json
+  media.json
+  box2d.png
+  box3d.png
+  fanart.png
+  screenshot.png
+  logo.png
+  video.mp4
+```
+
+Images and videos are signature-checked before being stored. Existing catalog
+entries are preserved and the matching title entry is updated in the versioned
+catalog document. A third-party UWP application can consume the same schema
+after the user grants that application access to the same repository folder;
+Future Access List tokens themselves are private to each package and cannot be
+shared between applications.
+
 ## UWP limitations
 
 - The application must not terminate the process through `exit()` or `abort()`;

@@ -71,6 +71,17 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 		DebugSettings->EnableFrameRateCounter = true;
 	}
 #endif
+	EnsureMainPage(e->Arguments);
+
+	if (e->PreviousExecutionState == ApplicationExecutionState::Terminated)
+	{
+		m_directXPage->LoadInternalState(ApplicationData::Current->LocalSettings->Values);
+	}
+	Window::Current->Activate();
+}
+
+void App::EnsureMainPage(Object^ parameter)
+{
 	// This must happen before creating the XAML visual tree. Otherwise Xbox
 	// automatically enlarges the whole interface for ten-foot presentation.
 	ConfigureWindowBounds();
@@ -98,7 +109,7 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 		// parâmetro
 		try
 		{
-			rootFrame->Navigate(TypeName(DirectXPage::typeid), e->Arguments);
+			rootFrame->Navigate(TypeName(DirectXPage::typeid), parameter);
 		}
 		catch (Platform::Exception^ ex)
 		{
@@ -127,13 +138,19 @@ void App::OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEvent
 		m_directXPage = dynamic_cast<DirectXPage^>(rootFrame->Content);
 	}
 
-	if (e->PreviousExecutionState == ApplicationExecutionState::Terminated)
-	{
-		m_directXPage->LoadInternalState(ApplicationData::Current->LocalSettings->Values);
+}
+
+void App::OnActivated(IActivatedEventArgs^ e)
+{
+	if (e->Kind != ActivationKind::Protocol) {
+		Application::OnActivated(e);
+		return;
 	}
-	
-	// Verifique se a janela atual está ativa
+	auto protocol = safe_cast<ProtocolActivatedEventArgs^>(e);
+	EnsureMainPage(protocol->Uri);
 	Window::Current->Activate();
+	if (m_directXPage != nullptr)
+		m_directXPage->HandleProtocolActivation(protocol->Uri);
 }
 
 void App::ConfigureWindowBounds()
