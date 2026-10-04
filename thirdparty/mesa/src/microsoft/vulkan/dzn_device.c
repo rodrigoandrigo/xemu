@@ -37,6 +37,7 @@
 #include "util/disk_cache.h"
 #include "util/macros.h"
 #include "util/mesa-blake3.h"
+#include "util/os_time.h"
 #include "util/u_dl.h"
 
 #include "dzn_drirc.h"
@@ -61,6 +62,57 @@
 #define DZN_API_VERSION VK_MAKE_VERSION(1, 2, VK_HEADER_VERSION)
 
 #define MAX_TIER2_MEMORY_TYPES 4
+
+static bool
+dzn_custom_border_color_supported(const struct dzn_physical_device *pdev)
+{
+#ifdef _WIN32
+   const struct dzn_instance *instance =
+      container_of(pdev->vk.instance, struct dzn_instance, vk);
+   enum dxil_validator_version validator = dxil_get_validator_version(instance->dxil_validator);
+   if (validator != NO_DXIL_VALIDATION && validator < DXIL_VALIDATOR_1_7)
+      return false;
+#endif
+   return pdev->dev11 && pdev->options14.AdvancedTextureOpsSupported &&
+          pdev->shader_model >= D3D_SHADER_MODEL_6_7;
+}
+
+#ifdef _WIN32
+static bool
+dzn_external_memory_host_supported(const struct dzn_physical_device *pdev)
+{
+   D3D12_FEATURE_DATA_EXISTING_HEAPS caps = { 0 };
+   return SUCCEEDED(ID3D12Device1_CheckFeatureSupport(pdev->dev,
+                    D3D12_FEATURE_EXISTING_HEAPS, &caps, sizeof(caps))) &&
+          caps.Supported;
+}
+
+static HRESULT
+dzn_open_host_heap(struct dzn_physical_device *pdev, const void *pointer,
+                   uint64_t size, ID3D12Heap **heap)
+{
+   *heap = NULL;
+   if (!dzn_external_memory_host_supported(pdev) || !pointer || !size ||
+       ((uintptr_t)pointer % 65536) || (size % 65536) ||
+       size > SIZE_MAX - (uintptr_t)pointer)
+      return E_INVALIDARG;
+
+   if (pdev->dev13)
+      return ID3D12Device13_OpenExistingHeapFromAddress1(pdev->dev13, pointer,
+                (SIZE_T)size, &IID_ID3D12Heap, (void **)heap);
+
+   /* The older API wraps the entire VirtualAlloc allocation. An interior
+    * address would give Vulkan offset zero a different meaning than D3D12. */
+   MEMORY_BASIC_INFORMATION region;
+   if (!VirtualQuery(pointer, &region, sizeof(region)) ||
+       region.AllocationBase != pointer || region.State != MEM_COMMIT ||
+       region.RegionSize < size || (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+      return E_INVALIDARG;
+
+   return ID3D12Device3_OpenExistingHeapFromAddress(pdev->dev, pointer,
+             &IID_ID3D12Heap, (void **)heap);
+}
+#endif
 
 const VkExternalMemoryHandleTypeFlags opaque_external_flag =
 #ifdef _WIN32
@@ -99,6 +151,7 @@ static void
 dzn_physical_device_get_extensions(struct dzn_physical_device *pdev)
 {
    pdev->vk.supported_extensions = (struct vk_device_extension_table) {
+      .EXT_custom_border_color              = dzn_custom_border_color_supported(pdev),
       .KHR_16bit_storage                     = pdev->options4.Native16BitShaderOpsSupported,
       .KHR_bind_memory2                      = true,
       .KHR_buffer_device_address             = pdev->shader_model >= D3D_SHADER_MODEL_6_6,
@@ -146,7 +199,7 @@ dzn_physical_device_get_extensions(struct dzn_physical_device *pdev)
       .EXT_debug_marker                      = true,
       .EXT_descriptor_indexing               = pdev->shader_model >= D3D_SHADER_MODEL_6_6,
 #if defined(_WIN32)
-      .EXT_external_memory_host              = pdev->dev13,
+      .EXT_external_memory_host              = dzn_external_memory_host_supported(pdev),
 #endif
       .EXT_scalar_block_layout               = true,
       .EXT_separate_stencil_usage            = true,
@@ -696,7 +749,10 @@ dzn_physical_device_get_features(const struct dzn_physical_device *pdev,
       .pipelineStatisticsQuery = true,
       .vertexPipelineStoresAndAtomics = true,
       .fragmentStoresAndAtomics = true,
-      .shaderTessellationAndGeometryPointSize = false,
+      /* PointSize reads/writes are lowered to the supported 1.0 size.
+       * largePoints remains false and pointSizeRange remains [1, 1].
+       */
+      .shaderTessellationAndGeometryPointSize = true,
       .shaderImageGatherExtended = true,
       .shaderStorageImageExtendedFormats = pdev->options.TypedUAVLoadAdditionalFormats,
       .shaderStorageImageMultisample = false,
@@ -808,6 +864,8 @@ dzn_physical_device_get_features(const struct dzn_physical_device *pdev,
       .vertexAttributeInstanceRateDivisor = true,
       .vertexAttributeInstanceRateZeroDivisor = true,
       .shaderReplicatedComposites         = true,
+      .customBorderColors                 = dzn_custom_border_color_supported(pdev),
+      .customBorderColorWithoutFormat      = dzn_custom_border_color_supported(pdev),
    };
 }
 
@@ -848,6 +906,7 @@ dzn_physical_device_get_properties(const struct dzn_physical_device *pdev,
       .maxPushConstantsSize = 128,
       .maxMemoryAllocationCount = 4096,
       .maxSamplerAllocationCount = 4000,
+      .maxCustomBorderColorSamplers = dzn_custom_border_color_supported(pdev) ? 4000 : 0,
       .bufferImageGranularity = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
       .sparseAddressSpaceSize = 0,
       .maxBoundDescriptorSets = MAX_SETS,
@@ -1474,11 +1533,12 @@ dzn_physical_device_get_image_format_properties(struct dzn_physical_device *pdev
          break;
 #if defined(_WIN32)
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
-         if (pdev->dev13) {
+         if (dzn_external_memory_host_supported(pdev) && info->tiling == VK_IMAGE_TILING_LINEAR) {
             external_props->externalMemoryProperties.compatibleHandleTypes =
-               external_props->externalMemoryProperties.exportFromImportedHandleTypes =
-               VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT | opaque_external_flag;
-            external_props->externalMemoryProperties.externalMemoryFeatures = import_export_feature_flags;
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            external_props->externalMemoryProperties.exportFromImportedHandleTypes = 0;
+            external_props->externalMemoryProperties.externalMemoryFeatures =
+               VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
             break;
          }
          FALLTHROUGH;
@@ -1729,11 +1789,11 @@ dzn_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice,
       break;
 #if defined(_WIN32)
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
-      if (pdev->dev13) {
+      if (dzn_external_memory_host_supported(pdev)) {
          pExternalBufferProperties->externalMemoryProperties.compatibleHandleTypes =
-            pExternalBufferProperties->externalMemoryProperties.exportFromImportedHandleTypes =
-            VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT | opaque_external_flag;
-         pExternalBufferProperties->externalMemoryProperties.externalMemoryFeatures = import_export_feature_flags;
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+         pExternalBufferProperties->externalMemoryProperties.exportFromImportedHandleTypes = 0;
+         pExternalBufferProperties->externalMemoryProperties.externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
          break;
       }
       FALLTHROUGH;
@@ -1963,7 +2023,7 @@ dzn_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
          VkPhysicalDeviceMemoryBudgetPropertiesEXT* vk_physical_memory_budget_properties = (VkPhysicalDeviceMemoryBudgetPropertiesEXT*)ext;
          VK_FROM_HANDLE(dzn_physical_device, pdev, physicalDevice);
 
-         struct d3d12_memory_info memory_info;
+         struct d3d12_memory_info memory_info = {0};
 
          dzn_query_memory_info(pdev->adapter, &memory_info);
 
@@ -1971,13 +2031,28 @@ dzn_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
          memset(vk_physical_memory_budget_properties->heapUsage,  0, sizeof(VkDeviceSize) * VK_MAX_MEMORY_HEAPS);
 
          for(int i = 0; i < pMemoryProperties->memoryProperties.memoryHeapCount; i++){
-            if(pMemoryProperties->memoryProperties.memoryHeaps[i].flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT){
+            if(pMemoryProperties->memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT){
                vk_physical_memory_budget_properties->heapBudget[i] = memory_info.budget_local;
                vk_physical_memory_budget_properties->heapUsage[i]  = memory_info.usage_local;
             } else {
                vk_physical_memory_budget_properties->heapBudget[i] = memory_info.budget_nonlocal;
                vk_physical_memory_budget_properties->heapUsage[i]  = memory_info.usage_nonlocal;
             }
+            bool local = pMemoryProperties->memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+            VkDeviceSize heap_size = pMemoryProperties->memoryProperties.memoryHeaps[i].size;
+            VkDeviceSize allocated = p_atomic_read(&pdev->allocated_memory[i]);
+            if (!(local ? memory_info.local_valid : memory_info.nonlocal_valid)) {
+               /* Some AppContainer runtimes expose neither budget API. Keep
+                * the estimate useful and include our live Vulkan allocations.
+                */
+               vk_physical_memory_budget_properties->heapBudget[i] = heap_size;
+               vk_physical_memory_budget_properties->heapUsage[i] = allocated;
+            }
+            /* Native accounting can lag behind a successful allocation. */
+            vk_physical_memory_budget_properties->heapUsage[i] =
+               MAX2(vk_physical_memory_budget_properties->heapUsage[i], allocated);
+            vk_physical_memory_budget_properties->heapBudget[i] =
+               MIN2(vk_physical_memory_budget_properties->heapBudget[i], heap_size);
          }
       }
       else {
@@ -2083,29 +2158,38 @@ dzn_queue_submit(struct vk_queue *q,
 
       util_dynarray_foreach(&cmd_buffer->events.signal, struct dzn_cmd_event_signal, evt) {
          if (FAILED(ID3D12CommandQueue_Signal(queue->cmdqueue, evt->event->fence, evt->value ? 1 : 0)))
-            return vk_error(device, VK_ERROR_UNKNOWN);
-      }
-
-      util_dynarray_foreach(&cmd_buffer->queries.signal, struct dzn_cmd_buffer_query_range, range) {
-         mtx_lock(&range->qpool->queries_lock);
-         for (uint32_t q = range->start; q < range->start + range->count; q++) {
-            struct dzn_query *query = &range->qpool->queries[q];
-            query->fence_value = queue->fence_point + 1;
-            query->fence = queue->fence;
-            ID3D12Fence_AddRef(query->fence);
-         }
-         mtx_unlock(&range->qpool->queries_lock);
+            return vk_device_set_lost(&device->vk, "Failed to signal event fence");
       }
    }
 
    for (uint32_t i = 0; i < info->signal_count; i++) {
       result = dzn_queue_sync_signal(queue, &info->signals[i]);
       if (result != VK_SUCCESS)
-         return vk_error(device, VK_ERROR_UNKNOWN);
+         return vk_device_set_lost(&device->vk, "Failed to signal submission sync");
    }
 
    if (FAILED(ID3D12CommandQueue_Signal(queue->cmdqueue, queue->fence, ++queue->fence_point)))
-      return vk_error(device, VK_ERROR_UNKNOWN);
+      return vk_device_set_lost(&device->vk, "Failed to signal queue fence");
+
+   /* Publish only a fence value that has successfully been submitted. */
+   for (uint32_t i = 0; i < info->command_buffer_count; i++) {
+      struct dzn_cmd_buffer *cmd_buffer =
+         container_of(info->command_buffers[i], struct dzn_cmd_buffer, vk);
+
+      util_dynarray_foreach(&cmd_buffer->queries.signal, struct dzn_cmd_buffer_query_range, range) {
+         mtx_lock(&range->qpool->queries_lock);
+         for (uint32_t q = range->start; q < range->start + range->count; q++) {
+            struct dzn_query *query = &range->qpool->queries[q];
+            if (query->fence)
+               ID3D12Fence_Release(query->fence);
+            query->fence_value = queue->fence_point;
+            query->fence = queue->fence;
+            ID3D12Fence_AddRef(query->fence);
+         }
+         cnd_broadcast(&range->qpool->queries_cond);
+         mtx_unlock(&range->qpool->queries_lock);
+      }
+   }
 
    return VK_SUCCESS;
 }
@@ -2166,7 +2250,12 @@ dzn_queue_init(struct dzn_queue *queue,
 static VkResult
 dzn_device_query_init(struct dzn_device *device)
 {
-   /* FIXME: create the resource in the default heap */
+   ID3D12Resource *upload = NULL;
+   ID3D12CommandQueue *queue = NULL;
+   ID3D12CommandAllocator *allocator = NULL;
+   ID3D12GraphicsCommandList *cmdlist = NULL;
+   ID3D12Fence *fence = NULL;
+   VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
    D3D12_HEAP_PROPERTIES hprops = dzn_ID3D12Device4_GetCustomHeapProperties(device->dev, 0, D3D12_HEAP_TYPE_UPLOAD);
    D3D12_RESOURCE_DESC rdesc = {
       .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -2184,21 +2273,102 @@ dzn_device_query_init(struct dzn_device *device)
    if (FAILED(ID3D12Device1_CreateCommittedResource(device->dev, &hprops,
                                                    D3D12_HEAP_FLAG_NONE,
                                                    &rdesc,
-                                                   D3D12_RESOURCE_STATE_COMMON,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ,
                                                    NULL,
                                                    &IID_ID3D12Resource,
-                                                   (void **)&device->queries.refs)))
-      return vk_error(device->vk.physical, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+                                                   (void **)&upload)))
+      goto out;
 
    uint8_t *queries_ref;
-   if (FAILED(ID3D12Resource_Map(device->queries.refs, 0, NULL, (void **)&queries_ref)))
-      return vk_error(device->vk.physical, VK_ERROR_OUT_OF_HOST_MEMORY);
+   D3D12_RANGE no_read = { 0, 0 };
+   if (FAILED(ID3D12Resource_Map(upload, 0, &no_read, (void **)&queries_ref))) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto out;
+   }
 
    memset(queries_ref + DZN_QUERY_REFS_ALL_ONES_OFFSET, 0xff, DZN_QUERY_REFS_SECTION_SIZE);
    memset(queries_ref + DZN_QUERY_REFS_ALL_ZEROS_OFFSET, 0x0, DZN_QUERY_REFS_SECTION_SIZE);
-   ID3D12Resource_Unmap(device->queries.refs, 0, NULL);
+   ID3D12Resource_Unmap(upload, 0, NULL);
 
-   return VK_SUCCESS;
+   hprops = dzn_ID3D12Device4_GetCustomHeapProperties(device->dev, 0, D3D12_HEAP_TYPE_DEFAULT);
+   if (FAILED(ID3D12Device1_CreateCommittedResource(device->dev, &hprops,
+                                                   D3D12_HEAP_FLAG_NONE, &rdesc,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   NULL, &IID_ID3D12Resource,
+                                                   (void **)&device->queries.refs)))
+      goto out;
+
+   /* Device queues have not been created yet. A temporary copy queue makes
+    * the immutable references ready for every queue before device creation
+    * returns, without retaining the CPU-visible staging allocation.
+    */
+   D3D12_COMMAND_QUEUE_DESC queue_desc = { .Type = D3D12_COMMAND_LIST_TYPE_COPY };
+   if (FAILED(ID3D12Device1_CreateCommandQueue(device->dev, &queue_desc,
+                                              &IID_ID3D12CommandQueue, (void **)&queue)) ||
+       FAILED(ID3D12Device1_CreateCommandAllocator(device->dev, D3D12_COMMAND_LIST_TYPE_COPY,
+                                                  &IID_ID3D12CommandAllocator, (void **)&allocator)) ||
+       FAILED(ID3D12Device1_CreateCommandList(device->dev, 0, D3D12_COMMAND_LIST_TYPE_COPY,
+                                             allocator, NULL, &IID_ID3D12GraphicsCommandList,
+                                             (void **)&cmdlist)) ||
+       FAILED(ID3D12Device1_CreateFence(device->dev, 0, D3D12_FENCE_FLAG_NONE,
+                                       &IID_ID3D12Fence, (void **)&fence)))
+      goto out;
+
+   ID3D12GraphicsCommandList_CopyBufferRegion(cmdlist, device->queries.refs, 0,
+                                             upload, 0, DZN_QUERY_REFS_RES_SIZE);
+   D3D12_RESOURCE_BARRIER barrier = {
+      .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+      .Transition = {
+         .pResource = device->queries.refs,
+         .Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+         .StateBefore = D3D12_RESOURCE_STATE_COPY_DEST,
+         .StateAfter = D3D12_RESOURCE_STATE_COMMON,
+      },
+   };
+   ID3D12GraphicsCommandList_ResourceBarrier(cmdlist, 1, &barrier);
+   if (FAILED(ID3D12GraphicsCommandList_Close(cmdlist))) {
+      result = VK_ERROR_INITIALIZATION_FAILED;
+      goto out;
+   }
+
+   ID3D12CommandList *lists[] = { (ID3D12CommandList *)cmdlist };
+   ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+   if (FAILED(ID3D12CommandQueue_Signal(queue, fence, 1))) {
+      result = vk_device_set_lost(&device->vk, "Failed to signal query upload fence");
+      goto out;
+   }
+
+   HRESULT hr = ID3D12Fence_SetEventOnCompletion(fence, 1, NULL);
+   if (ID3D12Fence_GetCompletedValue(fence) == UINT64_MAX) {
+      result = vk_device_set_lost(&device->vk, "Query upload device removed");
+      goto out;
+   }
+   if (FAILED(hr)) {
+      /* Keep staging alive until the submitted copy completes even when
+       * registering the synchronous fence wait runs out of memory.
+       */
+      uint64_t completed;
+      while ((completed = ID3D12Fence_GetCompletedValue(fence)) < 1)
+         os_time_sleep(1000);
+      result = completed == UINT64_MAX ?
+               vk_device_set_lost(&device->vk, "Query upload device removed") :
+               (hr == E_OUTOFMEMORY ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_UNKNOWN);
+      goto out;
+   }
+
+   result = VK_SUCCESS;
+out:
+   if (fence)
+      ID3D12Fence_Release(fence);
+   if (cmdlist)
+      ID3D12GraphicsCommandList_Release(cmdlist);
+   if (allocator)
+      ID3D12CommandAllocator_Release(allocator);
+   if (queue)
+      ID3D12CommandQueue_Release(queue);
+   if (upload)
+      ID3D12Resource_Release(upload);
+   return result == VK_SUCCESS ? result : vk_error(device, result);
 }
 
 static void
@@ -2559,6 +2729,12 @@ dzn_device_memory_destroy(struct dzn_device_memory *mem,
 
    struct dzn_device *device = container_of(mem->base.device, struct dzn_device, vk);
 
+   if (mem->budget_accounted) {
+      struct dzn_physical_device *pdev =
+         container_of(device->vk.physical, struct dzn_physical_device, vk);
+      p_atomic_add(&pdev->allocated_memory[mem->heap_index], -mem->size);
+   }
+
    if (mem->map && mem->map_res)
       ID3D12Resource_Unmap(mem->map_res, 0, NULL);
 
@@ -2657,6 +2833,11 @@ dzn_device_memory_create(struct dzn_device *device,
       case VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT: {
          const VkImportMemoryHostPointerInfoEXT *imp =
             (const VkImportMemoryHostPointerInfoEXT *)ext;
+         if (!imp->handleType)
+            break;
+         if (imp->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+             !imp->pHostPointer || pAllocateInfo->allocationSize % 65536)
+            return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
          host_pointer = imp->pHostPointer;
          break;
       }
@@ -2725,6 +2906,10 @@ dzn_device_memory_create(struct dzn_device *device,
    if (export_flags & ~valid_flags)
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
+   if (host_pointer && (export_flags || import_handle ||
+       !(mem_type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)))
+      return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
    struct dzn_device_memory *mem =
       vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*mem), 8,
                  VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -2741,6 +2926,8 @@ dzn_device_memory_create(struct dzn_device *device,
 
    mem->size = pAllocateInfo->allocationSize;
 
+   if (host_pointer)
+      heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
    heap_desc.SizeInBytes = ALIGN_POT(heap_desc.SizeInBytes, heap_desc.Alignment);
    if (!image && !buffer)
       heap_desc.Flags =
@@ -2768,17 +2955,19 @@ dzn_device_memory_create(struct dzn_device *device,
       error = VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
 #if defined(_WIN32)
-      if (!device->dev13)
-         goto cleanup;
-
-      if (FAILED(ID3D12Device13_OpenExistingHeapFromAddress1(device->dev13, host_pointer, heap_desc.SizeInBytes, &IID_ID3D12Heap, (void**)&mem->heap)))
+      if (FAILED(dzn_open_host_heap(pdevice, host_pointer,
+                                   pAllocateInfo->allocationSize, &mem->heap)))
          goto cleanup;
 
       D3D12_HEAP_DESC desc = dzn_ID3D12Heap_GetDesc(mem->heap);
       if (desc.Properties.Type != D3D12_HEAP_TYPE_CUSTOM)
          desc.Properties = dzn_ID3D12Device4_GetCustomHeapProperties(device->dev, 0, desc.Properties.Type);
 
-      if ((heap_desc.Flags & ~desc.Flags) ||
+      if (desc.SizeInBytes < heap_desc.SizeInBytes ||
+          (desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) ||
+          ((heap_desc.Flags & (D3D12_HEAP_FLAG_SHARED |
+                              D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER |
+                              D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS)) & ~desc.Flags) ||
           desc.Properties.CPUPageProperty != heap_desc.Properties.CPUPageProperty ||
           desc.Properties.MemoryPoolPreference != heap_desc.Properties.MemoryPoolPreference)
          goto cleanup;
@@ -2932,6 +3121,9 @@ dzn_device_memory_create(struct dzn_device *device,
    }
 
    *out = dzn_device_memory_to_handle(mem);
+   mem->heap_index = mem_type->heapIndex;
+   p_atomic_add(&pdevice->allocated_memory[mem->heap_index], mem->size);
+   mem->budget_accounted = true;
    return VK_SUCCESS;
 
 cleanup:
@@ -3147,7 +3339,8 @@ dzn_buffer_create(struct dzn_device *device,
 
    const VkExternalMemoryBufferCreateInfo *external_info =
       vk_find_struct_const(pCreateInfo->pNext, EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
-   if (external_info && external_info->handleTypes != 0)
+   if (external_info && (external_info->handleTypes &
+       ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) != 0)
       buf->shared = true;
 
    *out = dzn_buffer_to_handle(buf);
@@ -3342,7 +3535,7 @@ dzn_BindBufferMemory2(VkDevice _device,
          desc.Flags |= mem->res_flags;
          if (FAILED(ID3D12Device1_CreatePlacedResource(device->dev, mem->heap,
                                                        pBindInfos[i].memoryOffset,
-                                                       &buffer->desc,
+                                                       &desc,
                                                        D3D12_RESOURCE_STATE_COMMON,
                                                        NULL,
                                                        &IID_ID3D12Resource,
@@ -3493,9 +3686,13 @@ dzn_QueueBindSparse(VkQueue queue,
                     const VkBindSparseInfo *pBindInfo,
                     VkFence fence)
 {
-   // FIXME: add proper implem
-   dzn_stub();
-   return VK_SUCCESS;
+   VK_FROM_HANDLE(dzn_queue, q, queue);
+
+   /* No queue family advertises sparse binding. Never silently accept binds
+    * or leave their semaphores/fence unsignaled while reporting success.
+    */
+   return vk_errorf(q->vk.base.device, VK_ERROR_UNKNOWN,
+                    "Sparse binding is not supported by this queue");
 }
 
 static D3D12_TEXTURE_ADDRESS_MODE
@@ -3534,6 +3731,13 @@ dzn_sampler_create(struct dzn_device *device,
                    VkSampler *out)
 {
    struct dzn_physical_device *pdev = container_of(device->vk.physical, struct dzn_physical_device, vk);
+   const VkSamplerCustomBorderColorCreateInfoEXT *custom =
+      vk_find_struct_const(pCreateInfo->pNext, SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT);
+   if ((pCreateInfo->borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT ||
+        pCreateInfo->borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT) &&
+       (!dzn_custom_border_color_supported(pdev) || !custom ||
+        !device->vk.enabled_features.customBorderColors))
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
    struct dzn_sampler *sampler =
       vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*sampler), 8,
                  VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
@@ -3616,6 +3820,22 @@ dzn_sampler_create(struct dzn_device *device,
          break;
       default:
          UNREACHABLE("Unsupported border color");
+      }
+   }
+
+   if (custom && (pCreateInfo->borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT ||
+                  pCreateInfo->borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT)) {
+      /* Match the native component order used by the corresponding SRV. */
+      uint32_t color[4];
+      memcpy(color, sampler->desc.UintBorderColor, sizeof(color));
+      if (custom->format == VK_FORMAT_B4G4R4A4_UNORM_PACK16) {
+         const unsigned remap[2][4] = { { 1, 0, 3, 2 }, { 2, 1, 0, 3 } };
+         for (unsigned i = 0; i < 4; i++)
+            sampler->desc.UintBorderColor[remap[pdev->support_a4b4g4r4][i]] = color[i];
+      } else if (vk_format_has_stencil(custom->format) &&
+                 pCreateInfo->borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT) {
+         sampler->desc.UintBorderColor[0] = color[1];
+         sampler->desc.UintBorderColor[1] = color[0];
       }
    }
 
@@ -3884,18 +4104,28 @@ dzn_GetMemoryHostPointerPropertiesEXT(VkDevice _device,
 {
    VK_FROM_HANDLE(dzn_device, device, _device);
 
-   if (!device->dev13)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
-
-   ID3D12Heap *heap;
-   if (FAILED(ID3D12Device13_OpenExistingHeapFromAddress1(device->dev13, pHostPointer, 1, &IID_ID3D12Heap, (void **)&heap)))
+   pMemoryHostPointerProperties->memoryTypeBits = 0;
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
    struct dzn_physical_device *pdev = container_of(device->vk.physical, struct dzn_physical_device, vk);
+   ID3D12Heap *heap;
+   if (FAILED(dzn_open_host_heap(pdev, pHostPointer, 65536, &heap)))
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
    D3D12_HEAP_DESC heap_desc = dzn_ID3D12Heap_GetDesc(heap);
-   pMemoryHostPointerProperties->memoryTypeBits = 0;
+   if (heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) {
+      ID3D12Heap_Release(heap);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+   if (heap_desc.Properties.Type != D3D12_HEAP_TYPE_CUSTOM)
+      heap_desc.Properties = dzn_ID3D12Device4_GetCustomHeapProperties(device->dev, 0, heap_desc.Properties.Type);
    for (uint32_t i = 0; i < pdev->memory.memoryTypeCount; ++i) {
       const VkMemoryType *mem_type = &pdev->memory.memoryTypes[i];
+      if (!(mem_type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+         continue;
+      if (pdev->heap_flags_for_mem_type[i] & D3D12_HEAP_FLAG_DENY_BUFFERS)
+         continue;
       D3D12_HEAP_PROPERTIES required_props = deduce_heap_properties_from_memory(pdev, mem_type);
       if (heap_desc.Properties.CPUPageProperty != required_props.CPUPageProperty ||
           heap_desc.Properties.MemoryPoolPreference != required_props.MemoryPoolPreference)
@@ -3904,6 +4134,6 @@ dzn_GetMemoryHostPointerPropertiesEXT(VkDevice _device,
       pMemoryHostPointerProperties->memoryTypeBits |= (1 << i);
    }
    ID3D12Heap_Release(heap);
-   return VK_SUCCESS;
+   return pMemoryHostPointerProperties->memoryTypeBits ? VK_SUCCESS : VK_ERROR_INVALID_EXTERNAL_HANDLE;
 }
 #endif

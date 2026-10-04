@@ -251,6 +251,7 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
       return result;
 
    struct dxil_spirv_runtime_conf conf = {
+      .fixed_point_size = true,
       .runtime_data_cbv = {
          .register_space = DZN_REGISTER_SPACE_SYSVALS,
          .base_shader_register = 0,

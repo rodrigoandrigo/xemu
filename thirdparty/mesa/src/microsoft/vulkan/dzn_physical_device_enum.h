@@ -50,6 +50,8 @@ struct dzn_physical_device_desc {
 };
 
 struct d3d12_memory_info {
+   bool local_valid;
+   bool nonlocal_valid;
    uint64_t usage_local;
    uint64_t budget_local;
    uint64_t usage_nonlocal;

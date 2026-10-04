@@ -221,6 +221,7 @@ struct dzn_physical_device {
    D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19;
    D3D12_FEATURE_DATA_D3D12_OPTIONS21 options21;
    VkPhysicalDeviceMemoryProperties memory;
+   uint64_t allocated_memory[VK_MAX_MEMORY_HEAPS];
    D3D12_HEAP_FLAGS heap_flags_for_mem_type[VK_MAX_MEMORY_TYPES];
    const struct vk_sync_type *sync_types[MAX_SYNC_TYPES + 1];
    float timestamp_period;
@@ -336,6 +337,8 @@ struct dzn_device_memory {
 
    ID3D12Heap *heap;
    VkDeviceSize size;
+   uint32_t heap_index;
+   bool budget_accounted;
 
    /* A buffer-resource spanning the entire heap, used for mapping memory */
    ID3D12Resource *map_res;
@@ -1302,6 +1305,7 @@ struct dzn_query_pool {
    uint32_t query_count;
    struct dzn_query *queries;
    mtx_t queries_lock;
+   cnd_t queries_cond;
    ID3D12Resource *resolve_buffer;
    ID3D12Resource *collect_buffer;
    VkQueryPipelineStatisticFlags pipeline_statistics;

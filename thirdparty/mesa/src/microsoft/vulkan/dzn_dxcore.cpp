@@ -24,6 +24,9 @@
 #include "dzn_physical_device_enum.h"
 #include <directx/dxcore.h>
 #include <dxguids/dxguids.h>
+#ifdef _WIN32
+#include <dxgi1_4.h>
+#endif
 
 #include "util/u_dl.h"
 #include "util/log.h"
@@ -94,26 +97,57 @@ dzn_enumerate_physical_devices_dxcore(struct vk_instance *instance)
 }
 
 void
-dzn_query_memory_info(IUnknown* unk, d3d12_memory_info* output){
-   IDXCoreAdapter* adapter = NULL;
+dzn_query_memory_info(IUnknown *unk, d3d12_memory_info *output)
+{
+   *output = {};
+   if (!unk)
+      return;
+   IDXCoreAdapter *adapter = nullptr;
    HRESULT hr = unk->QueryInterface(
       __uuidof(IDXCoreAdapter),
       reinterpret_cast<void**>(&adapter));
 
-   if(SUCCEEDED(hr)){
-
-      DXCoreAdapterMemoryBudget local_info, nonlocal_info;
+   if (SUCCEEDED(hr)) {
+      DXCoreAdapterMemoryBudget local_info = {}, nonlocal_info = {};
       DXCoreAdapterMemoryBudgetNodeSegmentGroup local_node_segment = { 0, DXCoreSegmentGroup::Local };
       DXCoreAdapterMemoryBudgetNodeSegmentGroup nonlocal_node_segment = { 0, DXCoreSegmentGroup::NonLocal };
-      adapter->QueryState(DXCoreAdapterState::AdapterMemoryBudget, &local_node_segment, &local_info);
-      adapter->QueryState(DXCoreAdapterState::AdapterMemoryBudget, &nonlocal_node_segment, &nonlocal_info);
+      output->local_valid = SUCCEEDED(adapter->QueryState(
+         DXCoreAdapterState::AdapterMemoryBudget, &local_node_segment, &local_info));
+      output->nonlocal_valid = SUCCEEDED(adapter->QueryState(
+         DXCoreAdapterState::AdapterMemoryBudget, &nonlocal_node_segment, &nonlocal_info));
+      adapter->Release();
 
-      output->budget_local = local_info.budget;
-      output->budget_nonlocal = nonlocal_info.budget;
-      output->budget = local_info.budget + nonlocal_info.budget;
-      output->usage_local = local_info.currentUsage;
-      output->usage_nonlocal = nonlocal_info.currentUsage;
-      output->usage = local_info.currentUsage + nonlocal_info.currentUsage;
-      return;
+      if (output->local_valid) {
+         output->budget_local = local_info.budget;
+         output->usage_local = local_info.currentUsage;
+      }
+      if (output->nonlocal_valid) {
+         output->budget_nonlocal = nonlocal_info.budget;
+         output->usage_nonlocal = nonlocal_info.currentUsage;
+      }
    }
+#ifdef _WIN32
+   if (!output->local_valid || !output->nonlocal_valid) {
+      IDXGIAdapter3 *dxgi = nullptr;
+      if (SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(&dxgi)))) {
+         DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+         if (!output->local_valid && SUCCEEDED(dxgi->QueryVideoMemoryInfo(
+                0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+            output->local_valid = true;
+            output->budget_local = info.Budget;
+            output->usage_local = info.CurrentUsage;
+         }
+         info = {};
+         if (!output->nonlocal_valid && SUCCEEDED(dxgi->QueryVideoMemoryInfo(
+                0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
+            output->nonlocal_valid = true;
+            output->budget_nonlocal = info.Budget;
+            output->usage_nonlocal = info.CurrentUsage;
+         }
+         dxgi->Release();
+      }
+   }
+#endif
+   output->budget = output->budget_local + output->budget_nonlocal;
+   output->usage = output->usage_local + output->usage_nonlocal;
 }

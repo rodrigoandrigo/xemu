@@ -564,19 +564,9 @@ static bool
 dxil_spirv_nir_discard_point_size_var(nir_shader *shader)
 {
    if (shader->info.stage != MESA_SHADER_VERTEX &&
+       shader->info.stage != MESA_SHADER_TESS_CTRL &&
        shader->info.stage != MESA_SHADER_TESS_EVAL &&
        shader->info.stage != MESA_SHADER_GEOMETRY)
-      return false;
-
-   nir_variable *psiz = NULL;
-   nir_foreach_shader_out_variable(var, shader) {
-      if (var->data.location == VARYING_SLOT_PSIZ) {
-         psiz = var;
-         break;
-      }
-   }
-
-   if (!psiz)
       return false;
 
    if (!nir_shader_intrinsics_pass(shader, discard_psiz_access,
@@ -635,6 +625,27 @@ lower_point_size_emit(nir_builder *b, nir_instr *instr, void *cb_data)
 
    struct lower_point_size_data *data = cb_data;
    b->cursor = nir_before_instr(instr);
+   /* EmitVertex makes all shader outputs undefined. Snapshot them before
+    * expanding a point, and restore them before every corner, including
+    * arrays such as ClipDistance. Only updating Position is not sufficient.
+    */
+   struct point_output {
+      nir_variable *output;
+      nir_variable *saved;
+   };
+   unsigned output_capacity = 0;
+   nir_foreach_shader_out_variable(var, b->shader)
+      output_capacity++;
+   struct point_output *outputs =
+      rzalloc_array(b->shader, struct point_output, output_capacity);
+   unsigned output_count = 0;
+   nir_foreach_shader_out_variable(var, b->shader) {
+      outputs[output_count].output = var;
+      outputs[output_count].saved =
+         nir_local_variable_create(b->impl, var->type, "point_output");
+      nir_copy_var(b, outputs[output_count].saved, var);
+      output_count++;
+   }
    nir_def *position = nir_load_var(b, data->position);
    nir_def *point_size = nir_load_var(b, data->point_size);
    nir_def *viewport = load_viewport_size(b, data->conf);
@@ -646,6 +657,8 @@ lower_point_size_emit(nir_builder *b, nir_instr *instr, void *cb_data)
       { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 },
    };
    for (unsigned i = 0; i < ARRAY_SIZE(corners); i++) {
+      for (unsigned j = 0; j < output_count; j++)
+         nir_copy_var(b, outputs[j].output, outputs[j].saved);
       nir_def *new_position = nir_vec4(
          b, nir_ffma(b, nir_channel(b, half_extent, 0),
                      nir_imm_float(b, corners[i][0]),
@@ -658,6 +671,7 @@ lower_point_size_emit(nir_builder *b, nir_instr *instr, void *cb_data)
       nir_emit_vertex(b);
    }
    nir_end_primitive(b);
+   ralloc_free(outputs);
    nir_instr_remove(instr);
    return true;
 }
@@ -996,42 +1010,6 @@ merge_ubos_and_ssbos(nir_shader *nir)
    return progress;
 }
 
-static void
-preserve_generic_io_locations(nir_shader *nir, nir_variable_mode modes,
-                              unsigned declared_location_count)
-{
-   unsigned generic_span = declared_location_count;
-   nir_foreach_variable_with_modes(var, nir, modes) {
-      if (var->data.location < VARYING_SLOT_VAR0 ||
-          var->data.location > VARYING_SLOT_VAR31)
-         continue;
-
-      const struct glsl_type *type = var->type;
-      if (nir_is_arrayed_io(var, nir->info.stage) && glsl_type_is_array(type))
-         type = glsl_get_array_element(type);
-      generic_span = MAX2(generic_span,
-                          var->data.location - VARYING_SLOT_VAR0 +
-                          glsl_count_vec4_slots(type, false, false));
-   }
-
-   unsigned system_location = generic_span;
-   nir_foreach_variable_with_modes(var, nir, modes) {
-      if (var->data.location >= VARYING_SLOT_VAR0 &&
-          var->data.location <= VARYING_SLOT_VAR31) {
-         var->data.driver_location =
-            var->data.location - VARYING_SLOT_VAR0;
-         continue;
-      }
-
-      var->data.driver_location = system_location;
-      const struct glsl_type *type = var->type;
-      if (nir_is_arrayed_io(var, nir->info.stage) && glsl_type_is_array(type))
-         type = glsl_get_array_element(type);
-      system_location += glsl_count_vec4_slots(type, false, false);
-   }
-   dxil_sort_by_driver_location(nir, modes);
-}
-
 void
 dxil_spirv_nir_passes(nir_shader *nir,
                       const struct dxil_spirv_runtime_conf *conf,
@@ -1136,8 +1114,10 @@ dxil_spirv_nir_passes(nir_shader *nir,
       NIR_PASS(_, nir, nir_opt_access, &opt_access_options);
    }
 
-   NIR_PASS(metadata->requires_runtime_data, nir,
-            dxil_spirv_nir_lower_geometry_point_size, conf);
+   if (!conf->fixed_point_size) {
+      NIR_PASS(metadata->requires_runtime_data, nir,
+               dxil_spirv_nir_lower_geometry_point_size, conf);
+   }
    NIR_PASS(_, nir, dxil_spirv_nir_discard_point_size_var);
 
    NIR_PASS(_, nir, nir_remove_dead_variables,
@@ -1259,6 +1239,9 @@ dxil_spirv_nir_passes(nir_shader *nir,
               NULL);
    NIR_PASS(_, nir, merge_ubos_and_ssbos);
 
+   uint64_t preserved_io = BITFIELD64_RANGE(VARYING_SLOT_VAR0,
+      MIN2(conf->preserve_generic_io_location_count, 64 - VARYING_SLOT_VAR0));
+
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       dxil_sort_ps_outputs(nir);
    } else {
@@ -1266,11 +1249,7 @@ dxil_spirv_nir_passes(nir_shader *nir,
        * assigned even if there's just a single vertex shader in the
        * pipeline. The real linking happens in dxil_spirv_nir_link().
        */
-      dxil_reassign_driver_locations(nir, nir_var_shader_out, 0, NULL);
-      if (conf->preserve_generic_io_location_count)
-         preserve_generic_io_locations(
-            nir, nir_var_shader_out,
-            conf->preserve_generic_io_location_count);
+      dxil_reassign_driver_locations(nir, nir_var_shader_out, preserved_io, NULL);
    }
 
    if (nir->info.stage == MESA_SHADER_VERTEX) {
@@ -1282,11 +1261,7 @@ dxil_spirv_nir_passes(nir_shader *nir,
 
       dxil_sort_by_driver_location(nir, nir_var_shader_in);
    } else {
-      dxil_reassign_driver_locations(nir, nir_var_shader_in, 0, NULL);
-      if (conf->preserve_generic_io_location_count)
-         preserve_generic_io_locations(
-            nir, nir_var_shader_in,
-            conf->preserve_generic_io_location_count);
+      dxil_reassign_driver_locations(nir, nir_var_shader_in, preserved_io, NULL);
    }
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));

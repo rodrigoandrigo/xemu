@@ -919,7 +919,8 @@ dzn_GetImageMemoryRequirements2(VkDevice _device,
       .alignment = info.Alignment,
       .memoryTypeBits =
          dzn_physical_device_get_mem_type_mask_for_resource(pdev, &image->desc,
-                                                            image->vk.external_handle_types != 0),
+            (image->vk.external_handle_types &
+             ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) != 0),
    };
 
    /*

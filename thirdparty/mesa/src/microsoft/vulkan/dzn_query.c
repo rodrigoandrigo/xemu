@@ -28,7 +28,7 @@
 #include "vk_debug_report.h"
 #include "vk_util.h"
 
-#include "util/os_time.h"
+#include "c11/time.h"
 
 static D3D12_QUERY_HEAP_TYPE
 dzn_query_pool_get_heap_type(VkQueryType in)
@@ -81,6 +81,7 @@ dzn_query_pool_destroy(struct dzn_query_pool *qpool,
          ID3D12Fence_Release(qpool->queries[q].fence);
    }
 
+   cnd_destroy(&qpool->queries_cond);
    mtx_destroy(&qpool->queries_lock);
    vk_object_base_finish(&qpool->base);
    vk_free2(&device->vk.alloc, alloc, qpool);
@@ -102,7 +103,17 @@ dzn_query_pool_create(struct dzn_device *device,
 
    vk_object_base_init(&device->vk, &qpool->base, VK_OBJECT_TYPE_QUERY_POOL);
 
-   mtx_init(&qpool->queries_lock, mtx_plain);
+   if (mtx_init(&qpool->queries_lock, mtx_plain) != thrd_success) {
+      vk_object_base_finish(&qpool->base);
+      vk_free2(&device->vk.alloc, alloc, qpool);
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   if (cnd_init(&qpool->queries_cond) != thrd_success) {
+      mtx_destroy(&qpool->queries_lock);
+      vk_object_base_finish(&qpool->base);
+      vk_free2(&device->vk.alloc, alloc, qpool);
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
    qpool->query_count = info->queryCount;
    qpool->queries = queries;
 
@@ -277,26 +288,42 @@ dzn_GetQueryPoolResults(VkDevice device,
          ID3D12Fence *query_fence = NULL;
          uint64_t query_fence_val = 0;
 
-         while (true) {
-            mtx_lock(&qpool->queries_lock);
-            if (query->fence) {
-               query_fence = query->fence;
-               ID3D12Fence_AddRef(query_fence);
-            }
-            query_fence_val = query->fence_value;
-            mtx_unlock(&qpool->queries_lock);
-
-            if (query_fence)
-               break;
-
-            /* Check again in 10ms.
-             * FIXME: decrease the polling period if it happens to hurt latency.
+         mtx_lock(&qpool->queries_lock);
+         while (!query->fence) {
+            /* Submission wakes us immediately. The timeout only allows device
+             * loss to be detected when no further submissions can wake us.
              */
-            os_time_sleep(10 * 1000);
+            struct timespec deadline;
+            if (timespec_get(&deadline, TIME_UTC) != TIME_UTC) {
+               mtx_unlock(&qpool->queries_lock);
+               return vk_error(dzn_device_from_handle(device), VK_ERROR_UNKNOWN);
+            }
+            deadline.tv_sec++;
+            int ret = cnd_timedwait(&qpool->queries_cond,
+                                    &qpool->queries_lock, &deadline);
+            struct dzn_device *dev = dzn_device_from_handle(device);
+            VkResult status = vk_device_check_status(&dev->vk);
+            if (status != VK_SUCCESS ||
+                (ret != thrd_success && ret != thrd_timedout)) {
+               mtx_unlock(&qpool->queries_lock);
+               return status != VK_SUCCESS ? status :
+                      vk_error(dev, VK_ERROR_UNKNOWN);
+            }
          }
+         query_fence = query->fence;
+         ID3D12Fence_AddRef(query_fence);
+         query_fence_val = query->fence_value;
+         mtx_unlock(&qpool->queries_lock);
 
-         ID3D12Fence_SetEventOnCompletion(query_fence, query_fence_val, NULL);
+         HRESULT hr = ID3D12Fence_SetEventOnCompletion(query_fence, query_fence_val, NULL);
+         uint64_t completed = ID3D12Fence_GetCompletedValue(query_fence);
          ID3D12Fence_Release(query_fence);
+         if (completed == UINT64_MAX)
+            return vk_device_set_lost(&dzn_device_from_handle(device)->vk,
+                                      "Query fence device removed");
+         if (FAILED(hr))
+            return vk_error(dzn_device_from_handle(device),
+                            hr == E_OUTOFMEMORY ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_UNKNOWN);
          available = UINT64_MAX;
       } else {
          ID3D12Fence *query_fence = NULL;
@@ -309,9 +336,13 @@ dzn_GetQueryPoolResults(VkDevice device,
          mtx_unlock(&qpool->queries_lock);
 
          if (query_fence) {
-            if (ID3D12Fence_GetCompletedValue(query_fence) >= query_fence_val)
+            uint64_t completed = ID3D12Fence_GetCompletedValue(query_fence);
+            if (completed >= query_fence_val)
                available = UINT64_MAX;
             ID3D12Fence_Release(query_fence);
+            if (completed == UINT64_MAX)
+               return vk_device_set_lost(&dzn_device_from_handle(device)->vk,
+                                         "Query fence device removed");
          }
       }
 
