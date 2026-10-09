@@ -222,6 +222,15 @@ dzn_image_create(struct dzn_device *device,
    else
       image->desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
 
+   /* Raw matching-aspect copy shaders must see/store integer bits even when
+    * the public single-channel color format is float or normalized. */
+   if (usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+      DXGI_FORMAT typeless = dzn_get_typeless_dxgi_format(image->desc.Format);
+      if (typeless == DXGI_FORMAT_R8_TYPELESS || typeless == DXGI_FORMAT_R16_TYPELESS ||
+          typeless == DXGI_FORMAT_R32_TYPELESS)
+         image->desc.Format = typeless;
+   }
+
    image->desc.SampleDesc.Quality = 0;
 
    image->desc.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -288,6 +297,8 @@ dzn_image_get_dxgi_format(const struct dzn_physical_device *pdev,
    enum pipe_format pfmt = vk_format_to_pipe_format(format);
 
    if (pdev && !pdev->support_a4b4g4r4) {
+      if (pfmt == PIPE_FORMAT_R4G4B4A4_UNORM)
+         return DXGI_FORMAT_UNKNOWN;
       if (pfmt == PIPE_FORMAT_A4R4G4B4_UNORM)
          return DXGI_FORMAT_B4G4R4A4_UNORM;
       if (pfmt == PIPE_FORMAT_A4B4G4R4_UNORM)
@@ -975,6 +986,32 @@ dzn_GetImageSubresourceLayout(VkDevice _device,
    }
 }
 
+VKAPI_ATTR void VKAPI_CALL
+dzn_GetImageSubresourceLayout2KHR(VkDevice device, VkImage image,
+                                 const VkImageSubresource2KHR *subresource,
+                                 VkSubresourceLayout2KHR *layout)
+{
+   dzn_GetImageSubresourceLayout(device, image, &subresource->imageSubresource,
+                                  &layout->subresourceLayout);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+dzn_GetDeviceImageSubresourceLayoutKHR(VkDevice _device,
+                                      const VkDeviceImageSubresourceInfoKHR *info,
+                                      VkSubresourceLayout2KHR *layout)
+{
+   VK_FROM_HANDLE(dzn_device, device, _device);
+   VkImage image;
+   VkResult result = dzn_image_create(device, info->pCreateInfo, NULL, &image);
+   if (result != VK_SUCCESS) {
+      memset(&layout->subresourceLayout, 0, sizeof(layout->subresourceLayout));
+      vk_error(device, result);
+      return;
+   }
+   dzn_GetImageSubresourceLayout2KHR(_device, image, info->pSubresource, layout);
+   dzn_image_destroy(dzn_image_from_handle(image), NULL);
+}
+
 static D3D12_SHADER_COMPONENT_MAPPING
 translate_swizzle(VkComponentSwizzle in, uint32_t comp)
 {
@@ -999,6 +1036,68 @@ translate_swizzle(VkComponentSwizzle in, uint32_t comp)
 }
 
 static void
+dzn_image_view_apply_min_lod_clamp(struct dzn_image_view *iview)
+{
+   iview->srv_min_lod_clamp = 0.0f;
+   if (!iview->vk.base.device->enabled_features.minLod)
+      return;
+
+   /*
+    * D3D12 recommends leaving MostDetailedMip at zero when using
+    * ResourceMinLODClamp. In that mode MipLevels is the upper resource-mip
+    * bound, so widen it to the end of the Vulkan view and fold baseMipLevel
+    * into the resource-relative clamp. The resulting interval is
+    * [max(baseMipLevel, minLod), baseMipLevel + levelCount - 1].
+    */
+   iview->srv_min_lod_clamp =
+      MAX2((float)iview->vk.base_mip_level, iview->vk.min_lod);
+
+   switch (iview->srv_desc.ViewDimension) {
+   case D3D12_SRV_DIMENSION_TEXTURE1D:
+      iview->srv_desc.Texture1D.MostDetailedMip = 0;
+      iview->srv_desc.Texture1D.MipLevels += iview->vk.base_mip_level;
+      iview->srv_desc.Texture1D.ResourceMinLODClamp = iview->srv_min_lod_clamp;
+      break;
+   case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+      iview->srv_desc.Texture1DArray.MostDetailedMip = 0;
+      iview->srv_desc.Texture1DArray.MipLevels += iview->vk.base_mip_level;
+      iview->srv_desc.Texture1DArray.ResourceMinLODClamp = iview->srv_min_lod_clamp;
+      break;
+   case D3D12_SRV_DIMENSION_TEXTURE2D:
+      iview->srv_desc.Texture2D.MostDetailedMip = 0;
+      iview->srv_desc.Texture2D.MipLevels += iview->vk.base_mip_level;
+      iview->srv_desc.Texture2D.ResourceMinLODClamp = iview->srv_min_lod_clamp;
+      break;
+   case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+      iview->srv_desc.Texture2DArray.MostDetailedMip = 0;
+      iview->srv_desc.Texture2DArray.MipLevels += iview->vk.base_mip_level;
+      iview->srv_desc.Texture2DArray.ResourceMinLODClamp = iview->srv_min_lod_clamp;
+      break;
+   case D3D12_SRV_DIMENSION_TEXTURE3D:
+      iview->srv_desc.Texture3D.MostDetailedMip = 0;
+      iview->srv_desc.Texture3D.MipLevels += iview->vk.base_mip_level;
+      iview->srv_desc.Texture3D.ResourceMinLODClamp = iview->srv_min_lod_clamp;
+      break;
+   case D3D12_SRV_DIMENSION_TEXTURECUBE:
+      iview->srv_desc.TextureCube.MostDetailedMip = 0;
+      iview->srv_desc.TextureCube.MipLevels += iview->vk.base_mip_level;
+      iview->srv_desc.TextureCube.ResourceMinLODClamp = iview->srv_min_lod_clamp;
+      break;
+   case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+      iview->srv_desc.TextureCubeArray.MostDetailedMip = 0;
+      iview->srv_desc.TextureCubeArray.MipLevels += iview->vk.base_mip_level;
+      iview->srv_desc.TextureCubeArray.ResourceMinLODClamp = iview->srv_min_lod_clamp;
+      break;
+   case D3D12_SRV_DIMENSION_TEXTURE2DMS:
+   case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+      assert(iview->vk.base_mip_level == 0 && iview->vk.min_lod == 0.0f);
+      break;
+   default:
+      UNREACHABLE("Unexpected image-view SRV dimension");
+   }
+}
+
+static void
 dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
 {
    struct dzn_physical_device *pdev =
@@ -1011,6 +1110,9 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
        iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) ?
       6 : 1;
    bool from_3d_image = iview->vk.image->image_type == VK_IMAGE_TYPE_3D;
+   /* D3D12 permits single-slice 1D/2D SRVs to serve either shader arrayness;
+    * select the concrete descriptor shape from the Vulkan view range.
+    */
    bool use_array = iview->vk.base_array_layer > 0 ||
                     (iview->vk.layer_count / layers_per_elem) > 1;
 
@@ -1055,6 +1157,13 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
          for (uint32_t i = 0; i < ARRAY_SIZE(swz); i++)
             swz[i] = bgra4_remap[swz[i]];
       }
+   } else if (iview->vk.format == VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR) {
+      for (uint32_t i = 0; i < ARRAY_SIZE(swz); i++) {
+         if (swz[i] == D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0)
+            swz[i] = D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2;
+         else if (swz[i] == D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2)
+            swz[i] = D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0;
+      }
    } else if (iview->vk.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
       /* D3D puts stencil in G, not R. Requests for R should be routed to G and vice versa. */
       for (uint32_t i = 0; i < ARRAY_SIZE(swz); i++) {
@@ -1084,12 +1193,12 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
          iview->srv_desc.Texture1DArray.MipLevels = iview->vk.level_count;
          iview->srv_desc.Texture1DArray.FirstArraySlice = iview->vk.base_array_layer;
          iview->srv_desc.Texture1DArray.ArraySize = iview->vk.layer_count;
-         iview->srv_desc.Texture1DArray.ResourceMinLODClamp = 0.0f;
+         iview->srv_desc.Texture1DArray.ResourceMinLODClamp = iview->vk.min_lod;
       } else {
          iview->srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
          iview->srv_desc.Texture1D.MostDetailedMip = iview->vk.base_mip_level;
          iview->srv_desc.Texture1D.MipLevels = iview->vk.level_count;
-         iview->srv_desc.Texture1D.ResourceMinLODClamp = 0.0f;
+         iview->srv_desc.Texture1D.ResourceMinLODClamp = iview->vk.min_lod;
       }
       break;
 
@@ -1099,7 +1208,7 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
          iview->srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
          iview->srv_desc.Texture3D.MostDetailedMip = iview->vk.base_mip_level;
          iview->srv_desc.Texture3D.MipLevels = iview->vk.level_count;
-         iview->srv_desc.Texture3D.ResourceMinLODClamp = 0.0f;
+         iview->srv_desc.Texture3D.ResourceMinLODClamp = iview->vk.min_lod;
       } else if (use_array && ms) {
          iview->srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
          iview->srv_desc.Texture2DMSArray.FirstArraySlice = iview->vk.base_array_layer;
@@ -1111,7 +1220,7 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
          iview->srv_desc.Texture2DArray.FirstArraySlice = iview->vk.base_array_layer;
          iview->srv_desc.Texture2DArray.ArraySize = iview->vk.layer_count;
          iview->srv_desc.Texture2DArray.PlaneSlice = plane_slice;
-         iview->srv_desc.Texture2DArray.ResourceMinLODClamp = 0.0f;
+         iview->srv_desc.Texture2DArray.ResourceMinLODClamp = iview->vk.min_lod;
       } else if (!use_array && ms) {
          iview->srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
       } else {
@@ -1119,7 +1228,7 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
          iview->srv_desc.Texture2D.MostDetailedMip = iview->vk.base_mip_level;
          iview->srv_desc.Texture2D.MipLevels = iview->vk.level_count;
          iview->srv_desc.Texture2D.PlaneSlice = plane_slice;
-         iview->srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+         iview->srv_desc.Texture2D.ResourceMinLODClamp = iview->vk.min_lod;
       }
       break;
 
@@ -1131,12 +1240,12 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
          iview->srv_desc.TextureCubeArray.MipLevels = iview->vk.level_count;
          iview->srv_desc.TextureCubeArray.First2DArrayFace = iview->vk.base_array_layer;
          iview->srv_desc.TextureCubeArray.NumCubes = iview->vk.layer_count / 6;
-         iview->srv_desc.TextureCubeArray.ResourceMinLODClamp = 0.0f;
+         iview->srv_desc.TextureCubeArray.ResourceMinLODClamp = iview->vk.min_lod;
       } else {
          iview->srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
          iview->srv_desc.TextureCube.MostDetailedMip = iview->vk.base_mip_level;
          iview->srv_desc.TextureCube.MipLevels = iview->vk.level_count;
-         iview->srv_desc.TextureCube.ResourceMinLODClamp = 0.0f;
+         iview->srv_desc.TextureCube.ResourceMinLODClamp = iview->vk.min_lod;
       }
       break;
 
@@ -1144,11 +1253,12 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
       iview->srv_desc.ViewDimension =  D3D12_SRV_DIMENSION_TEXTURE3D;
       iview->srv_desc.Texture3D.MostDetailedMip = iview->vk.base_mip_level;
       iview->srv_desc.Texture3D.MipLevels = iview->vk.level_count;
-      iview->srv_desc.Texture3D.ResourceMinLODClamp = 0.0f;
+      iview->srv_desc.Texture3D.ResourceMinLODClamp = iview->vk.min_lod;
       break;
 
    default: UNREACHABLE("Invalid view type");
    }
+   dzn_image_view_apply_min_lod_clamp(iview);
 }
 
 static void
@@ -1157,6 +1267,7 @@ dzn_image_view_prepare_uav_desc(struct dzn_image_view *iview)
    struct dzn_physical_device *pdev =
       container_of(iview->vk.base.device->physical, struct dzn_physical_device, vk);
    bool use_array = iview->vk.base_array_layer > 0 || iview->vk.layer_count > 1;
+   bool from_3d_image = iview->vk.image->image_type == VK_IMAGE_TYPE_3D;
 
    assert(iview->vk.image->samples == 1);
 
@@ -1167,6 +1278,7 @@ dzn_image_view_prepare_uav_desc(struct dzn_image_view *iview)
                                    iview->vk.aspects),
    };
 
+   /* D3D12 permits a single-slice 1D/2D UAV to serve either shader arrayness. */
    switch (iview->vk.view_type) {
    case VK_IMAGE_VIEW_TYPE_1D:
    case VK_IMAGE_VIEW_TYPE_1D_ARRAY:
@@ -1185,7 +1297,12 @@ dzn_image_view_prepare_uav_desc(struct dzn_image_view *iview)
    case VK_IMAGE_VIEW_TYPE_2D_ARRAY:
    case VK_IMAGE_VIEW_TYPE_CUBE:
    case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY:
-      if (use_array) {
+      if (from_3d_image) {
+         iview->uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+         iview->uav_desc.Texture3D.MipSlice = iview->vk.base_mip_level;
+         iview->uav_desc.Texture3D.FirstWSlice = iview->vk.base_array_layer;
+         iview->uav_desc.Texture3D.WSize = iview->vk.layer_count;
+      } else if (use_array) {
          iview->uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
          iview->uav_desc.Texture2DArray.PlaneSlice = 0;
          iview->uav_desc.Texture2DArray.MipSlice = iview->vk.base_mip_level;
@@ -1200,8 +1317,8 @@ dzn_image_view_prepare_uav_desc(struct dzn_image_view *iview)
    case VK_IMAGE_VIEW_TYPE_3D:
       iview->uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
       iview->uav_desc.Texture3D.MipSlice = iview->vk.base_mip_level;
-      iview->uav_desc.Texture3D.FirstWSlice = 0;
-      iview->uav_desc.Texture3D.WSize = iview->vk.extent.depth;
+      iview->uav_desc.Texture3D.FirstWSlice = iview->vk.storage.z_slice_offset;
+      iview->uav_desc.Texture3D.WSize = iview->vk.storage.z_slice_count;
       break;
    default: UNREACHABLE("Invalid type");
    }
@@ -1515,7 +1632,10 @@ dzn_buffer_view_create(struct dzn_device *device,
 
    bview->buffer = buf;
    bview->srv_bindless_slot = bview->uav_bindless_slot = -1;
-   if (buf->usage &
+   const VkBufferUsageFlags2CreateInfoKHR *usage2 =
+      vk_find_struct_const(pCreateInfo->pNext, BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR);
+   VkBufferUsageFlags2KHR usage = usage2 ? usage2->usage : buf->usage;
+   if (usage &
        (VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
         VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)) {
       bview->srv_desc = (D3D12_SHADER_RESOURCE_VIEW_DESC) {
@@ -1541,7 +1661,7 @@ dzn_buffer_view_create(struct dzn_device *device,
       }
    }
 
-   if (buf->usage & VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT) {
+   if (usage & VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT) {
       bview->uav_desc = (D3D12_UNORDERED_ACCESS_VIEW_DESC) {
          .Format = dzn_buffer_get_dxgi_format(pCreateInfo->format),
          .ViewDimension = D3D12_UAV_DIMENSION_BUFFER,

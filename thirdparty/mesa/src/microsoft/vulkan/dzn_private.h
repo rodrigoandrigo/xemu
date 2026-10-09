@@ -85,13 +85,32 @@ struct dzn_meta_indirect_draw {
    ID3D12PipelineState *pipeline_state;
 };
 
+struct dzn_meta_large_point_draw_args {
+   ID3D12RootSignature *root_sig;
+   ID3D12PipelineState *pipeline_state;
+};
+
 enum dzn_index_type {
    DZN_NO_INDEX,
    DZN_INDEX_2B,
    DZN_INDEX_4B,
    DZN_INDEX_2B_WITH_PRIM_RESTART,
    DZN_INDEX_4B_WITH_PRIM_RESTART,
-   DZN_NUM_INDEX_TYPE,
+   DZN_INDEX_1B_CONVERT,
+   DZN_INDEX_2B_STRIP_RESTART,
+   DZN_INDEX_4B_STRIP_RESTART,
+   DZN_INDEX_2B_LIST1_RESTART,
+   DZN_INDEX_4B_LIST1_RESTART,
+   DZN_INDEX_2B_LIST2_RESTART,
+   DZN_INDEX_4B_LIST2_RESTART,
+   DZN_INDEX_2B_LIST3_RESTART,
+   DZN_INDEX_4B_LIST3_RESTART,
+   DZN_INDEX_2B_LIST4_RESTART,
+   DZN_INDEX_4B_LIST4_RESTART,
+   DZN_INDEX_2B_LIST6_RESTART,
+   DZN_INDEX_4B_LIST6_RESTART,
+   DZN_INDEX_2B_PATCH_RESTART,
+   DZN_NUM_INDEX_TYPE = DZN_INDEX_2B_PATCH_RESTART + 64,
 };
 
 static inline enum dzn_index_type
@@ -121,13 +140,19 @@ dzn_index_type_from_dxgi_format(DXGI_FORMAT format, bool prim_restart)
 static inline uint8_t
 dzn_index_size(enum dzn_index_type type)
 {
+   if (type >= DZN_INDEX_2B_LIST1_RESTART && type < DZN_NUM_INDEX_TYPE)
+      return (type - DZN_INDEX_2B_LIST1_RESTART) % 2 ? 4 : 2;
    switch (type) {
    case DZN_NO_INDEX:
       return 0;
+   case DZN_INDEX_1B_CONVERT:
+      return 1;
    case DZN_INDEX_2B_WITH_PRIM_RESTART:
+   case DZN_INDEX_2B_STRIP_RESTART:
    case DZN_INDEX_2B:
       return 2;
    case DZN_INDEX_4B_WITH_PRIM_RESTART:
+   case DZN_INDEX_4B_STRIP_RESTART:
    case DZN_INDEX_4B:
       return 4;
    default: UNREACHABLE("Invalid index type");
@@ -152,7 +177,8 @@ struct dzn_meta_blit_key {
          uint32_t resolve_mode : 3;
          uint32_t linear_filter : 1;
          uint32_t stencil_bit : 4;
-         uint32_t padding : 5;
+         uint32_t bit_copy : 4;
+         uint32_t padding : 1;
       };
       const uint64_t u64;
    };
@@ -225,6 +251,7 @@ struct dzn_physical_device {
    D3D12_HEAP_FLAGS heap_flags_for_mem_type[VK_MAX_MEMORY_TYPES];
    const struct vk_sync_type *sync_types[MAX_SYNC_TYPES + 1];
    float timestamp_period;
+   bool calibrated_timestamps;
    bool support_a4b4g4r4;
 };
 
@@ -282,6 +309,7 @@ struct dzn_device {
    struct vk_device vk;
    struct vk_device_extension_table enabled_extensions;
    struct vk_device_dispatch_table cmd_dispatch;
+   uint64_t memory_report_next_id;
 
    ID3D12Device4 *dev;
    ID3D12Device10 *dev10;
@@ -291,6 +319,7 @@ struct dzn_device {
    ID3D12DeviceConfiguration *dev_config;
 
    struct dzn_meta_indirect_draw indirect_draws[DZN_NUM_INDIRECT_DRAW_TYPES];
+   struct dzn_meta_large_point_draw_args large_point_draw_args;
    struct dzn_meta_triangle_fan_rewrite_index triangle_fan[DZN_NUM_INDEX_TYPE];
    struct dzn_meta_blits blits;
 
@@ -337,8 +366,11 @@ struct dzn_device_memory {
 
    ID3D12Heap *heap;
    VkDeviceSize size;
+   uint64_t memory_report_id;
    uint32_t heap_index;
    bool budget_accounted;
+   bool imported;
+   bool address_binding_reported;
 
    /* A buffer-resource spanning the entire heap, used for mapping memory */
    ID3D12Resource *map_res;
@@ -396,6 +428,7 @@ enum dzn_cmd_dirty {
 #define MAX_VP D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
 #define MAX_SCISSOR D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
 #define MAX_SETS 8
+#define DZN_MAX_PUSH_DESCRIPTORS 32
 #define MAX_DYNAMIC_UNIFORM_BUFFERS 8
 #define MAX_DYNAMIC_STORAGE_BUFFERS 4
 #define MAX_DYNAMIC_BUFFERS                                                  \
@@ -419,6 +452,8 @@ struct dzn_cmd_buffer;
 struct dzn_descriptor_state {
    struct {
       const struct dzn_descriptor_set *set;
+      bool push_descriptor;
+      const struct dzn_pipeline_layout *pipeline_layout;
       uint32_t dynamic_offsets[MAX_DYNAMIC_BUFFERS];
    } sets[MAX_SETS];
    struct dzn_descriptor_heap *heaps[NUM_POOL_TYPES];
@@ -568,8 +603,63 @@ struct dzn_rendering_attachment {
    VkAttachmentStoreOp store_op;
 };
 
+enum dzn_extended_dynamic_state {
+   DZN_DYNAMIC_CULL = 1 << 0,
+   DZN_DYNAMIC_FRONT_FACE = 1 << 1,
+   DZN_DYNAMIC_TOPOLOGY = 1 << 2,
+   DZN_DYNAMIC_DEPTH_TEST = 1 << 3,
+   DZN_DYNAMIC_DEPTH_WRITE = 1 << 4,
+   DZN_DYNAMIC_DEPTH_COMPARE = 1 << 5,
+   DZN_DYNAMIC_DEPTH_BOUNDS_TEST = 1 << 6,
+   DZN_DYNAMIC_STENCIL_TEST = 1 << 7,
+   DZN_DYNAMIC_STENCIL_OP = 1 << 8,
+   DZN_DYNAMIC_DISCARD = 1 << 9,
+   DZN_DYNAMIC_DEPTH_BIAS_ENABLE = 1 << 10,
+   DZN_DYNAMIC_RESTART = 1 << 11,
+   DZN_DYNAMIC_VERTEX_INPUT = 1 << 12,
+   DZN_DYNAMIC_VERTEX_STRIDE = 1 << 13,
+   DZN_DYNAMIC_DEPTH_CLAMP = 1 << 14,
+   DZN_DYNAMIC_DEPTH_CLIP = 1 << 15,
+   DZN_DYNAMIC_SAMPLE_MASK = 1 << 16,
+   DZN_DYNAMIC_ALPHA_TO_COVERAGE = 1 << 17,
+   DZN_DYNAMIC_BLEND_ENABLE = 1 << 18,
+   DZN_DYNAMIC_BLEND_EQUATION = 1 << 19,
+   DZN_DYNAMIC_COLOR_MASK = 1 << 20,
+   DZN_DYNAMIC_SAMPLES = 1 << 21,
+   DZN_DYNAMIC_CONSERVATIVE = 1 << 22,
+};
+
+struct dzn_extended_state {
+   VkCullModeFlags cull_mode;
+   VkFrontFace front_face;
+   VkPrimitiveTopology topology;
+   uint32_t depth_test, depth_write, depth_bounds_test, stencil_test;
+   uint32_t discard, depth_bias_enable, restart;
+   uint32_t depth_clamp, depth_clip, sample_mask, alpha_to_coverage;
+   VkSampleCountFlagBits samples;
+   VkConservativeRasterizationModeEXT conservative;
+   uint32_t blend_enable[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+   VkColorBlendEquationEXT blend_equation[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+   VkColorComponentFlags color_mask[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+   VkCompareOp depth_compare;
+   struct {
+      VkStencilOp fail, pass, depth_fail;
+      VkCompareOp compare;
+   } stencil[2];
+   struct {
+      uint32_t binding, offset;
+      VkFormat format;
+   } attributes[MAX_VERTEX_GENERIC_ATTRIBS];
+   struct {
+      VkVertexInputRate rate;
+      uint32_t divisor;
+   } bindings[MAX_VBS];
+};
+
 struct dzn_graphics_pipeline_variant_key {
    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE ib_strip_cut;
+   uint8_t color_write_enables;
+   struct dzn_extended_state extended;
    struct {
       int constant_factor;
       float slope_factor;
@@ -591,6 +681,7 @@ struct dzn_graphics_pipeline_variant {
 
 struct dzn_cmd_buffer_state {
    const struct dzn_pipeline *pipeline;
+   ID3D12PipelineState *pipeline_state;
    struct dzn_descriptor_heap *heaps[NUM_POOL_TYPES];
    struct dzn_graphics_pipeline_variant_key pipeline_variant;
    struct {
@@ -610,6 +701,8 @@ struct dzn_cmd_buffer_state {
    } vb;
    struct {
       D3D12_INDEX_BUFFER_VIEW view;
+      struct dzn_buffer *uint8_buffer;
+      VkDeviceSize uint8_offset, uint8_size;
    } ib;
    struct {
       struct {
@@ -626,6 +719,19 @@ struct dzn_cmd_buffer_state {
    } blend;
    D3D12_VIEWPORT viewports[MAX_VP];
    D3D12_RECT scissors[MAX_SCISSOR];
+   uint32_t viewport_count, scissor_count;
+   struct {
+      ID3D12Resource *buffer;
+      uint64_t offset;
+      D3D12_PREDICATION_OP op;
+   } conditional;
+   struct {
+      bool active;
+      struct dzn_buffer *buffers[D3D12_SO_BUFFER_SLOT_COUNT];
+      uint64_t offsets[D3D12_SO_BUFFER_SLOT_COUNT];
+      uint64_t sizes[D3D12_SO_BUFFER_SLOT_COUNT];
+      ID3D12Resource *counters[D3D12_SO_BUFFER_SLOT_COUNT];
+   } xfb;
    struct {
       struct dzn_cmd_buffer_push_constant_state gfx, compute;
    } push_constant;
@@ -674,7 +780,11 @@ enum dzn_internal_buf_bucket {
 
 struct dzn_cmd_buffer {
    struct vk_command_buffer vk;
+   struct vk_vertex_input_state dynamic_vi;
    struct dzn_cmd_buffer_state state;
+
+   /* Push descriptor updates are snapshots and remain alive through execution. */
+   struct util_dynarray push_descriptor_pools;
 
    struct {
       struct hash_table *ht;
@@ -704,6 +814,7 @@ struct dzn_cmd_buffer {
 
    ID3D12CommandAllocator *cmdalloc;
    ID3D12GraphicsCommandList1 *cmdlist;
+   ID3D12GraphicsCommandList2 *cmdlist2;
    ID3D12GraphicsCommandList8 *cmdlist8;
    ID3D12GraphicsCommandList9 *cmdlist9;
 
@@ -738,6 +849,7 @@ struct dzn_descriptor_pool {
 
 struct dzn_descriptor_set_layout_binding {
    VkDescriptorType type;
+   uint32_t descriptor_count;
    uint32_t stages;
    D3D12_SHADER_VISIBILITY visibility;
    uint32_t base_shader_register;
@@ -843,6 +955,7 @@ struct dzn_pipeline_layout {
 
 struct dzn_descriptor_update_template_entry {
    VkDescriptorType type;
+   bool immutable_sampler;
    uint32_t desc_count;
    uint32_t buffer_idx;
    struct {
@@ -859,9 +972,25 @@ struct dzn_descriptor_update_template_entry {
 
 struct dzn_descriptor_update_template {
    struct vk_object_base base;
+   VkDescriptorUpdateTemplateType type;
+   VkPipelineBindPoint bind_point;
+   uint32_t set;
+   struct dzn_pipeline_layout *pipeline_layout;
    uint32_t entry_count;
    const struct dzn_descriptor_update_template_entry *entries;
 };
+
+VkResult
+dzn_descriptor_set_push_allocate(struct dzn_device *device,
+                                 const struct dzn_descriptor_set_layout *layout,
+                                 const struct dzn_descriptor_set *previous,
+                                 VkDescriptorPool *pool,
+                                 VkDescriptorSet *set);
+void
+dzn_descriptor_set_push_update(struct dzn_device *device,
+                               VkDescriptorSet set,
+                               uint32_t write_count,
+                               const VkWriteDescriptorSet *writes);
 
 enum dzn_register_space {
    DZN_REGISTER_SPACE_SYSVALS = MAX_SETS,
@@ -942,6 +1071,16 @@ struct dzn_indirect_draw_cmd_sig_key {
 
 struct dzn_graphics_pipeline {
    struct dzn_pipeline base;
+   uint32_t extended_dynamic;
+   bool dynamic_viewport_count, dynamic_scissor_count;
+   uint32_t patch_control_points;
+   bool static_depth_test;
+   nir_shader *dynamic_vs;
+   nir_shader_compiler_options dynamic_vs_options;
+   uint32_t input_count;
+   uint32_t input_locations[D3D12_VS_INPUT_REGISTER_COUNT];
+   D3D12_SO_DECLARATION_ENTRY so_entries[512];
+   uint32_t so_strides[D3D12_SO_BUFFER_SLOT_COUNT];
    struct {
       unsigned count;
       uint32_t strides[MAX_VBS];
@@ -949,6 +1088,8 @@ struct dzn_graphics_pipeline {
 
    struct {
       bool triangle_fan;
+      VkPrimitiveTopology vk_topology;
+      VkPrimitiveTopology raster_topology;
       D3D_PRIMITIVE_TOPOLOGY topology;
    } ia;
 
@@ -956,6 +1097,7 @@ struct dzn_graphics_pipeline {
       unsigned count;
       bool dynamic;
       D3D12_VIEWPORT desc[MAX_VP];
+      float min_depth, max_depth;
    } vp;
 
    struct {
@@ -987,12 +1129,16 @@ struct dzn_graphics_pipeline {
    } zsa;
 
    struct {
+      bool dynamic_color_write_enable;
       bool dynamic_constants;
       float constants[4];
    } blend;
 
    bool rast_disabled_from_missing_position;
+   bool explicit_depth_clip;
    bool use_gs_for_polygon_mode_point;
+   bool use_gs_for_provoking_vertex;
+   bool provoking_vertex_last;
    bool needs_draw_sysvals;
 
    struct {
@@ -1007,6 +1153,10 @@ struct dzn_graphics_pipeline {
          uint32_t ib_strip_cut;
          uint32_t rast;
          uint32_t ds;
+         uint32_t blend;
+         uint32_t sample_mask;
+         uint32_t samples;
+         uint32_t ps, input_layout, topology, so;
       } desc_offsets;
       D3D12_INPUT_ELEMENT_DESC inputs[D3D12_VS_INPUT_REGISTER_COUNT];
       struct {
@@ -1016,6 +1166,7 @@ struct dzn_graphics_pipeline {
    } templates;
 
    struct hash_table *variants;
+   mtx_t variants_lock;
 
    ID3D12CommandSignature *indirect_cmd_sigs[DZN_NUM_INDIRECT_DRAW_CMD_SIGS];
    struct hash_table *custom_stride_cmd_sigs;
@@ -1031,6 +1182,9 @@ struct dzn_graphics_pipeline {
 ID3D12PipelineState *
 dzn_graphics_pipeline_get_state(struct dzn_graphics_pipeline *pipeline,
                                 const struct dzn_graphics_pipeline_variant_key *key);
+D3D12_PRIMITIVE_TOPOLOGY
+dzn_graphics_pipeline_topology(const struct dzn_graphics_pipeline *pipeline,
+                               VkPrimitiveTopology topology);
 
 ID3D12CommandSignature *
 dzn_graphics_pipeline_get_indirect_cmd_sig(struct dzn_graphics_pipeline *pipeline,
@@ -1131,6 +1285,7 @@ dzn_image_get_copy_loc(const struct dzn_image *image,
 struct dzn_image_view {
    struct vk_image_view vk;
    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+   float srv_min_lod_clamp;
    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
    D3D12_RENDER_TARGET_VIEW_DESC rtv_desc;
    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc;
@@ -1155,7 +1310,7 @@ struct dzn_buffer {
    ID3D12Resource *res;
 
    VkBufferCreateFlags create_flags;
-   VkBufferUsageFlags usage;
+   VkBufferUsageFlags2KHR usage;
    bool shared;
 
    D3D12_BARRIER_ACCESS valid_access;

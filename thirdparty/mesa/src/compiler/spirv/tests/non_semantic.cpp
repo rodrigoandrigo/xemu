@@ -117,3 +117,42 @@ TEST_F(NonSemantic, printf)
    ASSERT_NE(intrinsic, nullptr);
    ASSERT_TRUE(nir_def_instr(intrinsic->src[0].ssa)->type == nir_instr_type_deref);
 }
+
+
+TEST_F(NonSemantic, relaxed_extended_instruction_forward_refs)
+{
+   /*
+    * The new opcode may carry forward references only in non-semantic
+    * extended instruction sets.  Exercise both the module types/variables
+    * section and a function body with debug parsing enabled; the instructions must be
+    * discarded without looking up their not-yet-defined operands.
+    */
+   static const uint32_t words[] = {
+      0x07230203, 0x00010600, 0x00000000, 0x0000000f, 0x00000000, 0x00020011,
+      0x00000001, 0x0008000a, 0x5f565053, 0x5f52484b, 0x5f6e6f6e, 0x616d6573,
+      0x6369746e, 0x666e695f, 0x0000006f, 0x000b000a, 0x5f565053, 0x5f52484b,
+      0x616c6572, 0x5f646578, 0x65747865, 0x6465646e, 0x736e695f, 0x63757274,
+      0x6e6f6974, 0x00000000, 0x000b000b, 0x00000001, 0x536e6f4e, 0x6e616d65,
+      0x2e636974, 0x64616853, 0x442e7265, 0x67756265, 0x6f666e49, 0x3030312e,
+      0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0005000f, 0x00000005,
+      0x00000004, 0x6e69616d, 0x00000000, 0x00060010, 0x00000004, 0x00000011,
+      0x00000001, 0x00000001, 0x00000001, 0x00040007, 0x00000006, 0x656c6966,
+      0x00000000, 0x00020013, 0x00000002, 0x00040015, 0x00000009, 0x00000020,
+      0x00000000, 0x0004002b, 0x00000009, 0x0000000a, 0x00000001, 0x0004002b,
+      0x00000009, 0x0000000b, 0x00000001,
+      /* DebugSource refers forward to the later DebugSource result ID 8. */
+      0x00061151, 0x00000002, 0x00000007, 0x00000001, 0x00000023, 0x00000008,
+      0x0006000c, 0x00000002, 0x00000008, 0x00000001, 0x00000023, 0x00000006,
+      0x00030021, 0x00000003, 0x00000002, 0x00050036, 0x00000002, 0x00000004,
+      0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+      /* DebugLine refers forward to the DebugSource result ID 14. */
+      0x000a1151, 0x00000002, 0x0000000d, 0x00000001, 0x00000067, 0x0000000e,
+      0x0000000a, 0x0000000a, 0x0000000b, 0x0000000b, 0x0006000c, 0x00000002,
+      0x0000000e, 0x00000001, 0x00000023, 0x00000006, 0x000100fd, 0x00010038,
+   };
+
+   spirv_options.debug_info = true;
+   get_nir(sizeof(words) / sizeof(words[0]), words);
+   ASSERT_NE(shader, nullptr);
+   ASSERT_EQ(shader->info.stage, MESA_SHADER_COMPUTE);
+}

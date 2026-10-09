@@ -31,6 +31,12 @@ static HMODULE
 load_dxil_mod()
 {
 #if defined(_XBOX_UWP)
+   HMODULE existing = nullptr;
+   if (GetModuleHandleExW(0, L"DXIL.dll", &existing))
+      return existing;
+   HMODULE module = NULL;
+   if (GetModuleHandleExW(0, L"DXIL.dll", &module))
+      return module;
    return LoadPackagedLibrary(L"DXIL.dll", 0);
 #else
    /* First, try to load DXIL.dll from the default search-path */
@@ -317,54 +323,63 @@ public:
 bool
 dxil_validate_module(struct dxil_validator *val, void *data, size_t size, char **error)
 {
+   if (error)
+      *error = NULL;
    if (!val)
       return false;
 
    ShaderBlob source(data, size);
 
    ComPtr<IDxcOperationResult> result;
-   HRESULT call_hr = val->dxc_validator->Validate(
-      &source, DxcValidatorFlags_InPlaceEdit, &result);
-   if (FAILED(call_hr) || !result) {
+   HRESULT hr = val->dxc_validator->Validate(&source, DxcValidatorFlags_InPlaceEdit,
+                                            &result);
+   if (FAILED(hr) || !result) {
       if (error)
-         *error = ralloc_asprintf(val,
-                                  "IDxcValidator::Validate failed (0x%08lx)",
-                                  (unsigned long)call_hr);
+         *error = ralloc_asprintf(val, "DXIL Validate failed (HRESULT 0x%08x, result %s)",
+                                 (unsigned)hr, result ? "present" : "null");
       return false;
    }
-
-   HRESULT hr;
-   call_hr = result->GetStatus(&hr);
-   if (FAILED(call_hr)) {
+   HRESULT status_hr = result->GetStatus(&hr);
+   if (FAILED(status_hr)) {
       if (error)
-         *error = ralloc_asprintf(val,
-                                  "IDxcOperationResult::GetStatus failed "
-                                  "(0x%08lx)",
-                                  (unsigned long)call_hr);
+         *error = ralloc_asprintf(val, "DXIL GetStatus failed (HRESULT 0x%08x)", (unsigned)status_hr);
       return false;
    }
 
    if (FAILED(hr) && error) {
       /* try to resolve error message */
-      *error = NULL;
-      if (!val->dxc_library) {
-         debug_printf("DXIL: validation failed, but lacking IDxcLibrary"
-                      "from dxcompiler.dll for proper diagnostics.\n");
-         return false;
-      }
-
       ComPtr<IDxcBlobEncoding> blob, blob_utf8;
-
-      if (FAILED(result->GetErrorBuffer(&blob)))
-         fprintf(stderr, "DXIL: IDxcOperationResult::GetErrorBuffer() failed\n");
-      else if (FAILED(val->dxc_library->GetBlobAsUtf8(blob.Get(),
-                                                      blob_utf8.GetAddressOf())))
-         fprintf(stderr, "DXIL: IDxcLibrary::GetBlobAsUtf8() failed\n");
-      else {
-         char *str = reinterpret_cast<char *>(blob_utf8->GetBufferPointer());
-         str[blob_utf8->GetBufferSize() - 1] = 0;
-         *error = ralloc_strdup(val, str);
+      if (SUCCEEDED(result->GetErrorBuffer(&blob)) && blob && blob->GetBufferSize()) {
+         if (val->dxc_library &&
+             SUCCEEDED(val->dxc_library->GetBlobAsUtf8(blob.Get(), &blob_utf8)) && blob_utf8) {
+            *error = ralloc_strndup(val, static_cast<const char *>(blob_utf8->GetBufferPointer()),
+                                   blob_utf8->GetBufferSize());
+         } else {
+            // The validator supplies an encoded error blob. Diagnostics must
+            // not require the optional desktop dxcompiler.dll/IDxcLibrary.
+            BOOL known = FALSE;
+            UINT codepage = CP_UTF8;
+            if (SUCCEEDED(blob->GetEncoding(&known, &codepage)) && known && codepage == 1200) {
+               const wchar_t *text = static_cast<const wchar_t *>(blob->GetBufferPointer());
+               size_t characters = blob->GetBufferSize() / sizeof(wchar_t);
+               if (characters <= INT_MAX) {
+                  int bytes = WideCharToMultiByte(CP_UTF8, 0, text, (int)characters, NULL, 0, NULL, NULL);
+                  if (bytes > 0) {
+                     *error = rzalloc_array(val, char, (size_t)bytes + 1);
+                     if (*error && !WideCharToMultiByte(CP_UTF8, 0, text, (int)characters, *error, bytes, NULL, NULL)) {
+                        ralloc_free(*error);
+                        *error = NULL;
+                     }
+                  }
+               }
+            } else {
+               *error = ralloc_strndup(val, static_cast<const char *>(blob->GetBufferPointer()),
+                                      blob->GetBufferSize());
+            }
+         }
       }
+      if (!*error)
+         *error = ralloc_asprintf(val, "DXIL validation failed (HRESULT 0x%08x)", (unsigned)hr);
    }
 
    return SUCCEEDED(hr);

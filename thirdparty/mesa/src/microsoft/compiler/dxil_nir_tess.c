@@ -361,7 +361,8 @@ dxil_nir_fixup_tess_level_for_domain(nir_shader *nir)
             var->type = glsl_array_type(glsl_float_type(), new_array_size, 0);
          else {
             exec_node_remove(&var->node);
-            ralloc_free(var);
+            /* NIR variables are owned by the shader GC arena, not ralloc.
+             * Keep the detached variable alive for dead derefs until sweep. */
          }
 
          struct remove_tess_level_accesses_data pass_data = {

@@ -170,6 +170,7 @@ lower_bindless_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_image_deref_load:
    case nir_intrinsic_image_deref_store:
    case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
    case nir_intrinsic_image_deref_atomic:
    case nir_intrinsic_image_deref_atomic_swap:
       return lower_bindless_image_intr(b, intr, options);
@@ -238,11 +239,18 @@ dxil_spirv_nir_lower_bindless(nir_shader *nir, struct dxil_spirv_nir_lower_bindl
    if (options->dynamic_buffer_binding != ~0)
       descriptor_sets |= (1 << options->dynamic_buffer_binding);
 
-   nir_remove_dead_variables_options dead_var_options = {
-      .can_remove_var = can_remove_var,
-      .can_remove_var_data = options
-   };
-   ret |= nir_remove_dead_variables(nir, modes, &dead_var_options);
+   /* All non-static resources in these sets now use heap handles. A generic
+    * liveness pass cannot distinguish an old SSBO at binding N from the new
+    * descriptor-table SSBO at binding N, and can keep a writable declaration
+    * whose UAV range is absent from the bindless root signature. Remove the
+    * fully lowered declarations before inserting the read-only table SSBOs.
+    */
+   nir_foreach_variable_with_modes_safe(var, nir, modes) {
+      if (can_remove_var(var, options)) {
+         exec_node_remove(&var->node);
+         ret = true;
+      }
+   }
 
    if (!descriptor_sets)
       return ret;

@@ -23,6 +23,8 @@
 
 #include "vk_device.h"
 
+#include <math.h>
+
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
 #include "vk_fence.h"
@@ -902,6 +904,34 @@ fail:
    return VK_ERROR_FEATURE_NOT_PRESENT;
 }
 
+#if DETECT_OS_WINDOWS
+static VkResult
+vk_time_qpc_deviation_ns(uint64_t begin, uint64_t end,
+                         uint64_t max_clock_period,
+                         uint64_t *max_deviation)
+{
+   LARGE_INTEGER frequency;
+   if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+      return VK_ERROR_UNKNOWN;
+
+   /* QPC timestamps are returned in counter ticks, but Vulkan requires
+    * pMaxDeviation in nanoseconds. Round the bracketing interval up so the
+    * reported bound remains conservative.
+    */
+   const long double ticks = (long double)(end - begin) + 1.0L;
+   const long double interval_ns =
+      ceill(ticks * (long double)NSEC_PER_SEC / frequency.QuadPart);
+   if (interval_ns >= (long double)UINT64_MAX ||
+       (uint64_t)interval_ns > UINT64_MAX - max_clock_period) {
+      *max_deviation = UINT64_MAX;
+   } else {
+      *max_deviation = (uint64_t)interval_ns + max_clock_period;
+   }
+
+   return VK_SUCCESS;
+}
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_common_GetCalibratedTimestampsKHR(
    VkDevice _device, uint32_t timestampCount,
@@ -960,7 +990,17 @@ vk_common_GetCalibratedTimestampsKHR(
       max_clock_period = MAX2(max_clock_period, period);
    }
 
-   *pMaxDeviation = vk_time_max_deviation(begin, end, max_clock_period);
+#if DETECT_OS_WINDOWS
+   if (device->calibrate_time_domain == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR) {
+      result = vk_time_qpc_deviation_ns(begin, end, max_clock_period,
+                                        pMaxDeviation);
+      if (result != VK_SUCCESS)
+         return result;
+   } else
+#endif
+   {
+      *pMaxDeviation = vk_time_max_deviation(begin, end, max_clock_period);
+   }
 
    return VK_SUCCESS;
 }

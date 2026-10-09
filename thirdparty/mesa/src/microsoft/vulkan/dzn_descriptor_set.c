@@ -137,6 +137,68 @@ num_descs_for_type(VkDescriptorType type, bool static_sampler, bool bindless)
    return num_descs;
 }
 
+static void
+dzn_descriptor_set_layout_hash(struct dzn_descriptor_set_layout *layout,
+                               const VkDescriptorSetLayoutCreateInfo *create_info,
+                               const VkDescriptorSetLayoutBinding *sorted_bindings)
+{
+   const VkDescriptorSetLayoutBindingFlagsCreateInfo *binding_flags =
+      vk_find_struct_const(create_info->pNext,
+                           DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
+   struct mesa_blake3 ctx;
+   _mesa_blake3_init(&ctx);
+
+#define DZN_HASH_VALUE(value) \
+   _mesa_blake3_update(&ctx, &(value), sizeof(value))
+
+   VkDescriptorSetLayoutCreateFlags layout_flags = create_info->flags;
+   uint32_t binding_count = create_info->bindingCount;
+   DZN_HASH_VALUE(layout_flags);
+   DZN_HASH_VALUE(binding_count);
+
+   for (uint32_t i = 0; i < create_info->bindingCount; i++) {
+      const VkDescriptorSetLayoutBinding *binding = &sorted_bindings[i];
+      uint32_t binding_number = binding->binding;
+      VkDescriptorType descriptor_type = binding->descriptorType;
+      uint32_t descriptor_count = binding->descriptorCount;
+      VkShaderStageFlags stage_flags = binding->stageFlags;
+      VkDescriptorBindingFlags flags = 0;
+      for (uint32_t j = 0; j < create_info->bindingCount; j++) {
+         if (create_info->pBindings[j].binding == binding_number) {
+            if (binding_flags && j < binding_flags->bindingCount)
+               flags = binding_flags->pBindingFlags[j];
+            break;
+         }
+      }
+      bool has_immutable_samplers = dzn_desc_type_has_sampler(descriptor_type) &&
+                                    binding->pImmutableSamplers != NULL;
+      DZN_HASH_VALUE(binding_number);
+      DZN_HASH_VALUE(descriptor_type);
+      DZN_HASH_VALUE(descriptor_count);
+      DZN_HASH_VALUE(stage_flags);
+      DZN_HASH_VALUE(flags);
+      DZN_HASH_VALUE(has_immutable_samplers);
+
+      if (has_immutable_samplers) {
+         for (uint32_t s = 0; s < descriptor_count; s++) {
+            VK_FROM_HANDLE(dzn_sampler, sampler,
+                           binding->pImmutableSamplers[s]);
+            bool has_sampler = sampler != NULL;
+            DZN_HASH_VALUE(has_sampler);
+            if (has_sampler) {
+               _mesa_blake3_update(&ctx, &sampler->desc,
+                                   sizeof(sampler->desc));
+               int static_border_color = sampler->static_border_color;
+               DZN_HASH_VALUE(static_border_color);
+            }
+         }
+      }
+   }
+
+   _mesa_blake3_final(&ctx, layout->vk.blake3);
+#undef DZN_HASH_VALUE
+}
+
 static VkResult
 dzn_descriptor_set_layout_create(struct dzn_device *device,
                                  const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
@@ -271,6 +333,8 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
       return ret;
    }
 
+   dzn_descriptor_set_layout_hash(set_layout, pCreateInfo, ordered_bindings);
+
    assert(binding_count ==
           (pCreateInfo->bindingCount ?
            (ordered_bindings[pCreateInfo->bindingCount - 1].binding + 1) : 0));
@@ -303,6 +367,7 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
          D3D12_SHADER_VISIBILITY_ALL :
          translate_desc_visibility(ordered_bindings[i].stageFlags);
       binfos[binding].type = desc_type;
+      binfos[binding].descriptor_count = desc_count;
       binfos[binding].stages =
          translate_desc_stages(ordered_bindings[i].stageFlags);
       set_layout->stages |= binfos[binding].stages;
@@ -516,6 +581,10 @@ dzn_GetDescriptorSetLayoutSupport(VkDevice _device,
    VK_FROM_HANDLE(dzn_device, device, _device);
    const VkDescriptorSetLayoutBinding *bindings = pCreateInfo->pBindings;
    uint32_t sampler_count = 0, other_desc_count = 0;
+   uint64_t push_desc_count = 0;
+   bool invalid_push_descriptor_type = false;
+   bool is_push_descriptor_layout =
+      pCreateInfo->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
 
    const VkDescriptorSetLayoutBindingFlagsCreateInfo *binding_flags =
       vk_find_struct_const(pCreateInfo->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
@@ -526,6 +595,12 @@ dzn_GetDescriptorSetLayoutSupport(VkDevice _device,
 
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
       VkDescriptorType desc_type = bindings[i].descriptorType;
+      if (is_push_descriptor_layout) {
+         push_desc_count += bindings[i].descriptorCount;
+         invalid_push_descriptor_type |=
+            vk_descriptor_type_is_dynamic(desc_type) ||
+            desc_type > VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+      }
       bool has_sampler = dzn_desc_type_has_sampler(desc_type);
       bool is_sampler = desc_type == VK_DESCRIPTOR_TYPE_SAMPLER;
 
@@ -547,9 +622,12 @@ dzn_GetDescriptorSetLayoutSupport(VkDevice _device,
          other_desc_count += bindings[i].descriptorCount;
    }
 
-   pSupport->supported = device->bindless ||
+   pSupport->supported = (device->bindless ||
       (sampler_count <= MAX_DESCS_PER_SAMPLER_HEAP &&
-       other_desc_count <= MAX_DESCS_PER_CBV_SRV_UAV_HEAP);
+       other_desc_count <= MAX_DESCS_PER_CBV_SRV_UAV_HEAP)) &&
+      (!is_push_descriptor_layout ||
+       (push_desc_count <= DZN_MAX_PUSH_DESCRIPTORS &&
+        !invalid_push_descriptor_type));
 }
 
 static void
@@ -868,6 +946,8 @@ dzn_pipeline_layout_create(struct dzn_device *device,
    };
    /* TODO Only enable this flag when needed (optimization) */
    D3D12_ROOT_SIGNATURE_FLAGS root_flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+   if (device->vk.enabled_features.transformFeedback)
+      root_flags |= D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT;
    if (device->bindless)
       root_flags |= D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED |
                     D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
@@ -1006,7 +1086,7 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
       D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = iview->srv_desc;
       srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
       srv_desc.Texture2DArray.PlaneSlice = 0;
-      srv_desc.Texture2DArray.ResourceMinLODClamp = 0.0f;
+      srv_desc.Texture2DArray.ResourceMinLODClamp = iview->srv_min_lod_clamp;
       if (iview->srv_desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) {
          srv_desc.Texture2DArray.MostDetailedMip =
             iview->srv_desc.TextureCubeArray.MostDetailedMip;
@@ -2136,7 +2216,8 @@ dzn_descriptor_set_write(struct dzn_device *device,
          const VkDescriptorImageInfo *pImageInfo = pDescriptorWrite->pImageInfo + d;
          VK_FROM_HANDLE(dzn_sampler, sampler, pImageInfo->sampler);
 
-         if (sampler)
+         if (sampler &&
+             set->layout->bindings[ptr.binding].immutable_sampler_idx == ~0)
             dzn_descriptor_set_ptr_write_sampler_desc(device, set, &ptr, sampler);
 
          d++;
@@ -2150,7 +2231,8 @@ dzn_descriptor_set_write(struct dzn_device *device,
          VK_FROM_HANDLE(dzn_sampler, sampler, pImageInfo->sampler);
          VK_FROM_HANDLE(dzn_image_view, iview, pImageInfo->imageView);
 
-         if (sampler)
+         if (sampler &&
+             set->layout->bindings[ptr.binding].immutable_sampler_idx == ~0)
             dzn_descriptor_set_ptr_write_sampler_desc(device, set, &ptr, sampler);
 
          if (iview)
@@ -2347,6 +2429,116 @@ dzn_UpdateDescriptorSets(VkDevice _device,
       dzn_descriptor_set_copy(device, &pDescriptorCopies[i]);
 }
 
+VkResult
+dzn_descriptor_set_push_allocate(struct dzn_device *device,
+                                 const struct dzn_descriptor_set_layout *layout,
+                                 const struct dzn_descriptor_set *previous,
+                                 VkDescriptorPool *out_pool,
+                                 VkDescriptorSet *out_set)
+{
+   if (!(layout->vk.flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR))
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+
+   uint32_t descriptor_counts[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1] = { 0 };
+   uint32_t total_push_descriptors = 0;
+   for (uint32_t b = 0; b < layout->binding_count; b++) {
+      const struct dzn_descriptor_set_layout_binding *binding = &layout->bindings[b];
+      if (UINT32_MAX - total_push_descriptors < binding->descriptor_count)
+         return vk_error(device, VK_ERROR_OUT_OF_POOL_MEMORY);
+      total_push_descriptors += binding->descriptor_count;
+
+      if (binding->descriptor_count &&
+          (binding->type > VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+           vk_descriptor_type_is_dynamic(binding->type)))
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+
+      /* Static samplers are immutable root-signature state, not pool entries. */
+      uint32_t heap_desc_count = dzn_descriptor_set_layout_get_desc_count(layout, b);
+      if (!heap_desc_count)
+         continue;
+      if (heap_desc_count > UINT32_MAX - descriptor_counts[binding->type])
+         return vk_error(device, VK_ERROR_OUT_OF_POOL_MEMORY);
+      descriptor_counts[binding->type] += heap_desc_count;
+   }
+   if (total_push_descriptors > DZN_MAX_PUSH_DESCRIPTORS)
+      return vk_error(device, VK_ERROR_OUT_OF_POOL_MEMORY);
+
+   VkDescriptorPoolSize pool_sizes[VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT + 1];
+   uint32_t pool_size_count = 0;
+   for (uint32_t type = 0; type < ARRAY_SIZE(descriptor_counts); type++) {
+      if (descriptor_counts[type]) {
+         pool_sizes[pool_size_count++] = (VkDescriptorPoolSize) {
+            .type = (VkDescriptorType)type,
+            .descriptorCount = descriptor_counts[type],
+         };
+      }
+   }
+
+   VkDescriptorPoolCreateInfo pool_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .maxSets = 1,
+      .poolSizeCount = pool_size_count,
+      .pPoolSizes = pool_sizes,
+   };
+   VkDescriptorPool pool = VK_NULL_HANDLE;
+   VkResult result = dzn_descriptor_pool_create(device, &pool_info, NULL, &pool);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VkDescriptorSetLayout layout_handle =
+      dzn_descriptor_set_layout_to_handle((struct dzn_descriptor_set_layout *)layout);
+   VkDescriptorSetAllocateInfo alloc_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .descriptorPool = pool,
+      .descriptorSetCount = 1,
+      .pSetLayouts = &layout_handle,
+   };
+   VkDescriptorSet set = VK_NULL_HANDLE;
+   result = dzn_AllocateDescriptorSets(dzn_device_to_handle(device), &alloc_info, &set);
+   if (result != VK_SUCCESS) {
+      dzn_descriptor_pool_destroy(dzn_descriptor_pool_from_handle(pool), NULL);
+      return result;
+   }
+
+   if (previous &&
+       memcmp(previous->layout->vk.blake3, layout->vk.blake3,
+              sizeof(layout->vk.blake3)) == 0) {
+      VkDescriptorSet previous_handle =
+         dzn_descriptor_set_to_handle((struct dzn_descriptor_set *)previous);
+      for (uint32_t b = 0; b < layout->binding_count; b++) {
+         uint32_t desc_count = dzn_descriptor_set_layout_get_desc_count(layout, b);
+         if (!desc_count)
+            continue;
+         VkCopyDescriptorSet copy = {
+            .sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET,
+            .srcSet = previous_handle,
+            .srcBinding = b,
+            .dstSet = set,
+            .dstBinding = b,
+            .descriptorCount = desc_count,
+         };
+         dzn_descriptor_set_copy(device, &copy);
+      }
+   }
+
+   *out_pool = pool;
+   *out_set = set;
+   return VK_SUCCESS;
+}
+
+void
+dzn_descriptor_set_push_update(struct dzn_device *device,
+                               VkDescriptorSet set,
+                               uint32_t write_count,
+                               const VkWriteDescriptorSet *writes)
+{
+   for (uint32_t i = 0; i < write_count; i++) {
+      VkWriteDescriptorSet write = writes[i];
+      write.dstSet = set;
+      dzn_descriptor_set_write(device, &write);
+   }
+}
+
 static void
 dzn_descriptor_update_template_destroy(struct dzn_descriptor_update_template *templ,
                                        const VkAllocationCallbacks *alloc)
@@ -2357,6 +2549,8 @@ dzn_descriptor_update_template_destroy(struct dzn_descriptor_update_template *te
    struct dzn_device *device =
       container_of(templ->base.device, struct dzn_device, vk);
 
+   if (templ->pipeline_layout)
+      vk_pipeline_layout_unref(&device->vk, &templ->pipeline_layout->vk);
    vk_object_base_finish(&templ->base);
    vk_free2(&device->vk.alloc, alloc, templ);
 }
@@ -2367,9 +2561,28 @@ dzn_descriptor_update_template_create(struct dzn_device *device,
                                       const VkAllocationCallbacks *alloc,
                                       VkDescriptorUpdateTemplate *out)
 {
-   assert(info->templateType == VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET);
-
-   VK_FROM_HANDLE(dzn_descriptor_set_layout, set_layout, info->descriptorSetLayout);
+   struct dzn_descriptor_set_layout *set_layout = NULL;
+   struct dzn_pipeline_layout *push_layout = NULL;
+   switch (info->templateType) {
+   case VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET: {
+      VK_FROM_HANDLE(dzn_descriptor_set_layout, layout, info->descriptorSetLayout);
+      set_layout = layout;
+      break;
+   }
+   case VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS: {
+      VK_FROM_HANDLE(dzn_pipeline_layout, pipeline_layout, info->pipelineLayout);
+      if (!pipeline_layout || info->set >= pipeline_layout->set_count)
+         return vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+      push_layout = pipeline_layout;
+      set_layout = container_of(pipeline_layout->vk.set_layouts[info->set],
+                                struct dzn_descriptor_set_layout, vk);
+      if (!(set_layout->vk.flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR))
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      break;
+   }
+   default:
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
 
    uint32_t entry_count = 0;
    for (uint32_t e = 0; e < info->descriptorUpdateEntryCount; e++) {
@@ -2402,6 +2615,12 @@ dzn_descriptor_update_template_create(struct dzn_device *device,
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vk_object_base_init(&device->vk, &templ->base, VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE);
+   templ->type = info->templateType;
+   templ->bind_point = info->pipelineBindPoint;
+   templ->set = info->set;
+   templ->pipeline_layout = push_layout;
+   if (push_layout)
+      vk_pipeline_layout_ref(&push_layout->vk);
    templ->entry_count = entry_count;
    templ->entries = entries;
 
@@ -2422,6 +2641,9 @@ dzn_descriptor_update_template_create(struct dzn_device *device,
          uint32_t ndescs = dzn_descriptor_set_remaining_descs_in_binding(set_layout, &ptr);
 
          entry->type = type;
+         entry->immutable_sampler =
+            dzn_desc_type_has_sampler(type) &&
+            set_layout->bindings[ptr.binding].immutable_sampler_idx != ~0;
          entry->desc_count = MIN2(desc_count - d, ndescs);
          entry->user_data.stride = user_data_stride;
          entry->user_data.offset = user_data_offset;
@@ -2516,7 +2738,7 @@ dzn_UpdateDescriptorSetWithTemplate(VkDevice _device,
                dzn_descriptor_update_template_get_desc_data(templ, e, d, pData);
             VK_FROM_HANDLE(dzn_sampler, sampler, info->sampler);
 
-            if (sampler)
+            if (sampler && !entry->immutable_sampler)
                dzn_descriptor_set_write_sampler_desc(device, set, entry->heap_offsets.sampler + d, sampler);
          }
          break;
@@ -2528,7 +2750,7 @@ dzn_UpdateDescriptorSetWithTemplate(VkDevice _device,
             VK_FROM_HANDLE(dzn_sampler, sampler, info->sampler);
             VK_FROM_HANDLE(dzn_image_view, iview, info->imageView);
 
-            if (sampler)
+            if (sampler && !entry->immutable_sampler)
                dzn_descriptor_set_write_sampler_desc(device, set, entry->heap_offsets.sampler + d, sampler);
 
             if (iview)

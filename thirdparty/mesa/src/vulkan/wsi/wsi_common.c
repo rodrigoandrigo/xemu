@@ -892,22 +892,30 @@ wsi_create_image(const struct wsi_swapchain *chain,
 
    result = wsi->CreateImage(chain->device, &info->create,
                              &chain->alloc, &image->image);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      debug_printf("WSI: application image creation failed VkResult=%d\n", result);
       goto fail;
+   }
 
    result = info->create_mem(chain, info, image);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      debug_printf("WSI: image memory creation failed VkResult=%d\n", result);
       goto fail;
+   }
 
    result = wsi->BindImageMemory(chain->device, image->image,
                                  image->memory, 0);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      debug_printf("WSI: application image memory binding failed VkResult=%d\n", result);
       goto fail;
+   }
 
    if (info->finish_create) {
       result = info->finish_create(chain, info, image);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         debug_printf("WSI: image blit setup failed VkResult=%d\n", result);
          goto fail;
+      }
    }
 
    if (info->explicit_sync) {
@@ -3428,8 +3436,10 @@ wsi_finish_create_blit_context(const struct wsi_swapchain *chain,
       VkCommandBuffer cmd_buffer;
       result = wsi->AllocateCommandBuffers(chain->device, &cmd_buffer_info,
                                            &cmd_buffer);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         debug_printf("WSI: blit command-buffer allocation failed VkResult=%d\n", result);
          return result;
+      }
 
       image->blit.cmd_buffers[i] = cmd_buffer;
 
@@ -3438,7 +3448,11 @@ wsi_finish_create_blit_context(const struct wsi_swapchain *chain,
       const VkCommandBufferBeginInfo begin_info = {
          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
       };
-      wsi->BeginCommandBuffer(cmd_buffer, &begin_info);
+      result = wsi->BeginCommandBuffer(cmd_buffer, &begin_info);
+      if (result != VK_SUCCESS) {
+         debug_printf("WSI: blit command-buffer begin failed VkResult=%d\n", result);
+         return result;
+      }
 
       switch (chain->blit.type) {
       case WSI_SWAPCHAIN_BUFFER_BLIT: {
@@ -3455,8 +3469,10 @@ wsi_finish_create_blit_context(const struct wsi_swapchain *chain,
       }
 
       result = wsi->EndCommandBuffer(cmd_buffer);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         debug_printf("WSI: blit command-buffer end failed VkResult=%d\n", result);
          return result;
+      }
    }
 
    return VK_SUCCESS;
@@ -3733,6 +3749,6 @@ wsi_SetHdrMetadataEXT(VkDevice device, uint32_t swapchainCount,
    for (uint32_t i = 0; i < swapchainCount; i++) {
       VK_FROM_HANDLE(wsi_swapchain, swapchain, pSwapchains[i]);
       if (swapchain->set_hdr_metadata)
-         swapchain->set_hdr_metadata(swapchain, pMetadata);
+         swapchain->set_hdr_metadata(swapchain, &pMetadata[i]);
    }
 }

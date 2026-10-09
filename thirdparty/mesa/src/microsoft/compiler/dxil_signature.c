@@ -146,6 +146,10 @@ get_additional_semantic_info(nir_shader *s, nir_variable *var, struct semantic_i
       // This turns into a 'N/A' mask in the disassembly
       info->start_row = -1;
       info->cols = 1;
+   } else if (info->kind == DXIL_SEM_BARYCENTRICS) {
+      /* SV_Barycentrics is system-generated and does not consume an input row. */
+      info->start_row = -1;
+      info->cols = 3;
    } else if (info->kind == DXIL_SEM_TESS_FACTOR ||
               info->kind == DXIL_SEM_INSIDE_TESS_FACTOR) {
       assert(var->data.compact);
@@ -210,6 +214,17 @@ get_semantic_sv_name(nir_variable *var, struct semantic_info *info, mesa_shader_
    case SYSTEM_VALUE_SAMPLE_ID:
       info->kind = DXIL_SEM_SAMPLE_INDEX;
       break;
+   case SYSTEM_VALUE_BARYCENTRIC_PERSP_COORD:
+   case SYSTEM_VALUE_BARYCENTRIC_PULL_MODEL:
+      info->kind = DXIL_SEM_BARYCENTRICS;
+      info->index = 0;
+      strncpy(info->name, "SV_Barycentrics", ARRAY_SIZE(info->name) - 1);
+      return;
+   case SYSTEM_VALUE_BARYCENTRIC_LINEAR_COORD:
+      info->kind = DXIL_SEM_BARYCENTRICS;
+      info->index = 1;
+      strncpy(info->name, "SV_Barycentrics", ARRAY_SIZE(info->name) - 1);
+      return;
    default:
       UNREACHABLE("unsupported system value");
    }
@@ -580,9 +595,7 @@ get_input_signature_group(struct dxil_module *mod,
                                       mod->psv_inputs[mod->input_mappings[base_var->data.driver_location]].start_row,
                                       input_clip_size);
       else
-         *row_iter = get_additional_semantic_info(
-            s, var, &semantic, MAX2(*row_iter, var->data.driver_location),
-            input_clip_size);
+         *row_iter = get_additional_semantic_info(s, var, &semantic, *row_iter, input_clip_size);
 
       mod->input_mappings[var->data.driver_location] = num_inputs;
       struct dxil_psv_signature_element *psv_elm = &mod->psv_inputs[num_inputs];
@@ -617,6 +630,13 @@ process_input_signature(struct dxil_module *mod, nir_shader *s, unsigned input_c
                                                    s, nir_var_system_value,
                                                    get_semantic_sv_name,
                                                    &next_row, input_clip_size);
+
+   nir_foreach_variable_with_modes(var, s, nir_var_system_value) {
+      if (var->data.location == SYSTEM_VALUE_BARYCENTRIC_PERSP_COORD ||
+          var->data.location == SYSTEM_VALUE_BARYCENTRIC_LINEAR_COORD ||
+          var->data.location == SYSTEM_VALUE_BARYCENTRIC_PULL_MODEL)
+         mod->feats.barycentrics = true;
+   }
 
 }
 
@@ -674,9 +694,7 @@ process_output_signature(struct dxil_module *mod, nir_shader *s)
                                       mod->psv_outputs[mod->output_mappings[base_var->data.driver_location]].start_row,
                                       s->info.clip_distance_array_size);
       else
-         next_row = get_additional_semantic_info(
-            s, var, &semantic, MAX2(next_row, var->data.driver_location),
-            s->info.clip_distance_array_size);
+         next_row = get_additional_semantic_info(s, var, &semantic, next_row, s->info.clip_distance_array_size);
 
       mod->info.has_out_position |= semantic.kind== DXIL_SEM_POSITION;
       mod->info.has_out_depth |= semantic.kind == DXIL_SEM_DEPTH;

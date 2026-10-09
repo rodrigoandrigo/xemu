@@ -1016,12 +1016,17 @@ vtn_handle_extension(struct vtn_builder *b, SpvOp opcode,
       break;
    }
 
-   case SpvOpExtInst:
-   case SpvOpExtInstWithForwardRefsKHR: {
-      struct vtn_value *val = vtn_value(b, w[3], vtn_value_type_extension);
+   case SpvOpExtInstWithForwardRefsKHR:
+      /* SPV_KHR_relaxed_extended_instruction permits this opcode only for
+       * non-semantic extended instruction sets.  Ignore its operands rather
+       * than trying to resolve forward references, including when optional
+       * debug-info parsing is enabled.
+       */
+      vtn_handle_non_semantic_instruction(b, w[4], w, count);
+      break;
 
-      if (opcode == SpvOpExtInstWithForwardRefsKHR)
-         assert(val->ext_handler == vtn_handle_non_semantic_instruction);
+   case SpvOpExtInst: {
+      struct vtn_value *val = vtn_value(b, w[3], vtn_value_type_extension);
 
       bool handled = val->ext_handler(b, w[4], w, count);
       vtn_assert(handled);
@@ -6406,8 +6411,13 @@ vtn_handle_variable_or_type_instruction(struct vtn_builder *b, SpvOp opcode,
       vtn_handle_variables(b, opcode, w, count);
       break;
 
-   case SpvOpExtInst:
-   case SpvOpExtInstWithForwardRefsKHR: {
+   case SpvOpExtInstWithForwardRefsKHR:
+      /* Do not run optional debug handlers here: their operands may be IDs
+       * that have not been declared yet.  The instruction is non-semantic.
+       */
+      return true;
+
+   case SpvOpExtInst: {
       struct vtn_value *val = vtn_value(b, w[3], vtn_value_type_extension);
 
       if (val->ext_handler == vtn_handle_non_semantic_debug_info ||

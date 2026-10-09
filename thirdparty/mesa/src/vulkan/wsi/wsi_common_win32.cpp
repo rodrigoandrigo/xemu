@@ -22,6 +22,7 @@
  */
 
 #include <assert.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -29,6 +30,7 @@
 #include "util/cnd_monotonic.h"
 #include "util/timespec.h"
 #include "util/u_thread.h"
+#include "util/os_time.h"
 #include "util/uwp_util.h"
 #include "vk_format.h"
 #include "vk_instance.h"
@@ -38,6 +40,9 @@
 #include "wsi_common_private.h"
 
 #include <dxgi1_4.h>
+#ifndef _XBOX_UWP
+#include <dxgi1_5.h>
+#endif
 #include <directx/d3d12.h>
 #include <dxguids/dxguids.h>
 
@@ -102,14 +107,26 @@ struct wsi_win32_surface {
    struct wsi_win32_swapchain *current_swapchain;
 };
 
+struct wsi_win32_present_record {
+   uint64_t id;
+   UINT sequence;
+   struct wsi_win32_present_record *next;
+};
+
 struct wsi_win32_swapchain {
    struct wsi_swapchain         base;
    IDXGISwapChain3            *dxgi;
    struct wsi_win32           *wsi;
    wsi_win32_surface          *surface;
    mtx_t                      acquire_mutex;
+   mtx_t                      present_mutex;
+   HANDLE                     present_event;
+   bool                       present_ready;
    struct u_cnd_monotonic     acquire_cond;
    uint64_t                     flip_sequence;
+   uint64_t                     last_submitted_present_id;
+   uint64_t                     completed_present_id;
+   struct wsi_win32_present_record *present_head, *present_tail;
    VkResult                     status;
    VkExtent2D                 extent;
    HWND wnd;
@@ -490,6 +507,9 @@ wsi_create_dxgi_image_mem(const struct wsi_swapchain *drv_chain,
    VkImageCreateInfo create = info->create;
 
    create.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+   /* The private DXGI destination is typed. Mutable application images use
+    * their own castable/typeless resource and are copied into this image. */
+   create.flags &= ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
    create.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
    result = wsi->CreateImage(chain->base.device, &create,
@@ -508,7 +528,7 @@ wsi_create_dxgi_image_mem(const struct wsi_swapchain *drv_chain,
    const VkMemoryDedicatedAllocateInfo memory_dedicated_info = {
       VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
       nullptr,
-      image->blit.image,
+      image->image,
       VK_NULL_HANDLE,
    };
    const VkMemoryAllocateInfo memory_info = {
@@ -529,7 +549,7 @@ wsi_dxgi_image_needs_blit(const struct wsi_device *wsi,
 {
    if (wsi->win32.requires_blits && wsi->win32.requires_blits(device))
       return WSI_SWAPCHAIN_IMAGE_BLIT;
-   else if (params->storage_image)
+   else if (params->storage_image || params->mutable_format)
       return WSI_SWAPCHAIN_IMAGE_BLIT;
    return WSI_SWAPCHAIN_NO_BLIT;
 }
@@ -639,17 +659,104 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
    if (chain->surface->current_swapchain == chain)
       chain->surface->current_swapchain = NULL;
 
+   while (chain->present_head) {
+      struct wsi_win32_present_record *record = chain->present_head;
+      chain->present_head = record->next;
+      vk_free(&chain->base.alloc, record);
+   }
    if (chain->dxgi)
       chain->dxgi->Release();
+   if (chain->present_event)
+      CloseHandle(chain->present_event);
 
    wsi_swapchain_finish(&chain->base);
 
    u_cnd_monotonic_destroy(&chain->acquire_cond);
    mtx_destroy(&chain->acquire_mutex);
+   mtx_destroy(&chain->present_mutex);
 
    vk_free(allocator, chain);
    return VK_SUCCESS;
 }
+
+#ifndef _XBOX_UWP
+static UINT16
+wsi_win32_hdr_chromaticity_to_dxgi(float value)
+{
+   /* DXGI stores CIE 1931 coordinates normalized to 50,000. */
+   if (!(value > 0.0f))
+      return 0;
+   if (value >= 1.0f)
+      return 50000;
+   return (UINT16)(value * 50000.0f + 0.5f);
+}
+
+static UINT
+wsi_win32_hdr_luminance_to_dxgi(float value, double scale)
+{
+   if (!(value > 0.0f))
+      return 0;
+
+   const double scaled = (double)value * scale;
+   if (scaled >= (double)UINT_MAX - 0.5)
+      return UINT_MAX;
+   return (UINT)(scaled + 0.5);
+}
+
+static UINT16
+wsi_win32_hdr_light_level_to_dxgi(float value)
+{
+   if (!(value > 0.0f))
+      return 0;
+   if (value >= (float)UINT16_MAX - 0.5f)
+      return UINT16_MAX;
+   return (UINT16)(value + 0.5f);
+}
+
+static void
+wsi_win32_swapchain_set_hdr_metadata(struct wsi_swapchain *drv_chain,
+                                    const VkHdrMetadataEXT *metadata)
+{
+   struct wsi_win32_swapchain *chain =
+      (struct wsi_win32_swapchain *)drv_chain;
+   if (!chain->dxgi)
+      return;
+
+   DXGI_HDR_METADATA_HDR10 dxgi_metadata = { 0 };
+   dxgi_metadata.RedPrimary[0] =
+      wsi_win32_hdr_chromaticity_to_dxgi(metadata->displayPrimaryRed.x);
+   dxgi_metadata.RedPrimary[1] =
+      wsi_win32_hdr_chromaticity_to_dxgi(metadata->displayPrimaryRed.y);
+   dxgi_metadata.GreenPrimary[0] =
+      wsi_win32_hdr_chromaticity_to_dxgi(metadata->displayPrimaryGreen.x);
+   dxgi_metadata.GreenPrimary[1] =
+      wsi_win32_hdr_chromaticity_to_dxgi(metadata->displayPrimaryGreen.y);
+   dxgi_metadata.BluePrimary[0] =
+      wsi_win32_hdr_chromaticity_to_dxgi(metadata->displayPrimaryBlue.x);
+   dxgi_metadata.BluePrimary[1] =
+      wsi_win32_hdr_chromaticity_to_dxgi(metadata->displayPrimaryBlue.y);
+   dxgi_metadata.WhitePoint[0] =
+      wsi_win32_hdr_chromaticity_to_dxgi(metadata->whitePoint.x);
+   dxgi_metadata.WhitePoint[1] =
+      wsi_win32_hdr_chromaticity_to_dxgi(metadata->whitePoint.y);
+   dxgi_metadata.MaxMasteringLuminance =
+      wsi_win32_hdr_luminance_to_dxgi(metadata->maxLuminance, 1.0);
+   /* DXGI expresses minimum mastering luminance in 0.0001-nit units. */
+   dxgi_metadata.MinMasteringLuminance =
+      wsi_win32_hdr_luminance_to_dxgi(metadata->minLuminance, 10000.0);
+   dxgi_metadata.MaxContentLightLevel =
+      wsi_win32_hdr_light_level_to_dxgi(metadata->maxContentLightLevel);
+   dxgi_metadata.MaxFrameAverageLightLevel =
+      wsi_win32_hdr_light_level_to_dxgi(metadata->maxFrameAverageLightLevel);
+
+   IDXGISwapChain4 *dxgi4 = nullptr;
+   if (SUCCEEDED(chain->dxgi->QueryInterface(IID_PPV_ARGS(&dxgi4)))) {
+      dxgi4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10,
+                            sizeof(dxgi_metadata), &dxgi_metadata);
+      dxgi4->Release();
+   }
+}
+#endif
 
 static struct wsi_image *
 wsi_win32_get_wsi_image(struct wsi_swapchain *drv_chain,
@@ -810,6 +917,7 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
 
    HRESULT hres = chain->dxgi->Present1(sync_interval, present_flags, &params);
    switch (hres) {
+   case DXGI_STATUS_OCCLUDED: return VK_ERROR_OUT_OF_DATE_KHR;
    case DXGI_ERROR_DEVICE_REMOVED: return VK_ERROR_DEVICE_LOST;
    case E_OUTOFMEMORY: return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    default:
@@ -831,6 +939,92 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
    return VK_SUCCESS;
 }
 
+/* Called with acquire_mutex held. A waitable chain is constrained to one
+ * outstanding present, and the initial ready signal is consumed BEFORE the
+ * first Present. Thus a subsequent signal retires precisely the recorded
+ * present, not an arbitrary free queue slot. Never use a GPU fence here. */
+static VkResult
+wsi_win32_present_device_status(struct wsi_win32_swapchain *chain)
+{
+   ID3D12CommandQueue *queue = (ID3D12CommandQueue *)
+      chain->wsi->wsi->win32.get_d3d12_command_queue(chain->base.device);
+   if (!queue)
+      return VK_ERROR_DEVICE_LOST;
+   ID3D12Device *device = NULL;
+   HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
+   if (SUCCEEDED(hr)) {
+      hr = device->GetDeviceRemovedReason();
+      device->Release();
+   }
+   return FAILED(hr) ? VK_ERROR_DEVICE_LOST : VK_NOT_READY;
+}
+
+static VkResult
+wsi_win32_update_present_completion(struct wsi_win32_swapchain *chain)
+{
+   if (!chain->present_head || !chain->dxgi)
+      return VK_SUCCESS;
+   if (chain->present_event) {
+      DWORD wait = WaitForSingleObjectEx(chain->present_event, 0, FALSE);
+      if (wait == WAIT_TIMEOUT)
+         return wsi_win32_present_device_status(chain);
+      if (wait != WAIT_OBJECT_0)
+         return VK_ERROR_SURFACE_LOST_KHR;
+      struct wsi_win32_present_record *record = chain->present_head;
+      chain->completed_present_id = MAX2(chain->completed_present_id, record->id);
+      chain->present_head = record->next;
+      assert(!chain->present_head);
+      chain->present_tail = NULL;
+      chain->present_ready = true;
+      vk_free(&chain->base.alloc, record);
+      return VK_SUCCESS;
+   }
+   DXGI_FRAME_STATISTICS stats = {};
+   HRESULT hr = chain->dxgi->GetFrameStatistics(&stats);
+   if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT)
+      return VK_NOT_READY;
+   if (FAILED(hr)) {
+      debug_printf("WSI: GetFrameStatistics failed HRESULT=0x%08lx\n", (unsigned long)hr);
+      return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ?
+         VK_ERROR_DEVICE_LOST : VK_ERROR_OUT_OF_DATE_KHR;
+   }
+   while (chain->present_head &&
+          (int32_t)(stats.PresentCount - chain->present_head->sequence) >= 0) {
+      struct wsi_win32_present_record *record = chain->present_head;
+      chain->completed_present_id = record->id;
+      chain->present_head = record->next;
+      vk_free(&chain->base.alloc, record);
+   }
+   if (!chain->present_head)
+      chain->present_tail = NULL;
+   return VK_SUCCESS;
+}
+
+static VkResult
+wsi_win32_wait_for_present(struct wsi_swapchain *base, uint64_t present_id, uint64_t timeout)
+{
+   struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)base;
+   uint64_t deadline = os_time_get_absolute_timeout(timeout);
+   VkResult result = wsi_swapchain_wait_for_present_semaphore(base, present_id, timeout);
+   if (result != VK_SUCCESS)
+      return result;
+   for (;;) {
+      mtx_lock(&chain->acquire_mutex);
+      result = chain->status;
+      if (result == VK_SUCCESS)
+         result = wsi_win32_update_present_completion(chain);
+      bool completed = chain->completed_present_id >= present_id;
+      mtx_unlock(&chain->acquire_mutex);
+      if (completed)
+         return VK_SUCCESS;
+      if (result != VK_SUCCESS && result != VK_NOT_READY)
+         return result;
+      if ((uint64_t)os_time_get_nano() >= deadline)
+         return VK_TIMEOUT;
+      os_time_sleep(1000);
+   }
+}
+
 static VkResult
 wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
                         uint32_t image_index,
@@ -843,8 +1037,66 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
 
    assert(image->state == WSI_IMAGE_DRAWING);
 
-   if (chain->dxgi)
-      return wsi_win32_queue_present_dxgi(chain, image, damage);
+   if (chain->dxgi) {
+      struct wsi_win32_present_record *record = NULL;
+      if (chain->base.present_wait_enabled) {
+         record = (struct wsi_win32_present_record *)vk_zalloc(&chain->base.alloc,
+            sizeof(*record), alignof(struct wsi_win32_present_record), VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+         if (!record)
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         record->id = present_id;
+      }
+      mtx_lock(&chain->present_mutex);
+      mtx_lock(&chain->acquire_mutex);
+      VkResult result = chain->status;
+      while (result == VK_SUCCESS && chain->present_event && !chain->present_ready) {
+         if (chain->present_head) {
+            result = wsi_win32_update_present_completion(chain);
+         } else {
+            DWORD wait = WaitForSingleObjectEx(chain->present_event, 0, FALSE);
+            if (wait == WAIT_OBJECT_0)
+               chain->present_ready = true;
+            else
+               result = wait == WAIT_TIMEOUT ? wsi_win32_present_device_status(chain) : VK_ERROR_SURFACE_LOST_KHR;
+         }
+         if (result == VK_NOT_READY) {
+            mtx_unlock(&chain->acquire_mutex);
+            os_time_sleep(1000);
+            mtx_lock(&chain->acquire_mutex);
+            result = chain->status;
+         }
+      }
+      if (result == VK_SUCCESS)
+         result = wsi_win32_queue_present_dxgi(chain, image, damage);
+      if (result == VK_SUCCESS && chain->present_event)
+         chain->present_ready = false;
+      if (result == VK_SUCCESS && present_id) {
+         chain->last_submitted_present_id = present_id;
+      }
+      if (result == VK_SUCCESS && record) {
+         HRESULT hr = chain->dxgi->GetLastPresentCount(&record->sequence);
+         if (FAILED(hr)) {
+            debug_printf("WSI: GetLastPresentCount failed HRESULT=0x%08lx\n", (unsigned long)hr);
+            result = VK_ERROR_OUT_OF_DATE_KHR;
+         } else {
+            if (chain->present_tail)
+               chain->present_tail->next = record;
+            else
+               chain->present_head = record;
+            chain->present_tail = record;
+            record = NULL;
+            VkResult completion = wsi_win32_update_present_completion(chain);
+            if (completion != VK_SUCCESS && completion != VK_NOT_READY)
+               result = completion;
+         }
+      }
+      if (result != VK_SUCCESS)
+         chain->status = result;
+      mtx_unlock(&chain->acquire_mutex);
+      mtx_unlock(&chain->present_mutex);
+      vk_free(&chain->base.alloc, record);
+      return result;
+   }
 
    char *ptr = (char *)image->base.cpu_map;
    char *dptr = (char *)image->sw.ppvBits;
@@ -861,6 +1113,12 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
 
    wsi_win32_set_image_idle(chain, image);
 
+   if (chain->status == VK_SUCCESS && present_id) {
+      mtx_lock(&chain->acquire_mutex);
+      chain->last_submitted_present_id = present_id;
+      chain->completed_present_id = present_id;
+      mtx_unlock(&chain->acquire_mutex);
+   }
    return chain->status;
 }
 
@@ -895,7 +1153,9 @@ wsi_win32_surface_create_swapchain_dxgi(
    DXGI_SWAP_CHAIN_DESC1 desc = {
       create_info->imageExtent.width,
       create_info->imageExtent.height,
-      DXGI_FORMAT_B8G8R8A8_UNORM,
+      create_info->imageFormat == VK_FORMAT_R8G8B8A8_UNORM ||
+      create_info->imageFormat == VK_FORMAT_R8G8B8A8_SRGB ?
+         DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM,
       create_info->imageArrayLayers > 1,  // Stereo
       { 1 },                              // SampleDesc
       0,                                  // Usage (filled in below)
@@ -906,6 +1166,8 @@ wsi_win32_surface_create_swapchain_dxgi(
       chain->base.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ?
          DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u
    };
+   if (chain->base.present_wait_enabled)
+      desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
    const VkImageUsageFlags2KHR image_usage = vk_swapchain_usage_flags(create_info);
 
@@ -928,6 +1190,13 @@ wsi_win32_surface_create_swapchain_dxgi(
 #endif
 
    swapchain1->Release();
+   if (chain->base.present_wait_enabled) {
+      if (FAILED(chain->dxgi->SetMaximumFrameLatency(1)))
+         return VK_ERROR_INITIALIZATION_FAILED;
+      chain->present_event = chain->dxgi->GetFrameLatencyWaitableObject();
+      if (!chain->present_event)
+         return VK_ERROR_INITIALIZATION_FAILED;
+   }
 #if !defined _XBOX_UWP
    if (!surface->target &&
        FAILED(wsi->dxgi.dcomp->CreateTargetForHwnd(surface->base.hwnd, false, &surface->target)))
@@ -984,9 +1253,16 @@ wsi_win32_surface_create_swapchain(
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
+   ret = mtx_init(&chain->present_mutex, mtx_plain);
+   if (ret != thrd_success) {
+      mtx_destroy(&chain->acquire_mutex);
+      vk_free(allocator, chain);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
    ret = u_cnd_monotonic_init(&chain->acquire_cond);
    if (ret != thrd_success) {
       mtx_destroy(&chain->acquire_mutex);
+      mtx_destroy(&chain->present_mutex);
       vk_free(allocator, chain);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
@@ -997,6 +1273,8 @@ wsi_win32_surface_create_swapchain(
       { WSI_IMAGE_TYPE_DXGI },
    };
    dxgi_image_params.storage_image = (image_usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+   dxgi_image_params.mutable_format =
+      (create_info->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR) != 0;
 
    struct wsi_cpu_image_params cpu_image_params = {
       { WSI_IMAGE_TYPE_CPU },
@@ -1016,6 +1294,7 @@ wsi_win32_surface_create_swapchain(
    if (result != VK_SUCCESS) {
       u_cnd_monotonic_destroy(&chain->acquire_cond);
       mtx_destroy(&chain->acquire_mutex);
+      mtx_destroy(&chain->present_mutex);
       vk_free(allocator, chain);
       return result;
    }
@@ -1025,6 +1304,7 @@ wsi_win32_surface_create_swapchain(
    chain->base.acquire_next_image = wsi_win32_acquire_next_image;
    chain->base.release_images = wsi_win32_release_images;
    chain->base.queue_present = wsi_win32_queue_present;
+   chain->base.wait_for_present = wsi_win32_wait_for_present;
    chain->base.present_mode = wsi_swapchain_get_present_mode(wsi_device, create_info);
    chain->extent = create_info->imageExtent;
 
@@ -1037,6 +1317,9 @@ wsi_win32_surface_create_swapchain(
       result = wsi_win32_surface_create_swapchain_dxgi(surface, device, wsi, create_info, chain);
       if (result != VK_SUCCESS)
          goto fail;
+#ifndef _XBOX_UWP
+      chain->base.set_hdr_metadata = wsi_win32_swapchain_set_hdr_metadata;
+#endif
    }
 
    for (uint32_t image = 0; image < num_images; image++) {

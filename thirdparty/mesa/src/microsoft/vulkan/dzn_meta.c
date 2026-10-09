@@ -230,6 +230,72 @@ out:
    return ret;
 }
 
+static void
+dzn_meta_large_point_draw_args_finish(struct dzn_device *device)
+{
+   struct dzn_meta_large_point_draw_args *meta = &device->large_point_draw_args;
+   if (meta->root_sig)
+      ID3D12RootSignature_Release(meta->root_sig);
+   if (meta->pipeline_state)
+      ID3D12PipelineState_Release(meta->pipeline_state);
+}
+
+static VkResult
+dzn_meta_large_point_draw_args_init(struct dzn_device *device)
+{
+   struct dzn_instance *instance =
+      container_of(device->vk.physical->instance, struct dzn_instance, vk);
+   struct dzn_meta_large_point_draw_args *meta = &device->large_point_draw_args;
+   D3D12_ROOT_PARAMETER1 params[3] = {
+      {
+         .ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+         .Constants = { .ShaderRegister = 0, .Num32BitValues = 1 },
+         .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+      },
+      {
+         .ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV,
+         .Descriptor = { .ShaderRegister = 1 },
+         .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+      },
+      {
+         .ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV,
+         .Descriptor = { .ShaderRegister = 2 },
+         .ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+      },
+   };
+   D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc = {
+      .Version = D3D_ROOT_SIGNATURE_VERSION_1_1,
+      .Desc_1_1 = {
+         .NumParameters = ARRAY_SIZE(params),
+         .pParameters = params,
+      },
+   };
+   D3D12_COMPUTE_PIPELINE_STATE_DESC desc = { 0 };
+   VkResult ret = VK_SUCCESS;
+
+   glsl_type_singleton_init_or_ref();
+   nir_shader *nir = dzn_nir_large_point_draw_args_shader();
+   meta->root_sig = dzn_device_create_root_sig(device, &root_desc);
+   if (!meta->root_sig) {
+      ret = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+      goto out;
+   }
+   desc.pRootSignature = meta->root_sig;
+   dzn_meta_compile_shader(device, nir, &desc.CS);
+   if (FAILED(ID3D12Device1_CreateComputePipelineState(
+          device->dev, &desc, &IID_ID3D12PipelineState,
+          (void **)&meta->pipeline_state)))
+      ret = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+
+out:
+   if (ret != VK_SUCCESS)
+      dzn_meta_large_point_draw_args_finish(device);
+   free((void *)desc.CS.pShaderBytecode);
+   ralloc_free(nir);
+   glsl_type_singleton_decref();
+   return ret;
+}
+
 #define DZN_META_TRIANGLE_FAN_REWRITE_IDX_MAX_PARAM_COUNT 4
 
 static void
@@ -260,13 +326,20 @@ dzn_meta_triangle_fan_rewrite_index_init(struct dzn_device *device,
    glsl_type_singleton_init_or_ref();
 
    uint8_t old_index_size = dzn_index_size(old_index_type);
+   bool strip = old_index_type == DZN_INDEX_2B_STRIP_RESTART ||
+                old_index_type == DZN_INDEX_4B_STRIP_RESTART;
+   bool list = old_index_type >= DZN_INDEX_2B_LIST1_RESTART;
    bool prim_restart =
       old_index_type == DZN_INDEX_2B_WITH_PRIM_RESTART ||
-      old_index_type == DZN_INDEX_4B_WITH_PRIM_RESTART;
+      old_index_type == DZN_INDEX_4B_WITH_PRIM_RESTART || strip || list;
 
    nir_shader *nir =
+      list ? dzn_nir_list_restart_rewrite_index_shader(old_index_size,
+         old_index_type >= DZN_INDEX_2B_PATCH_RESTART ?
+            (old_index_type - DZN_INDEX_2B_PATCH_RESTART) / 2 + 1 :
+            (unsigned[]){1, 2, 3, 4, 6}[(old_index_type - DZN_INDEX_2B_LIST1_RESTART) / 2]) :
       prim_restart ?
-      dzn_nir_triangle_fan_prim_restart_rewrite_index_shader(old_index_size) :
+      dzn_nir_triangle_fan_prim_restart_rewrite_index_shader(old_index_size, strip) :
       dzn_nir_triangle_fan_rewrite_index_shader(old_index_size);
 
    uint32_t root_param_count = 0;
@@ -283,7 +356,7 @@ dzn_meta_triangle_fan_rewrite_index_init(struct dzn_device *device,
    };
 
    uint32_t params_size =
-      prim_restart ?
+      old_index_size == 1 ? 12 : prim_restart ?
       sizeof(struct dzn_triangle_fan_prim_restart_rewrite_index_params) :
       sizeof(struct dzn_triangle_fan_rewrite_index_params);
 
@@ -400,7 +473,7 @@ dzn_meta_triangle_fan_rewrite_index_init(struct dzn_device *device,
       goto out;
    }
 
-   if (FAILED(ID3D12Device1_CreateCommandSignature(device->dev, &cmd_sig_desc,
+   if (old_index_size != 1 && FAILED(ID3D12Device1_CreateCommandSignature(device->dev, &cmd_sig_desc,
                                                    meta->root_sig,
                                                    &IID_ID3D12CommandSignature,
                                                    (void **)&meta->cmd_sig)))
@@ -493,7 +566,7 @@ dzn_meta_blits_get_fs(struct dzn_device *device,
          out->pShaderBytecode = out + 1;
          memcpy((void *)out->pShaderBytecode, bc.pShaderBytecode, bc.BytecodeLength);
          out->BytecodeLength = bc.BytecodeLength;
-         _mesa_hash_table_insert(meta->fs, &info->hash_key, out);
+         _mesa_hash_table_insert(meta->fs, (void *)(uintptr_t)info->hash_key, out);
       }
       free((void *)bc.pShaderBytecode);
       ralloc_free(nir);
@@ -632,6 +705,7 @@ dzn_meta_blit_create(struct dzn_device *device, const struct dzn_meta_blit_key *
       .src_is_array = key->src_is_array,
       .resolve_mode = key->resolve_mode,
       .stencil_fallback = key->loc == FRAG_RESULT_STENCIL && key->stencil_bit != 0xf,
+      .bit_copy = key->bit_copy,
       .padding = 0,
    };
 
@@ -649,6 +723,16 @@ dzn_meta_blit_create(struct dzn_device *device, const struct dzn_meta_blit_key *
    if (!device->support_static_samplers) {
       root_sig_desc.Desc_1_1.NumStaticSamplers = 0;
       root_sig_desc.Desc_1_1.NumParameters = 3;
+   }
+
+   if (key->bit_copy == DZN_BLIT_CLEAR_INTEGER) {
+      root_params[3].Constants.Num32BitValues = 4;
+      if (device->support_static_samplers) {
+         root_params[2] = root_params[3];
+         root_sig_desc.Desc_1_1.NumParameters = 3;
+      } else {
+         root_sig_desc.Desc_1_1.NumParameters = 4;
+      }
    }
 
    /* Don't need fs constants unless we're doing the stencil fallback */
@@ -800,6 +884,7 @@ dzn_meta_blits_init(struct dzn_device *device)
 void
 dzn_meta_finish(struct dzn_device *device)
 {
+   dzn_meta_large_point_draw_args_finish(device);
    for (uint32_t i = 0; i < ARRAY_SIZE(device->triangle_fan); i++)
       dzn_meta_triangle_fan_rewrite_index_finish(device, i);
 
@@ -817,11 +902,18 @@ dzn_meta_init(struct dzn_device *device)
    if (result != VK_SUCCESS)
       goto out;
 
+   result = dzn_meta_large_point_draw_args_init(device);
+   if (result != VK_SUCCESS)
+      goto out;
+
    for (uint32_t i = 0; i < ARRAY_SIZE(device->indirect_draws); i++) {
       struct dzn_indirect_draw_type type = { .value = i };
       if (type.triangle_fan_primitive_restart && !type.triangle_fan)
          continue;
-      if (type.triangle_fan && pdev->options15.TriangleFanSupported)
+      if (type.triangle_fan && pdev->options15.TriangleFanSupported &&
+          !device->vk.enabled_features.provokingVertexLast &&
+          !device->vk.enabled_features.primitiveTopologyListRestart &&
+          !device->vk.enabled_features.primitiveTopologyPatchListRestart)
          continue;
       if (type.draw_params && pdev->options21.ExtendedCommandInfoSupported)
          continue;
@@ -832,12 +924,20 @@ dzn_meta_init(struct dzn_device *device)
          goto out;
    }
 
-   if (!pdev->options15.TriangleFanSupported) {
+   if (!pdev->options15.TriangleFanSupported || device->vk.enabled_features.provokingVertexLast ||
+       device->vk.enabled_features.primitiveTopologyListRestart ||
+       device->vk.enabled_features.primitiveTopologyPatchListRestart) {
       for (uint32_t i = 0; i < ARRAY_SIZE(device->triangle_fan); i++) {
+         if (i >= DZN_INDEX_2B_PATCH_RESTART && !device->vk.enabled_features.primitiveTopologyPatchListRestart)
+            continue;
          result = dzn_meta_triangle_fan_rewrite_index_init(device, i);
          if (result != VK_SUCCESS)
             goto out;
       }
+   } else {
+      result = dzn_meta_triangle_fan_rewrite_index_init(device, DZN_INDEX_1B_CONVERT);
+      if (result != VK_SUCCESS)
+         goto out;
    }
 
 out:

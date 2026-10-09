@@ -66,10 +66,12 @@ static const DXGI_FORMAT formats[PIPE_FORMAT_COUNT] = {
    [PIPE_FORMAT_B8G8R8X8_UNORM] = DXGI_FORMAT_B8G8R8X8_UNORM,
    [PIPE_FORMAT_B8G8R8A8_UNORM] = DXGI_FORMAT_B8G8R8A8_UNORM,
    [PIPE_FORMAT_B4G4R4A4_UNORM] = DXGI_FORMAT_B4G4R4A4_UNORM,
+   [PIPE_FORMAT_R4G4B4A4_UNORM] = DXGI_FORMAT_A4B4G4R4_UNORM,
    [PIPE_FORMAT_A4R4G4B4_UNORM] = DXGI_FORMAT_A4B4G4R4_UNORM,
    [PIPE_FORMAT_A4B4G4R4_UNORM] = DXGI_FORMAT_A4B4G4R4_UNORM,
    [PIPE_FORMAT_B5G6R5_UNORM] = DXGI_FORMAT_B5G6R5_UNORM,
    [PIPE_FORMAT_B5G5R5A1_UNORM] = DXGI_FORMAT_B5G5R5A1_UNORM,
+   [PIPE_FORMAT_R5G5B5A1_UNORM] = DXGI_FORMAT_B5G5R5A1_UNORM,
 
    MAP_FORMAT_SRGB(B8G8R8A8)
 
@@ -230,8 +232,27 @@ D3D12_FILTER
 dzn_translate_sampler_filter(const struct dzn_physical_device *pdev,
                              const VkSamplerCreateInfo *create_info)
 {
-   D3D12_FILTER_REDUCTION_TYPE reduction = create_info->compareEnable ?
-      D3D12_FILTER_REDUCTION_TYPE_COMPARISON : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+   const VkSamplerReductionModeCreateInfo *reduction_info =
+      vk_find_struct_const(create_info->pNext, SAMPLER_REDUCTION_MODE_CREATE_INFO);
+   VkSamplerReductionMode reduction_mode = reduction_info ?
+      reduction_info->reductionMode : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
+   D3D12_FILTER_REDUCTION_TYPE reduction;
+
+   switch (reduction_mode) {
+   case VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE:
+      reduction = create_info->compareEnable ?
+         D3D12_FILTER_REDUCTION_TYPE_COMPARISON :
+         D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+      break;
+   case VK_SAMPLER_REDUCTION_MODE_MIN:
+      reduction = D3D12_FILTER_REDUCTION_TYPE_MINIMUM;
+      break;
+   case VK_SAMPLER_REDUCTION_MODE_MAX:
+      reduction = D3D12_FILTER_REDUCTION_TYPE_MAXIMUM;
+      break;
+   default:
+      UNREACHABLE("Invalid sampler reduction mode");
+   }
 
    if (create_info->anisotropyEnable) {
       if (create_info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST &&

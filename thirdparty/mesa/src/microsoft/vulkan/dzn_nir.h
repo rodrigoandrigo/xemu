@@ -89,11 +89,19 @@ struct dzn_indirect_draw_type {
 nir_shader *
 dzn_nir_indirect_draw_shader(struct dzn_indirect_draw_type type);
 
+/* Convert a D3D12 stream-output filled-size counter (bytes) into the
+ * non-indexed indirect draw used by the large-point replay pass. */
+nir_shader *
+dzn_nir_large_point_draw_args_shader(void);
+
 nir_shader *
 dzn_nir_triangle_fan_rewrite_index_shader(uint8_t old_index_size);
 
 nir_shader *
-dzn_nir_triangle_fan_prim_restart_rewrite_index_shader(uint8_t old_index_size);
+dzn_nir_triangle_fan_prim_restart_rewrite_index_shader(uint8_t old_index_size, bool strip);
+
+nir_shader *
+dzn_nir_list_restart_rewrite_index_shader(uint8_t old_index_size, unsigned width);
 
 enum dzn_blit_resolve_mode {
    dzn_blit_resolve_none,
@@ -112,10 +120,24 @@ struct dzn_nir_blit_info {
          uint32_t src_is_array : 1;
          uint32_t resolve_mode : 3;
          uint32_t stencil_fallback : 1;
-         uint32_t padding : 9;
+         uint32_t bit_copy : 4;
+         uint32_t padding : 5;
       };
       const uint32_t hash_key;
    };
+};
+
+enum dzn_blit_bit_copy {
+   DZN_BLIT_COPY_NONE,
+   DZN_BLIT_COPY_D32_TO_COLOR,
+   DZN_BLIT_COPY_COLOR_TO_D32,
+   DZN_BLIT_COPY_D16_TO_COLOR,
+   DZN_BLIT_COPY_COLOR_TO_D16,
+   DZN_BLIT_COPY_D24_TO_COLOR,
+   DZN_BLIT_COPY_COLOR_TO_D24,
+   DZN_BLIT_COPY_UINT,
+   DZN_BLIT_CLEAR_INTEGER,
+   DZN_BLIT_COPY_D32_FLOAT_TO_COLOR,
 };
 
 nir_shader *
@@ -129,6 +151,10 @@ struct dzn_nir_point_gs_info {
    bool front_ccw;
    bool depth_bias;
    bool depth_bias_dynamic;
+   bool cull_dynamic;
+   bool front_face_dynamic;
+   bool depth_bias_enable_dynamic;
+   bool negative_one_to_one;
    DXGI_FORMAT ds_fmt;
    /* Constant values */
    float constant_depth_bias;
@@ -140,6 +166,14 @@ struct dzn_nir_point_gs_info {
       uint32_t base_shader_register;
    } runtime_data_cbv;
 };
+
+bool dzn_nir_lower_patch_vertices(nir_shader *nir, unsigned count);
+bool dzn_nir_preserve_xfb_position(nir_shader *nir);
+nir_shader *dzn_nir_provoking_vertex_gs(const nir_shader *previous,
+                                     enum mesa_prim primitive, unsigned register_space,
+                                     bool primitive_id);
+bool dzn_nir_lower_last_provoking_vertex(nir_shader *nir);
+
 nir_shader *
 dzn_nir_polygon_point_mode_gs(const nir_shader *vs, struct dzn_nir_point_gs_info *info);
 

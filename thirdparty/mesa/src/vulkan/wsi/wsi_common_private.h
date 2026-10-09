@@ -76,6 +76,7 @@ struct wsi_drm_image_params {
 struct wsi_dxgi_image_params {
    struct wsi_base_image_params base;
    bool storage_image;
+   bool mutable_format;
 };
 
 typedef uint32_t (*wsi_memory_type_select_cb)(const struct wsi_device *wsi,

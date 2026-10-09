@@ -35,6 +35,9 @@ image_robust2_oob_value(nir_builder *b, nir_intrinsic_instr *instr)
 
    const struct util_format_description *desc = util_format_description(format);
    nir_def *components[NIR_MAX_VEC_COMPONENTS];
+   if (!desc)
+      return nir_imm_zero(b, num_components, bit_size);
+
    for (unsigned i = 0; i < num_components; i++)
       components[i] = desc->swizzle[i] == PIPE_SWIZZLE_1 ? one : zero;
 
@@ -217,6 +220,9 @@ lower_image(nir_builder *b, nir_intrinsic_instr *instr,
    case nir_image_intrinsic_type_default:
       nir_def_as_intrinsic(size)->intrinsic = nir_intrinsic_image_size;
       break;
+   case nir_image_intrinsic_type_bindless:
+      nir_def_as_intrinsic(size)->intrinsic = nir_intrinsic_bindless_image_size;
+      break;
    case nir_image_intrinsic_type_deref:
       nir_def_as_intrinsic(size)->intrinsic = nir_intrinsic_image_deref_size;
       break;
@@ -244,6 +250,9 @@ lower_image(nir_builder *b, nir_intrinsic_instr *instr,
       switch (type) {
       case nir_image_intrinsic_type_default:
          nir_def_as_intrinsic(samples)->intrinsic = nir_intrinsic_image_samples;
+         break;
+      case nir_image_intrinsic_type_bindless:
+         nir_def_as_intrinsic(samples)->intrinsic = nir_intrinsic_bindless_image_samples;
          break;
       case nir_image_intrinsic_type_deref:
          nir_def_as_intrinsic(samples)->intrinsic = nir_intrinsic_image_deref_samples;
@@ -278,13 +287,17 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *_opts)
 
    switch (intr->intrinsic) {
    case nir_intrinsic_image_load:
+   case nir_intrinsic_bindless_image_load:
    case nir_intrinsic_image_deref_load:
    case nir_intrinsic_image_heap_load:
       lower_image(b, intr, image_intrinsic_type(intr->intrinsic), true);
       return true;
    case nir_intrinsic_image_store:
+   case nir_intrinsic_bindless_image_store:
    case nir_intrinsic_image_atomic:
+   case nir_intrinsic_bindless_image_atomic:
    case nir_intrinsic_image_atomic_swap:
+   case nir_intrinsic_bindless_image_atomic_swap:
    case nir_intrinsic_image_deref_store:
    case nir_intrinsic_image_deref_atomic:
    case nir_intrinsic_image_deref_atomic_swap:

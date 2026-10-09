@@ -46,6 +46,7 @@ static struct  predefined_func_descr predefined_funcs[] = {
 {"dx.op.threadIdInGroup", "i", "ii", DXIL_ATTR_KIND_READ_NONE},
 {"dx.op.flattenedThreadIdInGroup", "i", "i", DXIL_ATTR_KIND_READ_NONE},
 {"dx.op.groupId", "i", "ii", DXIL_ATTR_KIND_READ_NONE},
+{"dx.op.cycleCounterLegacy", "g", "i", DXIL_ATTR_KIND_NONE},
 {"dx.op.unary", "O", "iO", DXIL_ATTR_KIND_READ_NONE},
 {"dx.op.unaryBits", "i", "iO", DXIL_ATTR_KIND_READ_NONE},
 {"dx.op.isSpecialFloat", "b", "iO", DXIL_ATTR_KIND_READ_NONE},

@@ -39,6 +39,12 @@ static const struct spirv_capabilities
 spirv_caps = {
    .Shader = true,
    .Geometry = true,
+   .TransformFeedback = true,
+   /* Vulkan 1.2 feature-gated system-value outputs. */
+   .ShaderLayer = true,
+   .ShaderViewportIndex = true,
+   /* Promoted EXT alias is enabled only when both core features are supported. */
+   .ShaderViewportIndexLayerEXT = true,
    .DrawParameters = true,
    .MultiView = true,
    .GroupNonUniform = true,
@@ -57,6 +63,11 @@ spirv_caps = {
    .RoundingModeRTZ = true,
    .Float16 = true,
    .Int16 = true,
+   /* 8-bit ALU is widened by nir_lower_bit_size before DXIL emission. */
+   .Int8 = true,
+   .WorkgroupMemoryExplicitLayoutKHR = true,
+   .WorkgroupMemoryExplicitLayout8BitAccessKHR = true,
+   .WorkgroupMemoryExplicitLayout16BitAccessKHR = true,
    .StorageBuffer8BitAccess = true,
    .UniformAndStorageBuffer8BitAccess = true,
    .StoragePushConstant8 = true,
@@ -78,6 +89,7 @@ spirv_caps = {
    .ImageQuery = true,
    .Int64 = true,
    .Float64 = true,
+   .IntegerFunctions2INTEL = true,
    .Tessellation = true,
    .PhysicalStorageBufferAddresses = true,
 };
@@ -201,6 +213,11 @@ temp_var_info(const struct glsl_type* type, unsigned* size, unsigned* align)
 static nir_variable *
 add_runtime_data_var(nir_shader *nir, unsigned desc_set, unsigned binding)
 {
+   /* Generated Dozen point-fill GS can already declare the same runtime CBV. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo) {
+      if (var->data.descriptor_set == desc_set && var->data.binding == binding)
+         return var;
+   }
    unsigned runtime_data_size =
       nir->info.stage == MESA_SHADER_COMPUTE
          ? sizeof(struct dxil_spirv_compute_runtime_data)
@@ -586,6 +603,7 @@ struct lower_point_size_data {
    const struct dxil_spirv_runtime_conf *conf;
    nir_variable *position;
    nir_variable *point_size;
+   nir_variable *point_center;
 };
 
 static nir_def *
@@ -647,15 +665,51 @@ lower_point_size_emit(nir_builder *b, nir_instr *instr, void *cb_data)
       output_count++;
    }
    nir_def *position = nir_load_var(b, data->position);
-   nir_def *point_size = nir_load_var(b, data->point_size);
+   /* Vulkan guarantees at least [1, 64] for largePoints.  Dozen exposes that
+    * portable range and implements the rasterization in shader code. */
+   nir_def *point_size = nir_fclamp(b, nir_load_var(b, data->point_size),
+                                    nir_imm_float(b, 1.0f),
+                                    nir_imm_float(b, 64.0f));
    nir_def *viewport = load_viewport_size(b, data->conf);
    nir_def *clip_w = nir_channel(b, position, 3);
    nir_def *half_extent = nir_fmul(
       b, nir_fdiv(b, nir_vec2(b, point_size, point_size), viewport), clip_w);
 
+   /* Points are clipped from their original center before rasterization.
+    * Testing only the expanded corners would incorrectly retain a large point
+    * whose center lies outside the Vulkan clip volume.  ClipDistance and
+    * CullDistance remain ordinary replicated outputs and are subsequently
+    * applied to every generated corner.
+    */
+   nir_def *center_inside = nir_iand(
+      b, nir_iand(b,
+         nir_fge(b, nir_channel(b, position, 0), nir_fneg(b, clip_w)),
+         nir_fge(b, clip_w, nir_channel(b, position, 0))),
+      nir_iand(b,
+         nir_iand(b,
+            nir_fge(b, nir_channel(b, position, 1), nir_fneg(b, clip_w)),
+            nir_fge(b, clip_w, nir_channel(b, position, 1))),
+         nir_iand(b,
+            nir_fge_imm(b, nir_channel(b, position, 2), 0.0f),
+            nir_fge(b, clip_w, nir_channel(b, position, 2)))));
+
+   /* The fragment lowering represents PointCoord as the window-space point
+    * center and subtracts it from FragCoord.  Preserve the original center;
+    * deriving it again from each expanded corner produces four different
+    * centers and invalid coordinates.
+    */
+   nir_def *point_center_ndc =
+      nir_fmul(b, nir_trim_vector(b, position, 2), nir_frcp(b, clip_w));
+   nir_def *point_center = nir_fmul(
+      b, nir_fadd_imm(b,
+         nir_fmul(b, point_center_ndc,
+            nir_vec2(b, nir_imm_float(b, 0.5f), nir_imm_float(b, -0.5f))),
+         0.5f), viewport);
+
    static const int corners[4][2] = {
       { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 },
    };
+   nir_if *visible = nir_push_if(b, center_inside);
    for (unsigned i = 0; i < ARRAY_SIZE(corners); i++) {
       for (unsigned j = 0; j < output_count; j++)
          nir_copy_var(b, outputs[j].output, outputs[j].saved);
@@ -668,9 +722,11 @@ lower_point_size_emit(nir_builder *b, nir_instr *instr, void *cb_data)
                      nir_channel(b, position, 1)),
          nir_channel(b, position, 2), clip_w);
       nir_store_var(b, data->position, new_position, 0xf);
+      nir_store_var(b, data->point_center, nir_pad_vec4(b, point_center), 0xf);
       nir_emit_vertex(b);
    }
    nir_end_primitive(b);
+   nir_pop_if(b, visible);
    ralloc_free(outputs);
    nir_instr_remove(instr);
    return true;
@@ -690,9 +746,20 @@ dxil_spirv_nir_lower_geometry_point_size(
          shader, nir_var_shader_out, VARYING_SLOT_POS),
       .point_size = nir_find_variable_with_location(
          shader, nir_var_shader_out, VARYING_SLOT_PSIZ),
+      .point_center = nir_find_variable_with_location(
+         shader, nir_var_shader_out, VARYING_SLOT_PNTC),
    };
    if (!data.position || !data.point_size)
       return false;
+
+   if (!data.point_center) {
+      data.point_center = nir_variable_create(shader, nir_var_shader_out,
+                                               glsl_vec4_type(),
+                                               "dzn_point_center");
+      data.point_center->data.location = VARYING_SLOT_PNTC;
+      data.point_center->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+      shader->info.outputs_written |= VARYING_BIT_PNTC;
+   }
 
    shader->info.gs.output_primitive = MESA_PRIM_TRIANGLE_STRIP;
    shader->info.gs.vertices_out *= 4;
@@ -763,6 +830,10 @@ static bool
 dxil_spirv_write_pntc(nir_shader *nir, const struct dxil_spirv_runtime_conf *conf)
 {
    struct lower_pntc_data data = { .conf = conf };
+   data.pntc = nir_find_variable_with_location(nir, nir_var_shader_out,
+                                               VARYING_SLOT_PNTC);
+   if (data.pntc)
+      return false;
    data.pntc = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), "gl_PointCoord");
    data.pntc->data.location = VARYING_SLOT_PNTC;
    bool progress = nir_shader_instructions_pass(nir, write_pntc_with_pos,
@@ -1047,6 +1118,7 @@ dxil_spirv_nir_passes(nir_shader *nir,
       .lower_subgroup_masks = true,
       .lower_to_scalar = true,
       .lower_relative_shuffle = true,
+      .lower_rotate_to_shuffle = true,
       .lower_inverse_ballot = true,
    };
    if (nir->info.stage != MESA_SHADER_FRAGMENT &&
@@ -1140,11 +1212,26 @@ dxil_spirv_nir_passes(nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
               nir_address_format_32bit_index_offset_pack64);
 
-   if (nir->info.shared_memory_explicit_layout) {
+   /* Zero initialization uses byte-addressed shared-memory operations. Route
+    * those shaders through the same explicit-I/O path as explicitly laid out
+    * Workgroup memory, so DXIL can clear the complete group-shared allocation.
+    */
+   if (nir->info.shared_memory_explicit_layout ||
+       (nir->info.stage == MESA_SHADER_COMPUTE &&
+        nir->info.zero_initialize_shared_memory)) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
                  shared_var_info);
       NIR_PASS(_, nir, dxil_nir_split_unaligned_loads_stores, nir_var_mem_shared);
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
+      if (nir->info.stage == MESA_SHADER_COMPUTE &&
+          nir->info.zero_initialize_shared_memory &&
+          nir->info.shared_size > 0) {
+         /* DXIL's TGSM lowering backs shared memory with uint words. */
+         const unsigned chunk_size = 4;
+         const unsigned shared_size = align(nir->info.shared_size, chunk_size);
+         NIR_PASS(_, nir, nir_zero_initialize_shared_memory, shared_size,
+                  chunk_size);
+      }
       NIR_PASS(_, nir, dxil_nir_scratch_and_shared_to_dxil);
    } else {
       NIR_PASS(_, nir, nir_split_struct_vars, nir_var_mem_shared);
