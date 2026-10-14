@@ -180,6 +180,13 @@ typedef struct PGRAPHGLState {
     GLuint gl_memory_buffer;
     GLuint gl_vertex_array;
     GLuint gl_inline_buffer[NV2A_VERTEXSHADER_ATTRIBUTES];
+#ifdef CONFIG_UWP
+    GLuint vertex_stream_buffers[3];
+    GLsync vertex_stream_fences[3];
+    unsigned int vertex_stream_index;
+    size_t vertex_stream_position;
+    bool vertex_stream_failed;
+#endif
 
     QTAILQ_HEAD(, SurfaceBinding) surfaces;
     SurfaceBinding *color_binding, *zeta_binding;

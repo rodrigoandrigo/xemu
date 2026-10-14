@@ -2408,13 +2408,13 @@ endif
 vulkan = not_found
 libglslang = not_found
 
-if host_os == 'windows'
+if host_os == 'windows' and not get_option('uwp')
   vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
 elif host_os == 'linux'
   vulkan = dependency('vulkan')
 endif
 
-if vulkan.found()
+if vulkan.found() or is_uwp
   libglslang = dependency('glslang', version: '>=15.0.0', required: false)
   if not libglslang.found()
     # FIXME: Get spirv-tools to enable opt.
@@ -2446,7 +2446,7 @@ if vulkan.found()
   spirv_reflect_subproj = cmake.subproject('SPIRV-Reflect', options: spirv_reflect_opts)
   spirv_reflect = declare_dependency(include_directories: spirv_reflect_subproj.include_directories('spirv-reflect-static'),
                                      link_with: spirv_reflect_subproj.target('spirv-reflect-static'),
-                                     dependencies: vulkan)
+                                     dependencies: vulkan.found() ? [vulkan] : [])
 endif
 
 if host_os == 'windows'

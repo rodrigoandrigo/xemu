@@ -1,4 +1,8 @@
 if host_os == 'windows'
+  if not vulkan.found()
+    # Shared GLSL-to-SPIR-V compiler used by the native D3D12 renderer.
+    specific_ss.add(libglslang, spirv_reflect, files('../vk/glsl.c'))
+  endif
   d3d12 = cc.find_library('d3d12', required: true)
   d3d12_dxgi = cc.find_library('dxgi', required: true)
   d3d12_dxguid = cc.find_library('dxguid', required: true)

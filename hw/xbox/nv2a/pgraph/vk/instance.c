@@ -28,32 +28,6 @@
 
 static bool enable_validation = false;
 
-#ifdef CONFIG_UWP
-static HMODULE dzn_module;
-
-static bool initialize_uwp_dzn(Error **errp)
-{
-    if (!dzn_module) {
-        dzn_module = LoadPackagedLibrary(L"vulkan_dzn.dll", 0);
-    }
-    if (!dzn_module) {
-        error_setg(errp, "Failed to load packaged vulkan_dzn.dll (%lu)",
-                   GetLastError());
-        return false;
-    }
-
-    PFN_vkGetInstanceProcAddr get_instance_proc_addr =
-        (PFN_vkGetInstanceProcAddr)GetProcAddress(dzn_module,
-                                                  "vk_icdGetInstanceProcAddr");
-    if (!get_instance_proc_addr) {
-        error_setg(errp, "vulkan_dzn.dll does not export vk_icdGetInstanceProcAddr");
-        return false;
-    }
-
-    volkInitializeCustom(get_instance_proc_addr);
-    return true;
-}
-#endif
 
 static char const *const validation_layers[] = {
     "VK_LAYER_KHRONOS_validation",
@@ -192,14 +166,7 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
     PGRAPHVkState *r = pg->vk_renderer_state;
     VkResult result;
 
-#ifdef CONFIG_UWP
-    if (!initialize_uwp_dzn(errp)) {
-        return false;
-    }
-    result = VK_SUCCESS;
-#else
     result = volkInitialize();
-#endif
     if (result != VK_SUCCESS) {
         error_setg(errp, "volkInitialize failed");
         return false;

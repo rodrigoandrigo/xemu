@@ -17,15 +17,25 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "ui/xemu-settings.h"
 #define QEMU_HOST_INTERNAL
 #include "qemu/qemu-host.h"
 #undef QEMU_HOST_INTERNAL
+#ifdef CONFIG_VULKAN
 #include "renderer.h"
+#endif
 
 #include <assert.h>
 #include <glslang/Include/glslang_c_interface.h>
 #include <stdio.h>
+
+#ifndef CONFIG_VULKAN
+void pgraph_vk_init_glsl_compiler(void);
+void pgraph_vk_finalize_glsl_compiler(void);
+GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
+                                        const char *glsl_source);
+#endif
 
 static const glslang_resource_t
     resource_limits = { .max_lights = 32,
@@ -254,6 +264,7 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
     return g_byte_array_new_take(data, num_program_bytes);
 }
 
+#ifdef CONFIG_VULKAN
 VkShaderModule pgraph_vk_create_shader_module_from_spv(PGRAPHVkState *r,
                                                        GByteArray *spv)
 {
@@ -430,3 +441,4 @@ void pgraph_vk_destroy_shader_module(PGRAPHVkState *r, ShaderModuleInfo *info)
     g_byte_array_unref(info->spirv);
     g_free(info);
 }
+#endif

@@ -134,10 +134,9 @@ int ExceptionToErrno(Platform::Exception^ exception)
 
 XemuHost::XemuHost()
     : m_module(nullptr), m_sdlModule(nullptr), m_openGLModule(nullptr),
-      m_mesaModule(nullptr), m_vulkanModule(nullptr),
+      m_mesaModule(nullptr),
       m_running(false), m_stop(false), m_firstFrameLogged(false),
       m_attachMesa(nullptr), m_setMesaSwapChainAttach(nullptr),
-      m_attachDzn(nullptr), m_setDznSwapChainAttach(nullptr),
       m_updateSDLPanelSize(nullptr), m_setD3D12PresentTarget(nullptr),
       m_attachVirtualJoystick(nullptr),
       m_detachVirtualJoystick(nullptr), m_openJoystick(nullptr),
@@ -157,7 +156,6 @@ XemuHost::XemuHost()
       m_notifyMemoryPressure(nullptr), m_reset(nullptr), m_shutdown(nullptr),
       m_join(nullptr), m_cleanup(nullptr),
       m_registerLog(nullptr), m_setLogFile(nullptr),
-      m_setPipelineCacheFile(nullptr),
       m_registerBrokeredStorage(nullptr), m_mountFile(nullptr),
       m_mountFolder(nullptr)
 {
@@ -189,9 +187,6 @@ XemuHost::~XemuHost()
     }
     if (m_mesaModule) {
         FreeLibrary(m_mesaModule);
-    }
-    if (m_vulkanModule) {
-        FreeLibrary(m_vulkanModule);
     }
 }
 
@@ -227,15 +222,8 @@ bool XemuHost::AttachRenderPanel(Windows::UI::Xaml::Controls::SwapChainPanel^ pa
         WriteDiagnostic("[loader] opengl32.dll failed with Win32 error " +
                         std::to_string(GetLastError()));
     }
-    if (!m_vulkanModule) {
-        m_vulkanModule = LoadPackagedLibrary(L"vulkan_dzn.dll", 0);
-    }
-    if (!m_vulkanModule) {
-        WriteDiagnostic("[loader] vulkan_dzn.dll failed with Win32 error " +
-                        std::to_string(GetLastError()));
-    }
-    if (!m_sdlModule || !m_mesaModule || !m_openGLModule || !m_vulkanModule) {
-        SetError("Failed to load SDL3, Mesa OpenGL, or Mesa DZN while preparing the renderers");
+    if (!m_sdlModule || !m_mesaModule || !m_openGLModule) {
+        SetError("Failed to load SDL3 or Mesa OpenGL while preparing the renderer");
         return false;
     }
 
@@ -250,20 +238,13 @@ bool XemuHost::AttachRenderPanel(Windows::UI::Xaml::Controls::SwapChainPanel^ pa
         GetProcAddress(m_mesaModule, "uwp_set_window_reference"));
     m_setMesaSwapChainAttach = reinterpret_cast<SetMesaSwapChainAttach>(
         GetProcAddress(m_mesaModule, "mesa_uwp_set_swapchain_attach_callback"));
-    m_attachDzn = reinterpret_cast<AttachMesa>(
-        GetProcAddress(m_vulkanModule, "uwp_set_window_reference"));
-    m_setDznSwapChainAttach = reinterpret_cast<SetMesaSwapChainAttach>(
-        GetProcAddress(m_vulkanModule, "mesa_uwp_set_swapchain_attach_callback"));
     m_updateSDLPanelSize = reinterpret_cast<UpdateSDLPanelSize>(
         GetProcAddress(m_sdlModule, "SDL_WinRTUpdateXAMLPanelSize"));
     auto setSDLLog = reinterpret_cast<SetSDLLog>(
         GetProcAddress(m_sdlModule, "SDL_SetLogOutputFunction"));
     auto setMesaLog = reinterpret_cast<SetMesaLog>(
         GetProcAddress(m_mesaModule, "mesa_uwp_set_log_callback"));
-    auto setDznLog = reinterpret_cast<SetMesaLog>(
-        GetProcAddress(m_vulkanModule, "mesa_uwp_set_log_callback"));
     if (!attachSDL || !m_attachMesa || !m_setMesaSwapChainAttach ||
-        !m_attachDzn || !m_setDznSwapChainAttach ||
         !m_updateSDLPanelSize ||
         !setSDLLog || !setMesaLog) {
         SetError("SDL3/Mesa do not expose the expected XAML embedding API");
@@ -284,18 +265,11 @@ bool XemuHost::AttachRenderPanel(Windows::UI::Xaml::Controls::SwapChainPanel^ pa
     }
     setSDLLog(&XemuHost::SDLLog, this);
     setMesaLog(&XemuHost::MesaLog, this);
-    if (setDznLog) {
-        setDznLog(&XemuHost::MesaLog, this);
-    } else {
-        WriteDiagnostic("[loader] Optional Mesa DZN log callback is unavailable");
-    }
     m_renderPanel = panel;
     m_renderWidth = static_cast<uint32_t>(width);
     m_renderHeight = static_cast<uint32_t>(height);
     m_setMesaSwapChainAttach(&XemuHost::AttachMesaSwapChain, this);
-    m_setDznSwapChainAttach(&XemuHost::AttachMesaSwapChain, this);
     m_attachMesa(inspectable, width, height);
-    m_attachDzn(inspectable, width, height);
     if (!attachSDL(inspectable)) {
         SetError("SDL3 rejected the XAML host SwapChainPanel");
         return false;
@@ -580,7 +554,7 @@ long __cdecl XemuHost::AttachMesaSwapChain(void* opaque, void* swapchain)
         return exception->HResult;
     }
     /*
-     * Do not wait here. Vulkan can recreate its swapchain while the XAML thread
+     * Do not wait here. A renderer can recreate its swapchain while the XAML thread
      * is synchronously waiting for an emulation frame; waiting for RunAsync in
      * that situation deadlocks both threads. The ComPtr captured by attach
      * keeps the DXGI swapchain alive until the UI dispatcher installs it.
@@ -591,7 +565,7 @@ long __cdecl XemuHost::AttachMesaSwapChain(void* opaque, void* swapchain)
 bool XemuHost::UpdateRenderPanelSize(
     Windows::UI::Xaml::Controls::SwapChainPanel^ panel)
 {
-    if (!panel || !m_attachMesa || !m_attachDzn || !m_updateSDLPanelSize) {
+    if (!panel || !m_attachMesa || !m_updateSDLPanelSize) {
         return false;
     }
 
@@ -608,8 +582,6 @@ bool XemuHost::UpdateRenderPanelSize(
 
     m_attachMesa(reinterpret_cast<IInspectable *>(panel),
                  pixelWidth, pixelHeight);
-    m_attachDzn(reinterpret_cast<IInspectable *>(panel),
-                pixelWidth, pixelHeight);
     m_renderWidth = static_cast<uint32_t>(pixelWidth);
     m_renderHeight = static_cast<uint32_t>(pixelHeight);
     if (!m_updateSDLPanelSize(logicalWidth, logicalHeight,
@@ -702,7 +674,6 @@ bool XemuHost::Load()
               Resolve(m_cleanup, "qemu_host_cleanup") &&
               Resolve(m_registerLog, "qemu_host_register_log_callback") &&
               Resolve(m_setLogFile, "qemu_host_set_log_file") &&
-              Resolve(m_setPipelineCacheFile, "qemu_host_set_pipeline_cache_file") &&
               Resolve(m_setD3D12PresentTarget, "qemu_host_set_d3d12_present_target") &&
               Resolve(m_setGamepadState, "qemu_host_set_gamepad_state") &&
               Resolve(m_registerBrokeredStorage, "qemu_host_register_brokered_storage_callbacks") &&
@@ -715,10 +686,6 @@ bool XemuHost::Load()
     WriteDiagnostic("[loader] Embedding API is compatible");
     m_registerLog(&XemuHost::Log, this);
     WriteDiagnostic("[loader] xemu log callback registered");
-    auto pipelineCachePath = ApplicationData::Current->LocalFolder->Path +
-                             "\\vulkan-pipeline.cache";
-    auto pipelineCacheUtf8 = ToUtf8(pipelineCachePath);
-    m_setPipelineCacheFile(pipelineCacheUtf8.c_str());
 
     QemuHostBrokeredStorageCallbacks storage{};
     storage.size = sizeof(storage);

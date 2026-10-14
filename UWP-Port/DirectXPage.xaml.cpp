@@ -675,8 +675,7 @@ void DirectXPage::LoadSettings()
 	port3SlotB->SelectedIndex = ClampIndex(ReadInt("input.port3.slot_b", 0), 2, 0);
 	port4SlotA->SelectedIndex = ClampIndex(ReadInt("input.port4.slot_a", 0), 2, 0);
 	port4SlotB->SelectedIndex = ClampIndex(ReadInt("input.port4.slot_b", 0), 2, 0);
-	// UWP-Port exposes only the supported OpenGL/Mesa presentation path.
-	// Normalize persisted experimental renderer values back to OpenGL.
+	// Keep unsupported native renderer values on the default OpenGL path.
 	renderer->SelectedIndex = 0;
 	surfaceScale->SelectedIndex = ClampIndex(ReadInt("display.quality.surface_scale", 1) - 1, 6, 0);
 	filtering->SelectedIndex = ClampIndex(ReadInt("display.filtering", 0), 2, 0);

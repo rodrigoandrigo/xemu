@@ -321,16 +321,12 @@
       <Link>gallium_wgl.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\build-uwp\mesa\src\microsoft\vulkan\vulkan_dzn.dll">
-      <Link>vulkan_dzn.dll</Link>
+    <Content Include="$(SDL3UwpRoot)\VisualC-WinRT\x64\$(Configuration)\SDL-UWP\SDL3.dll">
+      <Link>SDL3.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="..\build-uwp\mesa\src\microsoft\spirv_to_dxil\spirv_to_dxil.dll">
       <Link>spirv_to_dxil.dll</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-    <Content Include="$(SDL3UwpRoot)\VisualC-WinRT\x64\$(Configuration)\SDL-UWP\SDL3.dll">
-      <Link>SDL3.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="$(WindowsSdkDir)Redist\D3D\x64\dxil.dll">
@@ -342,6 +338,14 @@
          the matching OneCore CRT app-local so Mesa can be loaded there. -->
     <Content Include="$(UwpOneCoreCrtDir)\msvcp140.dll;$(UwpOneCoreCrtDir)\vcruntime140.dll;$(UwpOneCoreCrtDir)\vcruntime140_1.dll">
       <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Dependencies\XeSS\x64\libxess.dll">
+      <Link>libxess.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Dependencies\XeSS\Licenses\XeSS_LICENSE.txt;Dependencies\XeSS\Licenses\XeSS_THIRD_PARTY_PROGRAMS.txt;Dependencies\XeSS\Licenses\Microsoft_VC_Runtime_LICENSE.html">
+      <Link>Licenses\%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="$(Msys2Ucrt64Root)\bin\glslang.dll;$(Msys2Ucrt64Root)\bin\libbrotlicommon.dll;$(Msys2Ucrt64Root)\bin\libbrotlidec.dll;$(Msys2Ucrt64Root)\bin\libcrypto-3-x64.dll;$(Msys2Ucrt64Root)\bin\libcurl-4.dll;$(Msys2Ucrt64Root)\bin\libepoxy-0.dll;$(Msys2Ucrt64Root)\bin\libgcc_s_seh-1.dll;$(Msys2Ucrt64Root)\bin\libglib-2.0-0.dll;$(Msys2Ucrt64Root)\bin\libiconv-2.dll;$(Msys2Ucrt64Root)\bin\libidn2-0.dll;$(Msys2Ucrt64Root)\bin\libintl-8.dll;$(Msys2Ucrt64Root)\bin\libnghttp2-14.dll;$(Msys2Ucrt64Root)\bin\libnghttp3-9.dll;$(Msys2Ucrt64Root)\bin\libngtcp2-16.dll;$(Msys2Ucrt64Root)\bin\libngtcp2_crypto_ossl-0.dll;$(Msys2Ucrt64Root)\bin\libpcre2-8-0.dll;$(Msys2Ucrt64Root)\bin\libpsl-5.dll;$(Msys2Ucrt64Root)\bin\libsamplerate-0.dll;$(Msys2Ucrt64Root)\bin\libslirp-0.dll;$(Msys2Ucrt64Root)\bin\libSPIRV-Tools.dll;$(Msys2Ucrt64Root)\bin\libSPIRV-Tools-opt.dll;$(Msys2Ucrt64Root)\bin\libssh2-1.dll;$(Msys2Ucrt64Root)\bin\libssl-3-x64.dll;$(Msys2Ucrt64Root)\bin\libstdc++-6.dll;$(Msys2Ucrt64Root)\bin\libunistring-5.dll;$(Msys2Ucrt64Root)\bin\libusb-1.0.dll;$(Msys2Ucrt64Root)\bin\libwinpthread-1.dll;$(Msys2Ucrt64Root)\bin\libxxhash.dll;$(Msys2Ucrt64Root)\bin\libzstd.dll;$(Msys2Ucrt64Root)\bin\zlib1.dll">

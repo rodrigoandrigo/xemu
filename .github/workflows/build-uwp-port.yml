@@ -150,6 +150,7 @@ jobs:
           cd build-uwp-embed
           ../configure \
             --target-list=i386-softmmu \
+            -Dx86_version=3 \
             --enable-uwp \
             --enable-slirp \
             --enable-opengl \
@@ -209,7 +210,7 @@ jobs:
             -Dgallium-d3d12-graphics=enabled `
             -Dgallium-d3d12-video=enabled `
             -Dvideo-codecs=all `
-            -Dvulkan-drivers=microsoft-experimental `
+            -Dvulkan-drivers= `
             -Dllvm=disabled `
             -Dglx=disabled `
             -Degl=disabled `
@@ -230,12 +231,10 @@ jobs:
           })
           $env:PATH = ((@($hostPythonDir) + $parts + @($env:MSYS2_USR_BIN)) -join ';')
           Write-Host "MSVC linker: $((Get-Command link.exe).Source)"
-          & $env:HOST_PYTHON -m mesonbuild.mesonmain compile -C build-uwp\mesa --verbose opengl32 gallium_wgl vulkan_dzn
+          & $env:HOST_PYTHON -m mesonbuild.mesonmain compile -C build-uwp\mesa --verbose opengl32 gallium_wgl spirv_to_dxil
           $required = @(
             'build-uwp\mesa\src\gallium\targets\libgl-gdi\opengl32.dll',
             'build-uwp\mesa\src\gallium\targets\wgl\gallium_wgl.dll',
-            'build-uwp\mesa\src\microsoft\vulkan\vulkan_dzn.dll'
-            'build-uwp\mesa\src\microsoft\spirv_to_dxil\spirv_to_dxil.dll'
           )
           foreach ($file in $required) {
             if (-not (Test-Path -LiteralPath $file)) {
@@ -268,6 +267,15 @@ jobs:
             throw "Expected exactly one MSIX package, found $($packages.Count)."
           }
           Write-Host "Package: $($packages[0].FullName)"
+          $entries = @(& tar -tf $packages[0].FullName)
+          foreach ($runtime in @('gallium_wgl.dll', 'opengl32.dll',
+                                  'spirv_to_dxil.dll', 'msvcp140.dll',
+                                  'vcruntime140.dll',
+                                  'vcruntime140_1.dll')) {
+            if ($runtime -notin $entries) {
+              throw "Required renderer runtime is missing: $runtime"
+            }
+          }
 
       - name: Upload UWP-Port package
         uses: actions/upload-artifact@v4

@@ -12,12 +12,8 @@ xemu NV2A -> OpenGL -> Mesa Gallium D3D12 -> D3D12/DXGI -> SwapChainPanel
 ```
 
 SDL3 supplies the UWP platform and input integration. Mesa supplies OpenGL
-through Gallium D3D12. OpenGL is currently the only renderer that works with
-acceptable correctness and stability in UWP-Port. Native D3D11, native D3D12,
-and Vulkan/DZN were implemented or evaluated experimentally, but did not
-render xemu correctly and reliably enough for normal use. They are therefore
-not exposed in the UWP-Port interface and must not be considered supported
-rendering paths.
+through Gallium D3D12. OpenGL is the only renderer available in UWP-Port.
+Native D3D11 and native D3D12 are not exposed in the interface.
 
 ## Requirements
 
@@ -41,7 +37,6 @@ Before building the host, prepare these artifacts:
 build-uwp-embed/qemu-system-i386.dll
 build-uwp/mesa/src/gallium/targets/libgl-gdi/opengl32.dll
 build-uwp/mesa/src/gallium/targets/wgl/gallium_wgl.dll
-build-uwp/mesa/src/microsoft/vulkan/vulkan_dzn.dll
 ```
 
 The SDL3 include/runtime directory and MSYS2 UCRT64 runtime directory are
@@ -55,7 +50,6 @@ The packaged application must contain at least:
 qemu-system-i386.dll
 opengl32.dll
 gallium_wgl.dll
-vulkan_dzn.dll
 glslang.dll
 libSPIRV-Tools.dll
 libSPIRV-Tools-opt.dll
@@ -100,16 +94,13 @@ Build Mesa for Windows/UWP x64 with:
 - OpenGL enabled
 - Gallium D3D12 graphics enabled
 - Gallium D3D12 video enabled
-- Vulkan DZN (`microsoft-experimental`) enabled only when required by the
-  existing build workflow; it is not a supported UWP-Port renderer
+- Vulkan drivers disabled
 - LLVM disabled when the internal DXIL compiler is available
 
 Place or configure the Mesa outputs so the host project can package
-`opengl32.dll` and `gallium_wgl.dll` from the expected build tree. The current
-workflow may also package `vulkan_dzn.dll` as an experimental build artifact,
-but Vulkan cannot be selected in the UWP-Port Settings page. Runtime settings
-are normalized to OpenGL, including configurations saved by older builds with
-an experimental renderer selected.
+`opengl32.dll` and `gallium_wgl.dll` from the expected build tree.
+OpenGL is persisted and passed to xemu.
+Older renderer selections fall back to OpenGL.
 
 ## Build and package UWP-Port
 
@@ -151,7 +142,7 @@ The current source manifest version is `1.0.0.110`.
 The `Build UWP-Port` workflow performs the complete x64 Release build on a
 Windows runner. It checks out `rodrigoandrigo/SDL3_UWP`, builds its WinRT
 project, builds the xemu embedding DLL, strips unneeded symbols from that DLL,
-builds Mesa Gallium D3D12 and the existing experimental Vulkan DZN artifact,
+builds Mesa Gallium D3D12,
 packages UWP-Port, and uploads the
 MSIX, certificate, symbols, and framework dependencies as the
 `UWP-Port-x64-Release` artifact.
@@ -341,9 +332,9 @@ shared between applications.
 - Rendering must remain attached to the XAML `SwapChainPanel`; desktop window
   ownership and desktop DXGI debug interfaces are not available on Xbox retail
   environments.
-- OpenGL through Mesa Gallium D3D12 is the only supported renderer. The native
-  D3D11, native D3D12, and Vulkan/DZN experiments did not provide correct and
-  stable xemu rendering and are intentionally unavailable in the interface.
+- OpenGL is the only UWP renderer.
+  Native D3D11 and native D3D12 remain
+  unavailable in the interface.
 - Video settings that operate on the guest framebuffer or xemu HUD are
   supported: internal resolution, filtering, display fit, aspect ratio, VSync,
   notifications, animations, and HUD scale. Desktop window size, exclusive

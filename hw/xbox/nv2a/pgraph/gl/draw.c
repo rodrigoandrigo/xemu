@@ -436,7 +436,12 @@ void pgraph_gl_flush_draw(NV2AState *d)
             nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4);
             glBufferData(GL_ELEMENT_ARRAY_BUFFER,
                          pg->inline_elements_length * 4,
-                         pg->inline_elements, GL_STATIC_DRAW);
+                         pg->inline_elements,
+#ifdef CONFIG_UWP
+                         GL_DYNAMIC_DRAW);
+#else
+                         GL_STATIC_DRAW);
+#endif
             found->initialized = true;
         } else {
             nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4_NOTDIRTY);

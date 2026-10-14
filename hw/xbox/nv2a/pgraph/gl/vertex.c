@@ -24,6 +24,79 @@
 #include "debug.h"
 #include "renderer.h"
 
+#ifdef CONFIG_UWP
+#define VERTEX_STREAM_SIZE (64 * 1024 * 1024)
+
+/* Reserve an entire draw before binding its attributes. Switching storage
+ * between attributes could reuse a buffer before that draw is submitted. */
+static bool vertex_stream_reserve(PGRAPHGLState *r, size_t size)
+{
+    if (r->vertex_stream_failed || size > VERTEX_STREAM_SIZE) {
+        return false;
+    }
+    unsigned int index = r->vertex_stream_index;
+    if (r->vertex_stream_position + size > VERTEX_STREAM_SIZE) {
+        r->vertex_stream_fences[index] =
+            glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (!r->vertex_stream_fences[index]) {
+            r->vertex_stream_failed = true;
+            return false;
+        }
+        index = (index + 1) % ARRAY_SIZE(r->vertex_stream_buffers);
+        GLsync fence = r->vertex_stream_fences[index];
+        if (fence) {
+            GLenum result;
+            do {
+                result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT,
+                                          100000000);
+            } while (result == GL_TIMEOUT_EXPIRED);
+            if (result != GL_ALREADY_SIGNALED &&
+                result != GL_CONDITION_SATISFIED) {
+                r->vertex_stream_failed = true;
+                return false;
+            }
+            glDeleteSync(fence);
+            r->vertex_stream_fences[index] = NULL;
+        }
+        r->vertex_stream_index = index;
+        r->vertex_stream_position = 0;
+    }
+    if (!r->vertex_stream_buffers[index]) {
+        glGenBuffers(1, &r->vertex_stream_buffers[index]);
+        glBindBuffer(GL_ARRAY_BUFFER, r->vertex_stream_buffers[index]);
+        glBufferData(GL_ARRAY_BUFFER, VERTEX_STREAM_SIZE, NULL, GL_STREAM_DRAW);
+        GLint allocated = 0;
+        glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &allocated);
+        if (allocated != VERTEX_STREAM_SIZE) {
+            r->vertex_stream_failed = true;
+            return false;
+        }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, r->vertex_stream_buffers[index]);
+    return true;
+}
+
+static GLintptr vertex_stream_upload(PGRAPHGLState *r, const void *data,
+                                     size_t size, size_t padding)
+{
+    GLintptr offset = ROUND_UP(r->vertex_stream_position, 64) + padding;
+    glBindBuffer(GL_ARRAY_BUFFER,
+                 r->vertex_stream_buffers[r->vertex_stream_index]);
+    void *mapped = glMapBufferRange(GL_ARRAY_BUFFER, offset, size,
+        GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+    if (mapped) {
+        memcpy(mapped, data, size);
+        if (!glUnmapBuffer(GL_ARRAY_BUFFER)) {
+            glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
+        }
+    } else {
+        glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
+    }
+    r->vertex_stream_position = offset + size;
+    return offset;
+}
+#endif
+
 static void update_memory_buffer(NV2AState *d, hwaddr addr, hwaddr size,
                                  bool quick)
 {
@@ -71,6 +144,25 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
 
     bool updated_memory_buffer = false;
     unsigned int num_elements = max_element - min_element + 1;
+#ifdef CONFIG_UWP
+    size_t stream_size = 0;
+    bool stream_draw = !inline_data;
+    for (int i = 0; stream_draw && i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+        VertexAttribute *attr = &pg->vertex_attributes[i];
+        if (!attr->count || !attr->stride) {
+            continue;
+        }
+        uint64_t needed = ((uint64_t)max_element + 1) * attr->stride +
+                          attr->size * attr->count + 64;
+        if (needed > VERTEX_STREAM_SIZE - stream_size) {
+            stream_draw = false;
+            break;
+        }
+        stream_size += needed;
+    }
+    stream_draw = stream_draw && stream_size &&
+                  vertex_stream_reserve(r, stream_size);
+#endif
 
     if (inline_data) {
         NV2A_GL_DGROUP_BEGIN("%s (num_elements: %d inline stride: %d)",
@@ -155,9 +247,15 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             attrib_data_addr = attr_data + attr->offset - d->vram_ptr;
             stride = attr->stride;
             start = attrib_data_addr + min_element * stride;
+#ifdef CONFIG_UWP
+            if (!stream_draw) {
+#endif
             update_memory_buffer(d, start, num_elements * stride,
                                         updated_memory_buffer);
             updated_memory_buffer = true;
+#ifdef CONFIG_UWP
+            }
+#endif
         }
 
         uint32_t provoking_element_index = provoking_element - min_element;
@@ -178,6 +276,19 @@ void pgraph_gl_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             glVertexAttrib4fv(i, attr->inline_value);
             continue;
         }
+
+#ifdef CONFIG_UWP
+        if (stream_draw) {
+            size_t bytes = (size_t)(num_elements - 1) * stride + element_size;
+            assert(start <= memory_region_size(d->vram) &&
+                   bytes <= memory_region_size(d->vram) - start);
+            size_t padding = (size_t)min_element * stride;
+            GLintptr offset = vertex_stream_upload(r, d->vram_ptr + start,
+                                                   bytes, padding);
+            attrib_data_addr = offset - padding;
+            nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_1);
+        }
+#endif
 
         if (needs_conversion) {
             glVertexAttribIPointer(i, gl_count, gl_type, stride,
@@ -286,6 +397,17 @@ void pgraph_gl_init_buffers(NV2AState *d)
 void pgraph_gl_finalize_buffers(PGRAPHState *pg)
 {
     PGRAPHGLState *r = pg->gl_renderer_state;
+#ifdef CONFIG_UWP
+    for (int i = 0; i < ARRAY_SIZE(r->vertex_stream_fences); i++) {
+        if (r->vertex_stream_fences[i]) {
+            glDeleteSync(r->vertex_stream_fences[i]);
+            r->vertex_stream_fences[i] = NULL;
+        }
+    }
+    glDeleteBuffers(ARRAY_SIZE(r->vertex_stream_buffers),
+                    r->vertex_stream_buffers);
+    memset(r->vertex_stream_buffers, 0, sizeof(r->vertex_stream_buffers));
+#endif
 
     GLuint element_cache_buffers[element_cache_size];
     for (int i = 0; i < element_cache_size; i++) {
