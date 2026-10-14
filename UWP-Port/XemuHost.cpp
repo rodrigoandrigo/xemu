@@ -279,6 +279,9 @@ bool XemuHost::AttachRenderPanel(Windows::UI::Xaml::Controls::SwapChainPanel^ pa
         return false;
     }
     WriteDiagnostic("[display] SwapChainPanel attached; SDL video initialized on the UI thread");
+    if (m_setD3D12PresentTarget && !RegisterNativePresentTarget()) {
+        return false;
+    }
     return true;
 }
 
@@ -602,6 +605,30 @@ bool XemuHost::UpdateRenderPanelSize(
             return false;
         }
     }
+    if (m_setD3D12PresentTarget && !RegisterNativePresentTarget()) {
+        return false;
+    }
+    return true;
+}
+
+bool XemuHost::RegisterNativePresentTarget()
+{
+    if (!m_setD3D12PresentTarget || !m_renderPanel ||
+        !m_renderWidth || !m_renderHeight) {
+        SetError("Native renderer presentation target is not ready");
+        return false;
+    }
+    // The legacy API name is shared by native D3D11 and D3D12 renderers.
+    int result = m_setD3D12PresentTarget(m_renderWidth, m_renderHeight,
+                                       &XemuHost::AttachMesaSwapChain, this);
+    if (result) {
+        SetError("Failed to register native renderer presentation target (error " +
+                 std::to_string(result) + ")");
+        return false;
+    }
+    WriteDiagnostic("[display] Native renderer presentation target registered: " +
+                    std::to_string(m_renderWidth) + "x" +
+                    std::to_string(m_renderHeight));
     return true;
 }
 
@@ -720,6 +747,9 @@ bool XemuHost::Start(const std::vector<std::string>& arguments)
         return m_running.load();
     }
     WriteDiagnostic("[lifecycle] Request to start xemu");
+    if (!RegisterNativePresentTarget()) {
+        return false;
+    }
     if (m_setEmbeddedCursorHidden) {
         m_setEmbeddedCursorHidden(true);
     }

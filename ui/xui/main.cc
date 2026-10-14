@@ -67,6 +67,9 @@ static bool g_flip_req;
 static bool g_hud_opengl_initialized;
 #ifdef CONFIG_UWP
 static bool g_hud_uses_d3d12;
+static bool g_hud_d3d11_initialized;
+static bool g_hud_d3d11_reset_pending;
+static bool g_hud_d3d11_frame_ready;
 static bool g_hud_d3d12_initialized;
 static uintptr_t g_hud_d3d12_cpu_base;
 static uint64_t g_hud_d3d12_gpu_base;
@@ -190,7 +193,7 @@ void xemu_hud_init(SDL_Window *window, void *sdl_gl_context)
     io.IniFilename = NULL;
 
     // Setup Platform/Renderer bindings
-    if (xemu_hud_uses_d3d12()) {
+    if (xemu_hud_uses_native_d3d()) {
         ImGui_ImplSDL3_InitForOther(window);
     } else {
         ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
@@ -212,6 +215,7 @@ void xemu_hud_init(SDL_Window *window, void *sdl_gl_context)
 
 void xemu_hud_cleanup(void)
 {
+    xemu_hud_d3d11_shutdown();
     if (xemu_hud_uses_d3d12()) {
         xemu_hud_d3d12_shutdown();
     } else if (g_hud_opengl_initialized) {
@@ -264,12 +268,18 @@ void xemu_hud_update(void)
     if (!first_boot_window.is_open) {
         int ww, wh;
         SDL_GetWindowSizeInPixels(xemu_get_window(), &ww, &wh);
-        if (!xemu_hud_uses_d3d12()) {
+        if (!xemu_hud_uses_native_d3d()) {
             RenderFramebuffer(g_tex, ww, wh, g_flip_req);
         }
     }
 
-    if (xemu_hud_uses_d3d12()) {
+    if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D11) {
+#ifdef CONFIG_UWP
+        if (g_hud_d3d11_initialized) {
+            ImGui_ImplDX11_NewFrame();
+        }
+#endif
+    } else if (xemu_hud_uses_d3d12()) {
 #ifdef CONFIG_UWP
         if (g_hud_d3d12_initialized) {
             ImGui_ImplDX12_NewFrame();
@@ -417,6 +427,102 @@ bool xemu_hud_uses_d3d12(void)
     return g_hud_uses_d3d12;
 #else
     return false;
+#endif
+}
+
+bool xemu_hud_uses_native_d3d(void)
+{
+#ifdef CONFIG_UWP
+    return xemu_hud_uses_d3d12() ||
+           g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D11;
+#else
+    return false;
+#endif
+}
+
+bool xemu_hud_screenshot_pending(void)
+{
+    return g_screenshot_pending;
+}
+
+bool xemu_hud_d3d11_init(void *device, void *context)
+{
+#ifdef CONFIG_UWP
+    if (qatomic_xchg(&g_hud_d3d11_reset_pending, false)) {
+        xemu_hud_d3d11_shutdown();
+    }
+    if (!g_hud_d3d11_initialized) {
+        if (g_hud_opengl_initialized) {
+            ImGui_ImplOpenGL3_Shutdown();
+            g_hud_opengl_initialized = false;
+        }
+        g_hud_d3d11_initialized = ImGui_ImplDX11_Init(
+            static_cast<ID3D11Device *>(device),
+            static_cast<ID3D11DeviceContext *>(context));
+    }
+    return g_hud_d3d11_initialized;
+#else
+    return false;
+#endif
+}
+
+bool xemu_hud_d3d11_rebuild_fonts(void)
+{
+#ifdef CONFIG_UWP
+    if (!g_hud_d3d11_initialized) {
+        // Initial backend creation will upload the atlas on its first frame.
+        return true;
+    }
+    ImGui_ImplDX11_InvalidateDeviceObjects();
+    return ImGui_ImplDX11_CreateDeviceObjects();
+#else
+    return false;
+#endif
+}
+
+void xemu_hud_d3d11_shutdown(void)
+{
+#ifdef CONFIG_UWP
+    if (g_hud_d3d11_initialized) {
+        ImGui_ImplDX11_Shutdown();
+        g_hud_d3d11_initialized = false;
+        g_hud_d3d11_frame_ready = false;
+    }
+#endif
+}
+
+void xemu_hud_d3d11_request_reset(void)
+{
+#ifdef CONFIG_UWP
+    // Resource teardown may run on the emulation thread. ImGui stays UI-only.
+    qatomic_set(&g_hud_d3d11_reset_pending, true);
+#endif
+}
+
+void xemu_hud_d3d11_prepare_frame(void)
+{
+#ifdef CONFIG_UWP
+    if (qatomic_read(&g_hud_d3d11_reset_pending)) {
+        return;
+    }
+    if (!g_hud_d3d11_initialized) {
+        return;
+    }
+    xemu_main_loop_lock();
+    xemu_hud_update();
+    xemu_main_loop_unlock();
+    ImGui::Render();
+    g_hud_d3d11_frame_ready = true;
+#endif
+}
+
+void xemu_hud_d3d11_render(void)
+{
+#ifdef CONFIG_UWP
+    if (g_hud_d3d11_initialized && g_hud_d3d11_frame_ready &&
+        ImGui::GetDrawData()) {
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    }
 #endif
 }
 

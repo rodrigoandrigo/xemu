@@ -12,8 +12,9 @@ xemu NV2A -> OpenGL -> Mesa Gallium D3D12 -> D3D12/DXGI -> SwapChainPanel
 ```
 
 SDL3 supplies the UWP platform and input integration. Mesa supplies OpenGL
-through Gallium D3D12. OpenGL is the only renderer available in UWP-Port.
-Native D3D11 and native D3D12 are not exposed in the interface.
+through Gallium D3D12. OpenGL remains the default. Settings also exposes
+Native Direct3D 11 (experimental), with a native composition swapchain and HUD.
+It does not use D3D11On12. Native D3D12 is not exposed in the interface.
 
 ## Requirements
 
@@ -99,8 +100,10 @@ Build Mesa for Windows/UWP x64 with:
 
 Place or configure the Mesa outputs so the host project can package
 `opengl32.dll` and `gallium_wgl.dll` from the expected build tree.
-OpenGL is persisted and passed to xemu.
-Older renderer selections fall back to OpenGL.
+OpenGL and native D3D11 selections are persisted and passed to xemu.
+Unsupported renderer selections fall back to OpenGL. The D3D11 backend has
+remaining NV2A compatibility limits documented in its renderer README;
+compilation and WARP tests do not establish game or Xbox compatibility.
 
 ## Build and package UWP-Port
 

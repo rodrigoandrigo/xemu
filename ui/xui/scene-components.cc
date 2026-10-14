@@ -216,6 +216,9 @@ public:
 
     void initScreenshot()
     {
+        if (xemu_hud_uses_native_d3d()) {
+            return;
+        }
         if (screenshot == 0) {
             glGenTextures(1, &screenshot);
             int w, h, n;
@@ -265,7 +268,7 @@ public:
             ImVec2 p0 = ImGui::GetItemRectMin();
             ImVec2 p1 = ImGui::GetItemRectMax();
             ImDrawList *draw_list = ImGui::GetWindowDrawList();
-            if (!xemu_hud_uses_d3d12()) {
+            if (!xemu_hud_uses_native_d3d()) {
                 draw_list->AddImageRounded(
                     (ImTextureID)screenshot, p0, p1, ImVec2(0, 0),
                     ImVec2(1, 1),

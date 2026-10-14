@@ -850,7 +850,11 @@ static void gl_render_frame(struct xemu_console *scon)
     if (xemu_hud_uses_d3d12()) {
         xemu_hud_d3d12_prepare_frame();
     }
-    if (nv2a_present_frame()) {
+    if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D11) {
+        xemu_hud_d3d11_prepare_frame();
+    }
+    if (nv2a_present_frame() ||
+        g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D11) {
         qatomic_set(&rendering, false);
         return;
     }
@@ -1343,6 +1347,9 @@ void xemu_render_embedded_frame(void)
                            "xemu display: first GL frame begin");
     }
     gl_render_frame(&scon_list[0]);
+    /* The embedding worker performs teardown. Do not leave its GL context
+     * owned by the XAML thread between presentation callbacks. */
+    SDL_GL_MakeCurrent(NULL, NULL);
     if (first_frame) {
         qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
                            "xemu display: first GL frame complete");
@@ -1500,6 +1507,7 @@ static void display_finalize(void)
     win32_dxgi_present_cleanup();
 #endif
     xemu_input_cleanup();
+    SDL_GL_MakeCurrent(m_window, m_context);
     xemu_hud_cleanup();
     nv2a_context_cleanup();
     if (guest_sprite) {

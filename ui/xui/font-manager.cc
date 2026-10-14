@@ -97,7 +97,9 @@ void FontManager::Rebuild()
         m_fixed_width_font = io.Fonts->AddFontDefault(&config);
     }
 
-    if (xemu_hud_uses_d3d12()) {
+    if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D11) {
+        xemu_hud_d3d11_rebuild_fonts();
+    } else if (xemu_hud_uses_d3d12()) {
 #ifdef CONFIG_UWP
         if (xemu_hud_d3d12_is_initialized()) {
             ImGui_ImplDX12_InvalidateDeviceObjects();

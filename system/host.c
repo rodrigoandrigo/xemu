@@ -17,6 +17,7 @@
 #include "ui/input.h"
 #include "ui/xemu-settings.h"
 
+
 #ifndef QEMU_HOST_HAS_VIDEO_METRICS_API
 typedef struct QemuHostVideoMetrics {
     uint32_t size;
@@ -911,7 +912,14 @@ static void *qemu_host_loop_thread(void *opaque)
     return NULL;
 }
 
-int qemu_host_init(int argc, char **argv)
+static bool host_cpu_only;
+
+bool qemu_host_is_cpu_only(void)
+{
+    return host_cpu_only;
+}
+
+static int qemu_host_init_common(int argc, char **argv, bool cpu_only)
 {
     int i;
 
@@ -929,8 +937,10 @@ int qemu_host_init(int argc, char **argv)
         return -EBUSY;
     }
     host_initializing = true;
+    host_cpu_only = cpu_only;
     g_mutex_unlock(&host_state_lock);
 
+    if (!cpu_only) {
     qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
                        "embedding: loading xemu configuration");
     for (i = 1; i + 1 < argc; i++) {
@@ -971,6 +981,7 @@ int qemu_host_init(int argc, char **argv)
     qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
                        "embedding: entering qemu_init");
 
+    }
     qemu_init(argc, argv);
     qemu_host_emit_log(QEMU_HOST_LOG_DEBUG,
                        "embedding: qemu_init completed");
@@ -978,7 +989,9 @@ int qemu_host_init(int argc, char **argv)
                        runstate_is_running() ?
                        "embedding: virtual machine is running" :
                        "embedding: virtual machine is not running");
-    xemu_start_embedded_display();
+    if (!cpu_only) {
+        xemu_start_embedded_display();
+    }
     bql_unlock();
     replay_mutex_unlock();
 #if defined(XBOX) || defined(CONFIG_UWP)
@@ -997,6 +1010,16 @@ int qemu_host_init(int argc, char **argv)
     g_mutex_unlock(&host_state_lock);
     qemu_host_emit_log(QEMU_HOST_LOG_INFO, "xemu embedding initialized");
     return 0;
+}
+
+int qemu_host_init(int argc, char **argv)
+{
+    return qemu_host_init_common(argc, argv, false);
+}
+
+int qemu_host_init_cpu(int argc, char **argv)
+{
+    return qemu_host_init_common(argc, argv, true);
 }
 
 int qemu_host_start(void)

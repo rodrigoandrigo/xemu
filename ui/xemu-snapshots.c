@@ -23,6 +23,7 @@
 
 #include <SDL3/SDL.h>
 #include <epoxy/gl.h>
+#include "ui/xui/xemu-hud.h"
 
 #include "block/aio.h"
 #include "block/block-common.h"
@@ -115,7 +116,7 @@ static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
     const size_t thumbnail_size = be32_to_cpu(*(uint32_t *)&buf[offset]);
     offset += 4;
 
-    if (thumbnail_size) {
+    if (thumbnail_size && !xemu_hud_uses_native_d3d()) {
         GLuint thumbnail;
         glGenTextures(1, &thumbnail);
         assert(size >= (offset + thumbnail_size));
@@ -275,7 +276,8 @@ void xemu_snapshots_save_extra_data(QEMUFile *f)
     }
 
     size_t thumbnail_size = 0;
-    void *thumbnail_buf = xemu_snapshots_create_framebuffer_thumbnail_png(&thumbnail_size);
+    void *thumbnail_buf = xemu_hud_uses_native_d3d() ? NULL :
+        xemu_snapshots_create_framebuffer_thumbnail_png(&thumbnail_size);
 
     qemu_put_be32(f, XEMU_SNAPSHOT_DATA_MAGIC);
     qemu_put_be32(f, XEMU_SNAPSHOT_DATA_VERSION);

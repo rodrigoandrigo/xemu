@@ -33,6 +33,7 @@
 
 #include "qemu/osdep.h"
 #ifdef CONFIG_UWP
+#include <imgui_impl_dx11.h>
 #include <imgui_impl_dx12.h>
 #endif
 

@@ -550,6 +550,10 @@ void HelpMarker(const char *desc)
 
 void Logo()
 {
+    if (xemu_hud_uses_native_d3d()) {
+        ImGui::TextUnformatted("xemu");
+        return;
+    }
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 25 * g_viewport_mgr.m_scale);
     ImGui::SetCursorPosX(
         (ImGui::GetWindowWidth() - 256 * g_viewport_mgr.m_scale) / 2);
@@ -570,7 +574,7 @@ void Logo()
     ImVec2 pos = ImGui::GetCursorPos();
     ImVec2 logo_size((t_w - x_off) * g_viewport_mgr.m_scale,
                      t_h * g_viewport_mgr.m_scale);
-    if (!xemu_hud_uses_d3d12()) {
+    if (!xemu_hud_uses_native_d3d()) {
         ImGui::Image(id, logo_size, ImVec2(x_off / t_w, t_h / t_h),
                      ImVec2(t_w / t_w, 0));
     } else {

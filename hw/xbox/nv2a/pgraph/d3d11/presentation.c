@@ -11,6 +11,7 @@
 #include "renderer.h"
 #include <d3dcompiler.h>
 #include "ui/xemu-settings.h"
+#include "ui/xui/xemu-hud.h"
 #include "ui/xemu-widescreen.h"
 #include "presentation.h"
 
@@ -135,11 +136,11 @@ void pgraph_d3d11_presentation_finalize(PGRAPHD3D11State *r)
     if (presentation->scanout_texture) {
         ID3D11Texture2D_Release(presentation->scanout_texture);
     }
-    if (presentation->retained_srv) {
-        ID3D11ShaderResourceView_Release(presentation->retained_srv);
-    }
-    if (presentation->retained_texture) {
-        ID3D11Texture2D_Release(presentation->retained_texture);
+    for (unsigned int i = 0; i < ARRAY_SIZE(presentation->retained); i++) {
+        if (presentation->retained[i].srv) {
+            ID3D11ShaderResourceView_Release(presentation->retained[i].srv);
+            ID3D11Texture2D_Release(presentation->retained[i].texture);
+        }
     }
     if (presentation->nearest_sampler) {
         ID3D11SamplerState_Release(presentation->nearest_sampler);
@@ -161,46 +162,61 @@ static bool d3d11_retain_scanout(PGRAPHD3D11State *r,
                                  PGRAPHD3D11RenderTarget *color, Error **errp)
 {
     PGRAPHD3D11PresentationState *presentation = r->presentation;
+    (void)errp;
     if (!color->texture || !color->srv || !color->width || !color->height) {
         return false;
     }
-    if (!presentation->retained_texture ||
-        presentation->retained_width != color->width ||
-        presentation->retained_height != color->height) {
-        if (presentation->retained_srv) {
-            ID3D11ShaderResourceView_Release(presentation->retained_srv);
-            presentation->retained_srv = NULL;
-        }
-        if (presentation->retained_texture) {
-            ID3D11Texture2D_Release(presentation->retained_texture);
-            presentation->retained_texture = NULL;
-        }
-        D3D11_TEXTURE2D_DESC desc;
-        ID3D11Texture2D_GetDesc(color->texture, &desc);
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        desc.CPUAccessFlags = 0;
-        desc.MiscFlags = 0;
-        HRESULT hr = ID3D11Device_CreateTexture2D(
-            r->device, &desc, NULL, &presentation->retained_texture);
-        if (SUCCEEDED(hr)) {
-            hr = ID3D11Device_CreateShaderResourceView(
-                r->device, (ID3D11Resource *)presentation->retained_texture,
-                NULL, &presentation->retained_srv);
-        }
-        if (FAILED(hr)) {
-            error_setg(errp,
-                       "D3D11: failed to retain PCRTC render target "
-                       "(HRESULT 0x%08lx)",
-                       (unsigned long)hr);
-            return false;
-        }
-        presentation->retained_width = color->width;
-        presentation->retained_height = color->height;
+    const uint64_t budget = 64 * 1024 * 1024;
+    uint64_t bytes = (uint64_t)color->width * color->height * 4;
+    if (bytes > budget) {
+        return true;
     }
-    ID3D11DeviceContext_CopyResource(
-        r->context, (ID3D11Resource *)presentation->retained_texture,
-        (ID3D11Resource *)color->texture);
+    ID3D11Texture2D_AddRef(color->texture);
+    ID3D11ShaderResourceView_AddRef(color->srv);
+    unsigned int slot = 0;
+    uint64_t used = 0;
+    for (unsigned int i = 0; i < ARRAY_SIZE(presentation->retained); i++) {
+        PGRAPHD3D11CachedScanout *entry = &presentation->retained[i];
+        if (entry->srv && entry->address == color->vram_address) {
+            ID3D11ShaderResourceView_Release(entry->srv);
+            ID3D11Texture2D_Release(entry->texture);
+            memset(entry, 0, sizeof(*entry));
+        }
+        used += (uint64_t)entry->width * entry->height * 4;
+        if (entry->serial < presentation->retained[slot].serial) {
+            slot = i;
+        }
+    }
+    for (;;) {
+        PGRAPHD3D11CachedScanout *entry = &presentation->retained[slot];
+        if (entry->srv) {
+            used -= (uint64_t)entry->width * entry->height * 4;
+            ID3D11ShaderResourceView_Release(entry->srv);
+            ID3D11Texture2D_Release(entry->texture);
+            memset(entry, 0, sizeof(*entry));
+        }
+        if (used + bytes <= budget) {
+            *entry = (PGRAPHD3D11CachedScanout){
+                .texture = color->texture,
+                .srv = color->srv,
+                .width = color->width,
+                .height = color->height,
+                .address = color->vram_address,
+                .length = color->storage_length,
+                .serial = ++presentation->retained_serial,
+            };
+            break;
+        }
+        /* Evict the oldest occupied entry; empty slots cannot reduce usage. */
+        uint64_t oldest = UINT64_MAX;
+        for (unsigned int i = 0; i < ARRAY_SIZE(presentation->retained); i++) {
+            if (presentation->retained[i].srv &&
+                presentation->retained[i].serial < oldest) {
+                oldest = presentation->retained[i].serial;
+                slot = i;
+            }
+        }
+    }
     return true;
 }
 
@@ -211,13 +227,38 @@ bool pgraph_d3d11_retain_color_scanout(NV2AState *d, Error **errp)
     if (!r->presentation || !color->srv) {
         return true;
     }
-    VGADisplayParams params;
-    d->vga.get_params(&d->vga, &params);
-    hwaddr scanout_address = d->pcrtc.start + params.line_offset;
-    bool contains_scanout =
-        scanout_address >= color->vram_address &&
-        scanout_address - color->vram_address < color->storage_length;
-    return !contains_scanout || d3d11_retain_scanout(r, color, errp);
+    return d3d11_retain_scanout(r, color, errp);
+}
+
+static PGRAPHD3D11CachedScanout *d3d11_find_retained_scanout(NV2AState *d)
+{
+    PGRAPHD3D11PresentationState *presentation =
+        d->pgraph.d3d11_renderer_state->presentation;
+    PGRAPHD3D11CachedScanout *best = NULL;
+    uint64_t row_probe =
+        d->pcrtc.start + (uint64_t)presentation->scanout_line_offset;
+    for (unsigned int i = 0; i < ARRAY_SIZE(presentation->retained); i++) {
+        PGRAPHD3D11CachedScanout *entry = &presentation->retained[i];
+        if (!entry->srv) {
+            continue;
+        }
+        if (memory_region_test_and_clear_dirty(
+                d->vram, entry->address, entry->length, DIRTY_MEMORY_NV2A)) {
+            ID3D11ShaderResourceView_Release(entry->srv);
+            ID3D11Texture2D_Release(entry->texture);
+            memset(entry, 0, sizeof(*entry));
+            continue;
+        }
+        bool contains_start = d->pcrtc.start >= entry->address &&
+                              d->pcrtc.start - entry->address < entry->length;
+        bool contains_row = row_probe >= entry->address &&
+                            row_probe - entry->address < entry->length;
+        if ((contains_start || contains_row) &&
+            (!best || entry->serial > best->serial)) {
+            best = entry;
+        }
+    }
+    return best;
 }
 
 static bool d3d11_prepare_raw_scanout(NV2AState *d,
@@ -374,7 +415,7 @@ d3d11_presentation_viewport(const PGRAPHD3D11State *r,
     };
 }
 
-bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
+static bool d3d11_present_color(NV2AState *d, Error **errp)
 {
     PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
     PGRAPHD3D11RenderTarget *color = &r->render_targets.color;
@@ -393,10 +434,15 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
                                               black);
     VGADisplayParams params;
     d->vga.get_params(&d->vga, &params);
-    hwaddr scanout_address = d->pcrtc.start + params.line_offset;
+    hwaddr scanout_address = d->pcrtc.start;
+    uint64_t row_probe = scanout_address + (uint64_t)params.line_offset;
+    r->presentation->scanout_line_offset = params.line_offset;
     bool color_contains_scanout =
-        color->srv && scanout_address >= color->vram_address &&
-        scanout_address - color->vram_address < color->storage_length;
+        color->srv &&
+        ((scanout_address >= color->vram_address &&
+          scanout_address - color->vram_address < color->storage_length) ||
+         (row_probe >= color->vram_address &&
+          row_probe - color->vram_address < color->storage_length));
     ID3D11ShaderResourceView *source_view =
         color_contains_scanout ? color->srv : NULL;
     uint32_t source_width = color->width;
@@ -407,11 +453,14 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     if (color_contains_scanout && !d3d11_retain_scanout(r, color, errp)) {
         return false;
     }
-    if (!source_view && presentation->retained_srv) {
-        source_view = presentation->retained_srv;
-        source_width = presentation->retained_width;
-        source_height = presentation->retained_height;
-        retained_scanout = true;
+    if (!source_view) {
+        PGRAPHD3D11CachedScanout *retained = d3d11_find_retained_scanout(d);
+        if (retained) {
+            source_view = retained->srv;
+            source_width = retained->width;
+            source_height = retained->height;
+            retained_scanout = true;
+        }
     }
     if (!source_view) {
         raw_scanout = d3d11_prepare_raw_scanout(d, &source_view, &source_width,
@@ -433,10 +482,17 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     }
     if (!source_view) {
         /* The guest has not programmed a display mode or color surface yet. */
+        xemu_hud_d3d11_render();
         return true;
     }
 
-    if (!r->logged_present_with_color) {
+    unsigned int source_kind = color_contains_scanout ? 1 :
+                               retained_scanout       ? 2 :
+                               raw_scanout            ? 3 :
+                                                        4;
+    if (!r->logged_present_with_color ||
+        (presentation->logged_source_kind != source_kind &&
+         presentation->source_logs < 8)) {
         char *message = g_strdup_printf(
             "D3D11: presenting %s scanout size=%ux%u pcrtc=0x%" HWADDR_PRIx
             " line-offset=%u",
@@ -450,6 +506,8 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
         qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
         g_free(message);
         r->logged_present_with_color = true;
+        presentation->logged_source_kind = source_kind;
+        presentation->source_logs++;
     }
 
     PGRAPHD3D11RenderTarget scanout = *color;
@@ -474,5 +532,114 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
 
     ID3D11ShaderResourceView *null_view = NULL;
     ID3D11DeviceContext_PSSetShaderResources(r->context, 0, 1, &null_view);
+    if (xemu_hud_screenshot_pending()) {
+        D3D11_TEXTURE2D_DESC desc;
+        ID3D11Texture2D_GetDesc(r->backbuffer, &desc);
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.MiscFlags = 0;
+        ID3D11Texture2D *staging = NULL;
+        HRESULT hr =
+            ID3D11Device_CreateTexture2D(r->device, &desc, NULL, &staging);
+        if (SUCCEEDED(hr)) {
+            ID3D11DeviceContext_CopyResource(r->context,
+                                             (ID3D11Resource *)staging,
+                                             (ID3D11Resource *)r->backbuffer);
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            hr = ID3D11DeviceContext_Map(r->context, (ID3D11Resource *)staging,
+                                         0, D3D11_MAP_READ, 0, &mapped);
+            if (SUCCEEDED(hr)) {
+                xemu_hud_d3d12_capture_frame(mapped.pData, desc.Width,
+                                             desc.Height, mapped.RowPitch);
+                ID3D11DeviceContext_Unmap(r->context, (ID3D11Resource *)staging,
+                                          0);
+            }
+            ID3D11Texture2D_Release(staging);
+        }
+        if (FAILED(hr)) {
+            error_setg(errp,
+                       "D3D11: screenshot readback failed (HRESULT 0x%08lx)",
+                       (unsigned long)hr);
+            return false;
+        }
+    }
+    xemu_hud_d3d11_render();
     return true;
+}
+
+bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
+{
+    ID3D11DeviceContext *context = d->pgraph.d3d11_renderer_state->context;
+    ID3D11RenderTargetView *targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    ID3D11DepthStencilView *depth;
+    ID3D11BlendState *blend;
+    FLOAT blend_factor[4];
+    UINT sample_mask, stencil_ref;
+    ID3D11DepthStencilState *depth_state;
+    ID3D11RasterizerState *raster;
+    D3D11_VIEWPORT
+    viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT viewport_count = ARRAY_SIZE(viewports);
+    ID3D11InputLayout *layout;
+    D3D11_PRIMITIVE_TOPOLOGY topology;
+    ID3D11VertexShader *vertex;
+    ID3D11PixelShader *pixel;
+    ID3D11ShaderResourceView *views[NV2A_MAX_TEXTURES];
+    ID3D11SamplerState *samplers[NV2A_MAX_TEXTURES];
+    ID3D11DeviceContext_OMGetRenderTargets(context, ARRAY_SIZE(targets),
+                                           targets, &depth);
+    ID3D11DeviceContext_OMGetBlendState(context, &blend, blend_factor,
+                                        &sample_mask);
+    ID3D11DeviceContext_OMGetDepthStencilState(context, &depth_state,
+                                               &stencil_ref);
+    ID3D11DeviceContext_RSGetState(context, &raster);
+    ID3D11DeviceContext_RSGetViewports(context, &viewport_count, viewports);
+    ID3D11DeviceContext_IAGetInputLayout(context, &layout);
+    ID3D11DeviceContext_IAGetPrimitiveTopology(context, &topology);
+    ID3D11DeviceContext_VSGetShader(context, &vertex, NULL, NULL);
+    ID3D11DeviceContext_PSGetShader(context, &pixel, NULL, NULL);
+    ID3D11DeviceContext_PSGetShaderResources(context, 0, ARRAY_SIZE(views),
+                                             views);
+    ID3D11DeviceContext_PSGetSamplers(context, 0, ARRAY_SIZE(samplers),
+                                      samplers);
+
+    bool result = d3d11_present_color(d, errp);
+
+    ID3D11DeviceContext_OMSetRenderTargets(context, ARRAY_SIZE(targets),
+                                           targets, depth);
+    ID3D11DeviceContext_OMSetBlendState(context, blend, blend_factor,
+                                        sample_mask);
+    ID3D11DeviceContext_OMSetDepthStencilState(context, depth_state,
+                                               stencil_ref);
+    ID3D11DeviceContext_RSSetState(context, raster);
+    ID3D11DeviceContext_RSSetViewports(context, viewport_count, viewports);
+    ID3D11DeviceContext_IASetInputLayout(context, layout);
+    ID3D11DeviceContext_IASetPrimitiveTopology(context, topology);
+    ID3D11DeviceContext_VSSetShader(context, vertex, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(context, pixel, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(context, 0, ARRAY_SIZE(views),
+                                             views);
+    ID3D11DeviceContext_PSSetSamplers(context, 0, ARRAY_SIZE(samplers),
+                                      samplers);
+#define RELEASE_SAVED(type, object) \
+    if (object) {                   \
+        type##_Release(object);     \
+    }
+    for (unsigned int i = 0; i < ARRAY_SIZE(targets); i++) {
+        RELEASE_SAVED(ID3D11RenderTargetView, targets[i]);
+    }
+    for (unsigned int i = 0; i < ARRAY_SIZE(views); i++) {
+        RELEASE_SAVED(ID3D11ShaderResourceView, views[i]);
+        RELEASE_SAVED(ID3D11SamplerState, samplers[i]);
+    }
+    RELEASE_SAVED(ID3D11DepthStencilView, depth);
+    RELEASE_SAVED(ID3D11BlendState, blend);
+    RELEASE_SAVED(ID3D11DepthStencilState, depth_state);
+    RELEASE_SAVED(ID3D11RasterizerState, raster);
+    RELEASE_SAVED(ID3D11InputLayout, layout);
+    RELEASE_SAVED(ID3D11VertexShader, vertex);
+    RELEASE_SAVED(ID3D11PixelShader, pixel);
+#undef RELEASE_SAVED
+    return result;
 }

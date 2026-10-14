@@ -31,6 +31,11 @@ void nv2a_profile_increment(void)
     frame_count++;
 
     static int64_t ts = 0;
+    if (!ts || now < ts) {
+        ts = now;
+        frame_count = 1;
+        return;
+    }
     int64_t delta = now - ts;
     if (delta >= fps_update_interval) {
         qatomic_set(&g_nv2a_stats.increment_fps,
@@ -43,7 +48,8 @@ void nv2a_profile_increment(void)
 void nv2a_profile_flip_stall(void)
 {
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    int64_t render_time = (now-g_nv2a_stats.last_flip_time)/1000;
+    int64_t render_time = g_nv2a_stats.last_flip_time ?
+        MAX(0, now - g_nv2a_stats.last_flip_time) / 1000 : 0;
 
     qatomic_set(&g_nv2a_stats.current_mspf, render_time);
     g_nv2a_stats.frame_working.mspf = render_time;

@@ -126,7 +126,9 @@ void MainMenuInputView::Draw()
     float xmu_w = 256, xmu_h = 256;
 
     // Setup rendering to fbo for controller and port images
-    controller_fbo->Target();
+    if (!xemu_hud_uses_native_d3d()) {
+        controller_fbo->Target();
+    }
     ImTextureID id = (ImTextureID)(intptr_t)controller_fbo->Texture();
 
     //
@@ -167,7 +169,7 @@ void MainMenuInputView::Draw()
         ImVec2 port_size(b_w * g_viewport_mgr.m_scale,
                          b_h * g_viewport_mgr.m_scale);
         bool activated;
-        if (xemu_hud_uses_d3d12()) {
+        if (xemu_hud_uses_native_d3d()) {
             char label[16];
             snprintf(label, sizeof(label), "%d", i + 1);
             activated = ImGui::Button(label, port_size);
@@ -192,7 +194,9 @@ void MainMenuInputView::Draw()
             port_color = 0x81dc8a00;
         }
 
-        RenderControllerPort(x, b_y, i, port_color);
+        if (!xemu_hud_uses_native_d3d()) {
+            RenderControllerPort(x, b_y, i, port_color);
+        }
 
         ImGui::PopID();
         ImGui::NextColumn();
@@ -334,10 +338,14 @@ void MainMenuInputView::Draw()
 
     if (bound_state) {
         device_selected = true;
-        RenderController(0, 0, 0x81dc8a00, 0x0f0f0f00, bound_state);
+        if (!xemu_hud_uses_native_d3d()) {
+            RenderController(0, 0, 0x81dc8a00, 0x0f0f0f00, bound_state);
+        }
     } else {
         static ControllerState state{};
-        RenderController(0, 0, 0x1f1f1f00, 0x0f0f0f00, &state);
+        if (!xemu_hud_uses_native_d3d()) {
+            RenderController(0, 0, 0x1f1f1f00, 0x0f0f0f00, &state);
+        }
     }
 
     ImVec2 cur = ImGui::GetCursorPos();
@@ -358,7 +366,7 @@ void MainMenuInputView::Draw()
         ImGui::GetCursorPosX() +
         (int)((ImGui::GetColumnWidth() - controller_display_size.x) / 2.0));
 
-    if (!xemu_hud_uses_d3d12()) {
+    if (!xemu_hud_uses_native_d3d()) {
         ImGui::Image(id, controller_display_size,
                      ImVec2(0, controller_height / t_h),
                      ImVec2(controller_width / t_w, 0));
@@ -374,7 +382,9 @@ void MainMenuInputView::Draw()
         ImGui::Text("%s", msg);
     }
 
-    controller_fbo->Restore();
+    if (!xemu_hud_uses_native_d3d()) {
+        controller_fbo->Restore();
+    }
 
     ImGui::PopFont();
     ImGui::SetCursorPos(pos);
@@ -388,7 +398,9 @@ void MainMenuInputView::Draw()
                             g_viewport_mgr.Scale(ImVec2(0, 12)));
         ImGui::Columns(2, "mixed", false);
 
-        xmu_fbo->Target();
+        if (!xemu_hud_uses_native_d3d()) {
+            xmu_fbo->Target();
+        }
         id = (ImTextureID)(intptr_t)xmu_fbo->Texture();
 
         static const SDL_DialogFileFilter img_file_filters[] = {
@@ -469,10 +481,11 @@ void MainMenuInputView::Draw()
                 float y = xmu_y;
 
                 XmuState *xmu = (XmuState *)bound_state->peripherals[i];
-                if (xmu->filename != NULL && strlen(xmu->filename) > 0) {
+                if (!xemu_hud_uses_native_d3d() &&
+                    xmu->filename != NULL && strlen(xmu->filename) > 0) {
                     RenderXmu(x, y, 0x81dc8a00, 0x0f0f0f00);
 
-                } else {
+                } else if (!xemu_hud_uses_native_d3d()) {
                     RenderXmu(x, y, 0x1f1f1f00, 0x0f0f0f00);
                 }
 
@@ -491,7 +504,7 @@ void MainMenuInputView::Draw()
                     (int)((ImGui::GetColumnWidth() - xmu_display_size.x) /
                           2.0));
 
-                if (!xemu_hud_uses_d3d12()) {
+                if (!xemu_hud_uses_native_d3d()) {
                     ImGui::Image(id, xmu_display_size, ImVec2(0.5f * i, 1),
                                  ImVec2(0.5f * (i + 1), 0));
                 } else {
@@ -538,7 +551,9 @@ void MainMenuInputView::Draw()
             ImGui::NextColumn();
         }
 
-        xmu_fbo->Restore();
+        if (!xemu_hud_uses_native_d3d()) {
+            xmu_fbo->Restore();
+        }
 
         ImGui::PopStyleVar(); // ItemSpacing
         ImGui::Columns(1);
@@ -752,6 +767,11 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
 void MainMenuDisplayView::Draw()
 {
     SectionTitle("Renderer");
+#ifdef CONFIG_UWP
+    ImGui::TextUnformatted(g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D11 ?
+        "Native Direct3D 11 (experimental)" : "OpenGL (Mesa Gallium D3D12)");
+    ImGui::TextDisabled("Select the backend in UWP-Port before starting xemu.");
+#else
     ChevronCombo("Backend", &g_config.display.renderer,
                  "Null\0"
                  "OpenGL\0"
@@ -760,6 +780,7 @@ void MainMenuDisplayView::Draw()
 #endif
                  ,
                  "Select desired renderer implementation");
+#endif
     int rendering_scale = nv2a_get_surface_scale_factor() - 1;
     if (ChevronCombo("Internal resolution scale", &rendering_scale,
                      "1x\0"
@@ -1220,13 +1241,15 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
 
     // Snapshot thumbnail
     GLuint thumbnail = data->gl_thumbnail ? data->gl_thumbnail : g_icon_tex;
-    int thumbnail_width, thumbnail_height;
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, thumbnail);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
-                             &thumbnail_width);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
-                             &thumbnail_height);
+    int thumbnail_width = 64, thumbnail_height = 64;
+    if (!xemu_hud_uses_native_d3d()) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, thumbnail);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
+                                 &thumbnail_width);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
+                                 &thumbnail_height);
+    }
 
     // Draw black background behind thumbnail
     ImVec2 thumbnail_min(p0.x + thumbnail_pos.x, p0.y + thumbnail_pos.y);
@@ -1243,7 +1266,7 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
                thumbnail_min.y + (thumbnail_size.y - scaled_height) / 2);
     ImVec2 img_max =
         ImVec2(img_min.x + scaled_width, img_min.y + scaled_height);
-    if (!xemu_hud_uses_d3d12()) {
+    if (!xemu_hud_uses_native_d3d()) {
         draw_list->AddImage((ImTextureID)(uint64_t)thumbnail, img_min, img_max);
     }
 
@@ -1647,7 +1670,14 @@ void MainMenuAboutView::Draw()
     }
 
     static const char *sys_info_text = NULL;
-    if (sys_info_text == NULL) {
+    if (sys_info_text == NULL && xemu_hud_uses_native_d3d()) {
+        sys_info_text = g_strdup_printf(
+            "CPU: %s\nOS Platform: %s\nOS Version: %s\nRenderer: %s\n"
+            "See xemu.log for native device diagnostics.",
+            xemu_get_cpu_info(), SDL_GetPlatform(), xemu_get_os_info(),
+            g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D11 ?
+                "Direct3D 11" : "Direct3D 12");
+    } else if (sys_info_text == NULL) {
         const char *gl_shader_version =
             (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
         const char *gl_version = (const char *)glGetString(GL_VERSION);

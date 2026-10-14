@@ -53,6 +53,7 @@ namespace UWP_Port
     private:
         template<typename T> bool Resolve(T& target, const char* name);
         bool Load();
+        bool RegisterNativePresentTarget();
         void Run(std::vector<std::string> arguments);
         void WriteDiagnostic(const std::string& message);
         void SetError(const std::string& error);

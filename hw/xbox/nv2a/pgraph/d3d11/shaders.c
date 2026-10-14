@@ -28,12 +28,12 @@
 #include <d3dcompiler.h>
 #include "shaders.h"
 
-#define D3D11_SHADER_CACHE_VERSION 6
+#define D3D11_SHADER_CACHE_VERSION 9
 #define D3D11_SHADER_CACHE_MAGIC 0x31485358U /* XSH1 */
 #define D3D11_SHADER_CACHE_MAX_BYTECODE (16 * MiB)
 #define D3D11_SHADER_MEMORY_CACHE_LIMIT 2048
 #define D3D11_SHADER_FAILURE_CACHE_LIMIT 256
-#define D3D11_PIXEL_CONSTANT_BUFFER_SIZE 656
+#define D3D11_PIXEL_CONSTANT_BUFFER_SIZE 720
 #define D3D11_VERTEX_CONSTANT_BUFFER_SIZE                            \
     ((NV2A_VERTEXSHADER_CONSTANTS + 2 + 4 * NV2A_MAX_LIGHTS +        \
       NV2A_LTC1_COUNT + NV2A_LTCTXA_COUNT + NV2A_LTCTXB_COUNT + 3) * \
@@ -619,7 +619,8 @@ static char *d3d11_translate_vertex_program(const ProgrammableVshState *program,
     g_string_append(
         s, "  oPos.xy = round(oPos.xy * 16.0) / 16.0;\n"
            "  oPos.w = nv_clamp_away(oPos.w);\n"
-           "  oPos.xy = (2.0 * oPos.xy - surfaceSize) / surfaceSize;\n"
+           "  oPos.xy = (2.0 * oPos.xy - surfaceSize) / surfaceSize; "
+           "oPos.y=-oPos.y;\n"
            "  oPos.z = oPos.z / clipRange.y; oPos.xyz *= oPos.w;\n"
            "  VSOut output; output.position=oPos; output.diffuse=oD0;\n"
            "  output.specular=oD1; output.backDiffuse=oB0;\n"
@@ -918,10 +919,11 @@ static char *d3d11_translate_fixed_function_vertex(const VshState *state,
     g_string_append_printf(
         s,
         "  oPos.w=nv_clamp_away(oPos.w);\n"
+        "  oPos.xy/=oPos.w;\n"
         "  oPos.xy+=C[%u].xy;\n"
         "  oPos.xy=trunc(oPos.xy*16.0)/16.0;\n"
-        "  oPos.xy=(2.0*oPos.xy-surfaceSize)/surfaceSize;\n"
-        "  oPos.z=oPos.z/clipRange.y; oPos.xyz*=oPos.w;\n"
+        "  oPos.xy=(2.0*oPos.xy-surfaceSize)/surfaceSize; oPos.y=-oPos.y;\n"
+        "  oPos.z=oPos.z/clipRange.y; oPos.xy*=oPos.w;\n"
         "  VSOut output; output.position=oPos; output.diffuse=diffuse;\n"
         "  output.specular=%s; output.backDiffuse=backDiffuse;\n"
         "  output.backSpecular=%s; output.fog=%s;\n"
@@ -1189,7 +1191,8 @@ static const char d3d11_psh_preamble[] =
     "  float4 K[18]; float4 fogColor; int alphaRef; float3 _psPad;\n"
     "  float4 bumpMat[4]; float4 bumpParams[4]; float4 clipRange;\n"
     "  uint4 colorKey; uint4 colorKeyMask; int4 clipRegion[8];\n"
-    "  float4 texScale; float2 surfaceScale; float depthOffset;\n"
+    "  float4 texScale; float4 texCoordScale[4]; float2 surfaceScale; float "
+    "depthOffset;\n"
     "  float depthFactor;\n"
     "};\n"
     "struct PSIn {\n"
@@ -1534,6 +1537,18 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
                          "#define NV2A_COLOR_INTERPOLATION\n" :
                          "#define NV2A_COLOR_INTERPOLATION nointerpolation\n");
     g_string_append(s, d3d11_psh_preamble);
+    g_string_append(
+        s,
+        "float3 nv_dotmap(float4 c,uint mode){float3 x=c.rgb*255.0;"
+        "if(mode==1)return (x-128.0)/127.0;"
+        "if(mode==2)return float3(x.x>=128?(x.x-255.5)/127.5:(x.x+0.5)/127.5,"
+        "x.y>=128?(x.y-255.5)/127.5:(x.y+0.5)/127.5,"
+        "x.z>=128?(x.z-255.5)/127.5:(x.z+0.5)/127.5);"
+        "if(mode==3)return float3(x.x>=128?x.x-256:x.x,"
+        "x.y>=128?x.y-256:x.y,x.z>=128?x.z-256:x.z)/127.0;"
+        "if(mode==4){uint4 b=(uint4)(c*255.0);"
+        "return float3((b.a*256+b.r)/65535.0,(b.g*256+b.b)/65535.0,1);}"
+        "return c.rgb;}\n");
     for (unsigned int i = 0; i < NV2A_MAX_TEXTURES; i++) {
         if (state->tex_cubemap[i]) {
             g_string_append_printf(s, "TextureCube tex%u:register(t%u);\n", i,
@@ -1552,27 +1567,135 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
            "  float4 "
            "pT0=input.tex0,pT1=input.tex1,pT2=input.tex2,pT3=input.tex3;\n"
            "  float4 T0=pT0,T1=pT1,T2=pT2,T3=pT3;\n"
-           "  float4 R0=float4(0,0,0,T0.a),R1=0;\n"
+           "  float4 R0=0,R1=0;\n"
+           "  float dots[4]={0,0,0,0};\n"
            "  float4 C0=K[0],C1=K[1];\n"
            "  float4 FOG=float4(fogColor.rgb,saturate(input.fog));\n"
            "  float4 V1R0_SUM=0,EF_PROD=0;\n");
     for (unsigned int i = 0; i < NV2A_MAX_TEXTURES; i++) {
         unsigned int mode = (state->shader_stage_program >> (i * 5)) & 0x1f;
-        if (mode == PS_TEXTUREMODES_NONE || mode == PS_TEXTUREMODES_PASSTHRU) {
+        if (mode == PS_TEXTUREMODES_NONE) {
+            g_string_append_printf(s, "  T%u=float4(0,0,0,1);\n", i);
             continue;
         }
-        if (state->tex_cubemap[i]) {
+        if (mode == PS_TEXTUREMODES_PASSTHRU) {
+            continue;
+        }
+        unsigned int input =
+            i < 2 ? 0 : (state->other_stage_input >> (i == 2 ? 16 : 20)) & 0xf;
+        unsigned int mapping =
+            i ? (state->other_stage_input >> ((i - 1) * 4)) & 0xf : 0;
+        bool uses_dot = mode == PS_TEXTUREMODES_DOTPRODUCT ||
+                        mode == PS_TEXTUREMODES_DOT_ST ||
+                        mode == PS_TEXTUREMODES_DOT_ZW;
+        if (mode >= PS_TEXTUREMODES_BUMPENVMAP &&
+            (!i || input >= i || (uses_dot && mapping > 4))) {
+            error_setg(errp, "D3D11: invalid/unsupported dependent texture "
+                             "input or dot mapping");
+            g_string_free(s, TRUE);
+            return NULL;
+        }
+        if (mode == PS_TEXTUREMODES_CLIPPLANE) {
+            for (unsigned int c = 0; c < 4; c++) {
+                g_string_append_printf(
+                    s, "  if(pT%u.%c%s0)discard;\n", i, "xyzw"[c],
+                    state -> compare_mode[i][c] ? ">=" : "<");
+            }
+            g_string_append_printf(s, "  T%u=0;\n", i);
+            continue;
+        } else if (mode == PS_TEXTUREMODES_DPNDNT_AR ||
+                   mode == PS_TEXTUREMODES_DPNDNT_GB) {
+            if (state->dim_tex[i] != 2 || state->tex_cubemap[i]) {
+                error_setg(errp,
+                           "D3D11: dependent AR/GB requires a 2D texture");
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            g_string_append_printf(
+                s, "  T%u=tex%u.Sample(samp%u,T%u.%s*texCoordScale[%u].xy);\n",
+                i, i, i, input, mode == PS_TEXTUREMODES_DPNDNT_AR ? "ar" : "gb",
+                i);
+        } else if (mode == PS_TEXTUREMODES_BUMPENVMAP ||
+                   mode == PS_TEXTUREMODES_BUMPENVMAP_LUM) {
+            g_string_append_printf(s, "  float2 bump%u=", i);
+            if (state->snorm_tex[input]) {
+                g_string_append_printf(s, "T%u.bg;\n", input);
+            } else {
+                g_string_append_printf(s, "nv_dotmap(T%u,3).bg;\n", input);
+            }
+            g_string_append_printf(
+                s,
+                "  float2 delta%u=float2(dot(bumpMat[%u].xz,bump%u),"
+                "dot(bumpMat[%u].yw,bump%u));\n",
+                i, i, i, i, i);
+            if (state->dim_tex[i] == 3 && !state->tex_cubemap[i]) {
+                g_string_append_printf(s,
+                                       "  "
+                                       "T%u=tex%u.Sample(samp%u,float3(pT%u.xy+"
+                                       "delta%u,pT%u.z));\n",
+                                       i, i, i, i, i, i);
+            } else if (state->dim_tex[i] == 2 && !state->tex_cubemap[i]) {
+                g_string_append_printf(s,
+                                       "  "
+                                       "T%u=tex%u.Sample(samp%u,(pT%u.xy+delta%"
+                                       "u)*texCoordScale[%u].xy);\n",
+                                       i, i, i, i, i, i);
+            } else {
+                error_setg(
+                    errp,
+                    "D3D11: bump environment requires a 2D or 3D texture");
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            if (mode == PS_TEXTUREMODES_BUMPENVMAP_LUM) {
+                g_string_append_printf(s, "  float lum%u=T%u.r;\n", i, input);
+                if (state->snorm_tex[input]) {
+                    g_string_append_printf(
+                        s, "  lum%u=lum%u>=0?lum%u/2:1+lum%u/2;\n", i, i, i, i);
+                }
+                g_string_append_printf(
+                    s, "  T%u*=bumpParams[%u].x*lum%u+bumpParams[%u].y;\n", i,
+                    i, i, i);
+            }
+        } else if (mode == PS_TEXTUREMODES_DOTPRODUCT ||
+                   mode == PS_TEXTUREMODES_DOT_ZW ||
+                   mode == PS_TEXTUREMODES_DOT_ST) {
+            g_string_append_printf(
+                s, "  dots[%u]=dot(pT%u.xyz,nv_dotmap(T%u,%u));\n", i, i, input,
+                mapping);
+            if (mode == PS_TEXTUREMODES_DOT_ST && i >= 2 &&
+                state->dim_tex[i] == 2) {
+                g_string_append_printf(s,
+                                       "  "
+                                       "T%u=tex%u.Sample(samp%u,float2(dots[%u]"
+                                       ",dots[%u])*texCoordScale[%u].xy);\n",
+                                       i, i, i, i - 1, i, i);
+            } else {
+                g_string_append_printf(s, "  T%u=0;\n", i);
+            }
+        } else if (mode != PS_TEXTUREMODES_PROJECT2D &&
+                   mode != PS_TEXTUREMODES_PROJECT3D &&
+                   mode != PS_TEXTUREMODES_CUBEMAP) {
+            error_setg(errp, "D3D11: texture mode 0x%x is not implemented",
+                       mode);
+            g_string_free(s, TRUE);
+            return NULL;
+        } else if (state->tex_cubemap[i]) {
             g_string_append_printf(s, "  T%u=tex%u.Sample(samp%u,pT%u.xyz);\n",
                                    i, i, i, i);
         } else if (state->dim_tex[i] == 3) {
-            g_string_append_printf(
-                s, "  T%u=tex%u.Sample(samp%u,pT%u.xyz/pT%u.w);\n", i, i, i, i,
-                i);
+            g_string_append_printf(s,
+                                   "  "
+                                   "T%u=tex%u.Sample(samp%u,pT%u.xyz/"
+                                   "pT%u.w*texCoordScale[%u].xyz);\n",
+                                   i, i, i, i, i, i);
         } else if (mode == PS_TEXTUREMODES_PROJECT2D ||
                    mode == PS_TEXTUREMODES_PROJECT3D) {
-            g_string_append_printf(
-                s, "  T%u=tex%u.Sample(samp%u,pT%u.xy/pT%u.w);\n", i, i, i, i,
-                i);
+            g_string_append_printf(s,
+                                   "  "
+                                   "T%u=tex%u.Sample(samp%u,pT%u.xy/"
+                                   "pT%u.w*texCoordScale[%u].xy);\n",
+                                   i, i, i, i, i, i);
         } else {
             g_string_append_printf(s, "  T%u=tex%u.Sample(samp%u,pT%u.xy);\n",
                                    i, i, i, i);
@@ -1584,6 +1707,7 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
             g_string_append_printf(s, "  T%u=T%u*2.0-1.0;\n", i, i);
         }
     }
+    g_string_append(s, "  R0.a=T0.a;\n");
     for (unsigned int i = 0; i < stages; i++) {
         if (!d3d11_ps_append_stage(s, state, i, errp)) {
             g_string_free(s, TRUE);
@@ -1730,6 +1854,7 @@ typedef struct PGRAPHD3D11PixelConstants {
     uint32_t color_key_mask[4];
     int32_t clip_region[8][4];
     float tex_scale[4];
+    float tex_coord_scale[4][4];
     float surface_scale[2];
     float depth_offset;
     float depth_factor;
@@ -1737,6 +1862,23 @@ typedef struct PGRAPHD3D11PixelConstants {
 
 QEMU_BUILD_BUG_ON(sizeof(PGRAPHD3D11PixelConstants) !=
                   D3D11_PIXEL_CONSTANT_BUFFER_SIZE);
+
+static void d3d11_texture_coordinate_scale(PGRAPHState *pg, unsigned int stage,
+                                           float scale[4])
+{
+    for (unsigned int i = 0; i < 4; i++) {
+        scale[i] = 1;
+    }
+    // Disabled stages may have uninitialized dimensionality and mip counts.
+    if (!pgraph_is_texture_enabled(pg, stage)) {
+        return;
+    }
+    TextureShape shape = pgraph_get_texture_shape(pg, stage);
+    if (kelvin_color_format_info_map[shape.color_format].linear) {
+        scale[0] = 1.0f / MAX(1, shape.width);
+        scale[1] = 1.0f / MAX(1, shape.height);
+    }
+}
 
 static bool d3d11_update_pixel_constants(PGRAPHState *pg, Error **errp)
 {
@@ -1771,6 +1913,7 @@ static bool d3d11_update_pixel_constants(PGRAPHState *pg, Error **errp)
         constants.bump_params[i][0] = values.bumpScale[i];
         constants.bump_params[i][1] = values.bumpOffset[i];
         constants.tex_scale[i] = values.texScale[i];
+        d3d11_texture_coordinate_scale(pg, i, constants.tex_coord_scale[i]);
     }
     memcpy(constants.clip_range, values.clipRange[0],
            sizeof(constants.clip_range));

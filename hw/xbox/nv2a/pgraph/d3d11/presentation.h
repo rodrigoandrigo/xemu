@@ -11,6 +11,15 @@
 typedef struct NV2AState NV2AState;
 typedef struct PGRAPHD3D11State PGRAPHD3D11State;
 
+typedef struct PGRAPHD3D11CachedScanout {
+    ID3D11Texture2D *texture;
+    ID3D11ShaderResourceView *srv;
+    uint32_t width, height;
+    uint64_t address;
+    size_t length;
+    uint64_t serial;
+} PGRAPHD3D11CachedScanout;
+
 typedef struct PGRAPHD3D11PresentationState {
     ID3D11VertexShader *vertex_shader;
     ID3D11PixelShader *pixel_shader;
@@ -20,10 +29,11 @@ typedef struct PGRAPHD3D11PresentationState {
     ID3D11ShaderResourceView *scanout_srv;
     uint32_t scanout_width;
     uint32_t scanout_height;
-    ID3D11Texture2D *retained_texture;
-    ID3D11ShaderResourceView *retained_srv;
-    uint32_t retained_width;
-    uint32_t retained_height;
+    uint32_t scanout_line_offset;
+    unsigned int logged_source_kind;
+    unsigned int source_logs;
+    PGRAPHD3D11CachedScanout retained[8];
+    uint64_t retained_serial;
 } PGRAPHD3D11PresentationState;
 
 bool pgraph_d3d11_presentation_init(PGRAPHD3D11State *r, Error **errp);

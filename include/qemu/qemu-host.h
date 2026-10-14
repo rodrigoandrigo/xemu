@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 #define QEMU_HOST_API_VERSION_MAJOR 1U
-#define QEMU_HOST_API_VERSION_MINOR 7U
+#define QEMU_HOST_API_VERSION_MINOR 8U
 #define QEMU_HOST_API_VERSION \
     ((QEMU_HOST_API_VERSION_MAJOR << 16) | QEMU_HOST_API_VERSION_MINOR)
 
@@ -210,6 +210,9 @@ typedef struct QemuHostBrokeredStorageCallbacks {
 
 QEMU_HOST_EXPORT uint32_t qemu_host_get_api_version(void);
 QEMU_HOST_EXPORT int qemu_host_init(int argc, char **argv);
+/* Internal CPU-only embedding: Cxbx owns the Xbox devices and presentation. */
+int qemu_host_init_cpu(int argc, char **argv);
+bool qemu_host_is_cpu_only(void);
 QEMU_HOST_EXPORT int qemu_host_start(void);
 QEMU_HOST_EXPORT int qemu_host_render_frame(void);
 QEMU_HOST_EXPORT int qemu_host_main_loop_step(bool nonblocking,

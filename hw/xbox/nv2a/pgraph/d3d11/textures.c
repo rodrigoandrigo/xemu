@@ -219,25 +219,32 @@ static uint8_t *d3d11_convert_level(TextureShape shape, const uint8_t *source,
     unsigned int pixel_size =
         special ? (format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5 ? 3 : 4) :
                   info.bytes_per_pixel;
+    if (special) {
+        row_pitch = width * pixel_size;
+        slice_pitch = row_pitch * height;
+    }
     uint8_t *rgba = g_malloc((size_t)width * height * depth * 4);
     for (size_t i = 0; i < (size_t)width * height * depth; i++) {
+        const uint8_t *pixel = pixels + (i / (width * height)) * slice_pitch +
+                               ((i / width) % height) * row_pitch +
+                               (i % width) * pixel_size;
         if (special && pixel_size == 4 &&
             format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8) {
             uint32_t p;
-            memcpy(&p, pixels + i * 4, 4);
+            memcpy(&p, pixel, 4);
             rgba[i * 4 + 0] = p >> 16;
             rgba[i * 4 + 1] = p >> 8;
             rgba[i * 4 + 2] = p;
             rgba[i * 4 + 3] = p >> 24;
         } else if (special && pixel_size == 4) {
-            memcpy(rgba + i * 4, pixels + i * 4, 4);
+            memcpy(rgba + i * 4, pixel, 4);
         } else if (special && pixel_size == 3) {
-            rgba[i * 4 + 0] = (uint8_t)((int8_t)pixels[i * 3 + 0] + 128);
-            rgba[i * 4 + 1] = (uint8_t)((int8_t)pixels[i * 3 + 1] + 128);
-            rgba[i * 4 + 2] = (uint8_t)((int8_t)pixels[i * 3 + 2] + 128);
+            rgba[i * 4 + 0] = (uint8_t)((int8_t)pixel[0] + 128);
+            rgba[i * 4 + 1] = (uint8_t)((int8_t)pixel[1] + 128);
+            rgba[i * 4 + 2] = (uint8_t)((int8_t)pixel[2] + 128);
             rgba[i * 4 + 3] = 255;
         } else {
-            d3d11_decode_pixel(format, pixels + i * pixel_size, rgba + i * 4);
+            d3d11_decode_pixel(format, pixel, rgba + i * 4);
         }
     }
     g_free(special);
@@ -322,6 +329,11 @@ static bool d3d11_create_texture(NV2AState *d, unsigned int stage,
     PGRAPHD3D11TextureBinding *binding = &r->textures->bindings[stage];
     unsigned int array_size = shape.cubemap ? 6 : 1;
     unsigned int levels = MAX(1, shape.levels);
+    if (!shape.width || !shape.height || shape.min_mipmap_level >= levels ||
+        (shape.dimensionality == 3 && (!shape.depth || shape.cubemap))) {
+        error_setg(errp, "D3D11: invalid texture dimensions or mip range");
+        return false;
+    }
     unsigned int subresource_count = levels * array_size;
     D3D11_SUBRESOURCE_DATA *initial =
         g_new0(D3D11_SUBRESOURCE_DATA, subresource_count);
@@ -331,12 +343,14 @@ static bool d3d11_create_texture(NV2AState *d, unsigned int stage,
         pgraph_get_texture_length(&d->pgraph, &shape) / array_size;
     for (unsigned int face = 0; face < array_size; face++) {
         const uint8_t *level_source = source + face * face_size;
-        unsigned int width = shape.width, height = shape.height;
+        unsigned int width = shape.width;
+        unsigned int height = shape.dimensionality >= 2 ? shape.height : 1;
+        unsigned int depth = shape.dimensionality == 3 ? shape.depth : 1;
         for (unsigned int level = 0; level < levels; level++) {
             unsigned int index = face * levels + level, consumed;
             converted[index] =
                 d3d11_convert_level(shape, level_source, palette, MAX(1, width),
-                                    MAX(1, height), 1, &consumed);
+                                    MAX(1, height), MAX(1, depth), &consumed);
             initial[index].pSysMem = converted[index];
             initial[index].SysMemPitch = MAX(1, width) * 4;
             initial[index].SysMemSlicePitch =
@@ -344,6 +358,7 @@ static bool d3d11_create_texture(NV2AState *d, unsigned int stage,
             level_source += consumed;
             width /= 2;
             height /= 2;
+            depth /= 2;
         }
     }
     D3D11_TEXTURE2D_DESC desc = {
@@ -357,9 +372,27 @@ static bool d3d11_create_texture(NV2AState *d, unsigned int stage,
         .BindFlags = D3D11_BIND_SHADER_RESOURCE,
         .MiscFlags = shape.cubemap ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0,
     };
-    ID3D11Texture2D *texture = NULL;
-    HRESULT hr =
-        ID3D11Device_CreateTexture2D(r->device, &desc, initial, &texture);
+    ID3D11Resource *texture = NULL;
+    HRESULT hr;
+    if (shape.dimensionality == 3) {
+        D3D11_TEXTURE3D_DESC volume_desc = {
+            .Width = shape.width,
+            .Height = shape.height,
+            .Depth = shape.depth,
+            .MipLevels = levels,
+            .Format = desc.Format,
+            .Usage = D3D11_USAGE_IMMUTABLE,
+            .BindFlags = D3D11_BIND_SHADER_RESOURCE,
+        };
+        ID3D11Texture3D *volume = NULL;
+        hr = ID3D11Device_CreateTexture3D(r->device, &volume_desc, initial,
+                                          &volume);
+        texture = (ID3D11Resource *)volume;
+    } else {
+        ID3D11Texture2D *image = NULL;
+        hr = ID3D11Device_CreateTexture2D(r->device, &desc, initial, &image);
+        texture = (ID3D11Resource *)image;
+    }
     for (unsigned int i = 0; i < subresource_count; i++) {
         g_free(converted[i]);
     }
@@ -373,11 +406,16 @@ static bool d3d11_create_texture(NV2AState *d, unsigned int stage,
     D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {
         .Format = desc.Format,
         .ViewDimension = shape.cubemap ? D3D11_SRV_DIMENSION_TEXTURECUBE :
+                         shape.dimensionality == 3 ?
+                                         D3D11_SRV_DIMENSION_TEXTURE3D :
                                          D3D11_SRV_DIMENSION_TEXTURE2D,
     };
     if (shape.cubemap) {
         view_desc.TextureCube.MostDetailedMip = shape.min_mipmap_level;
         view_desc.TextureCube.MipLevels = levels - shape.min_mipmap_level;
+    } else if (shape.dimensionality == 3) {
+        view_desc.Texture3D.MostDetailedMip = shape.min_mipmap_level;
+        view_desc.Texture3D.MipLevels = levels - shape.min_mipmap_level;
     } else {
         view_desc.Texture2D.MostDetailedMip = shape.min_mipmap_level;
         view_desc.Texture2D.MipLevels = levels - shape.min_mipmap_level;
@@ -386,7 +424,7 @@ static bool d3d11_create_texture(NV2AState *d, unsigned int stage,
     hr = ID3D11Device_CreateShaderResourceView(
         r->device, (ID3D11Resource *)texture, &view_desc, &view);
     if (FAILED(hr)) {
-        ID3D11Texture2D_Release(texture);
+        ID3D11Resource_Release(texture);
         error_setg(errp, "D3D11: texture SRV creation failed (HRESULT 0x%08lx)",
                    (unsigned long)hr);
         return false;
@@ -411,10 +449,6 @@ bool pgraph_d3d11_bind_textures(NV2AState *d, Error **errp)
             continue;
         }
         TextureShape shape = pgraph_get_texture_shape(pg, stage);
-        if (shape.dimensionality == 3) {
-            error_setg(errp, "D3D11: 3D NV2A textures are not implemented");
-            return false;
-        }
         hwaddr address = pgraph_get_texture_phys_addr(pg, stage);
         size_t length = pgraph_get_texture_length(pg, &shape);
         if (address > memory_region_size(d->vram) ||
@@ -422,9 +456,35 @@ bool pgraph_d3d11_bind_textures(NV2AState *d, Error **errp)
             error_setg(errp, "D3D11: texture %u exceeds VRAM", stage);
             return false;
         }
+        /* Resolve an active render-to-texture surface before reading VRAM.
+         * Surface transitions already resolve replaced targets. This also
+         * handles feedback from the currently bound color/depth surface.
+         */
+        PGRAPHD3D11RenderTarget *targets[] = {
+            &r->render_targets.color,
+            &r->render_targets.depth_stencil,
+        };
+        Surface *surfaces[] = { &pg->surface_color, &pg->surface_zeta };
+        bool resolve = false;
+        for (unsigned int i = 0; i < ARRAY_SIZE(targets); i++) {
+            if (surfaces[i]->draw_dirty && targets[i]->texture &&
+                address <
+                    targets[i]->vram_address + targets[i]->storage_length &&
+                targets[i]->vram_address < address + length) {
+                resolve = true;
+            }
+        }
+        if (resolve && !pgraph_d3d11_surface_flush(d, errp)) {
+            return false;
+        }
         size_t palette_length = 0;
         hwaddr palette_address = pgraph_get_texture_palette_phys_addr_length(
             pg, stage, &palette_length);
+        if (palette_address > memory_region_size(d->vram) ||
+            palette_length > memory_region_size(d->vram) - palette_address) {
+            error_setg(errp, "D3D11: texture %u palette exceeds VRAM", stage);
+            return false;
+        }
         const uint8_t *palette = d->vram_ptr + palette_address;
         uint64_t hash = fast_hash(d->vram_ptr + address, length);
         if (shape.color_format ==

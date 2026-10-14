@@ -415,7 +415,14 @@ bool nv2a_present_frame(void)
     pg = &d->pgraph;
     qemu_mutex_lock(&pg->renderer_lock);
     if (pg->renderer && pg->renderer->ops.present_frame) {
+        bool native_d3d11 = pg->renderer->type == CONFIG_DISPLAY_RENDERER_D3D11;
+        if (native_d3d11) {
+            qemu_mutex_lock(&pg->lock);
+        }
         presented = pg->renderer->ops.present_frame(d);
+        if (native_d3d11) {
+            qemu_mutex_unlock(&pg->lock);
+        }
     }
     qemu_mutex_unlock(&pg->renderer_lock);
     return presented;

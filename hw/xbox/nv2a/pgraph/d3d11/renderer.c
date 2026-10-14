@@ -10,6 +10,7 @@
 #include "hw/xbox/nv2a/nv2a.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "ui/xemu-settings.h"
+#include "ui/xui/xemu-hud.h"
 #include "blits.h"
 #include "renderer.h"
 
@@ -55,6 +56,7 @@ static bool d3d11_wait_idle(PGRAPHD3D11State *r)
     }
     qemu_host_emit_log(QEMU_HOST_LOG_WARNING,
                        "D3D11: timed out waiting for the GPU");
+    r->device_lost = true;
     return false;
 }
 
@@ -63,6 +65,7 @@ static void d3d11_release_device_resources(PGRAPHD3D11State *r)
     if (!r) {
         return;
     }
+    xemu_hud_d3d11_request_reset();
     pgraph_d3d11_reports_finalize(r);
     d3d11_wait_idle(r);
     if (r->context) {
@@ -138,8 +141,7 @@ static bool d3d11_create_device(PGRAPHD3D11State *r, Error **errp)
             break;
         }
         if (FAILED(hr)) {
-            d3d11_set_error(errp, "IDXGIFactory::EnumAdapters1", hr);
-            return false;
+            break;
         }
         DXGI_ADAPTER_DESC1 desc;
         hr = IDXGIAdapter1_GetDesc1(adapter, &desc);
@@ -155,6 +157,13 @@ static bool d3d11_create_device(PGRAPHD3D11State *r, Error **errp)
             }
         }
         IDXGIAdapter1_Release(adapter);
+    }
+    if (!r->device) {
+        /* Some device families do not expose a desktop adapter enumeration. */
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, feature_levels,
+            ARRAY_SIZE(feature_levels), D3D11_SDK_VERSION, &r->device,
+            &r->feature_level, &r->context);
     }
     if (!r->device) {
         d3d11_set_error(errp, "D3D11CreateDevice", hr);
@@ -453,8 +462,14 @@ static void pgraph_d3d11_draw_end(NV2AState *d)
         }
         r->draw->prepared = false;
         if (!r->logged_draw_submitted) {
-            qemu_host_emit_log(QEMU_HOST_LOG_INFO,
-                               "D3D11: first NV2A draw submitted");
+            char *message = g_strdup_printf(
+                "D3D11: first NV2A draw submitted color=0x%" HWADDR_PRIx
+                " size=%ux%u pitch=%u pcrtc=0x%" HWADDR_PRIx,
+                r->render_targets.color.vram_address,
+                r->render_targets.color.width, r->render_targets.color.height,
+                r->render_targets.color.pitch, d->pcrtc.start);
+            qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
+            g_free(message);
             r->logged_draw_submitted = true;
         }
         D3D11_RENDER_TARGET_BLEND_DESC1 *blend =
@@ -621,13 +636,21 @@ static bool pgraph_d3d11_present_frame(NV2AState *d)
         d3d11_check_device_removed(r, "swapchain resize");
         return false;
     }
+#ifdef CONFIG_UWP
+    if (!xemu_hud_d3d11_init(r->device, r->context)) {
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
+                           "D3D11: failed to initialize the native HUD");
+        return false;
+    }
+#endif
     if (!pgraph_d3d11_present_color(d, &error)) {
         qemu_host_emit_log(QEMU_HOST_LOG_ERROR, error_get_pretty(error));
         error_free(error);
         d3d11_check_device_removed(r, "presentation draw");
         return false;
     }
-    HRESULT hr = IDXGISwapChain3_Present(r->swapchain, 1, 0);
+    HRESULT hr = IDXGISwapChain3_Present(
+        r->swapchain, g_config.display.window.vsync ? 1 : 0, 0);
     if (FAILED(hr)) {
         d3d11_mark_device_lost(r, "Present", hr);
         return false;

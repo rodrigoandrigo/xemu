@@ -210,7 +210,7 @@ bool pgraph_d3d11_update_rasterizer(NV2AState *d, Error **errp)
         .FillMode = d3d11_fill_mode(raster),
         .CullMode = d3d11_cull_mode(pg, &skip_draw),
         /* The PGRAPH clip-space Y direction is inverted relative to D3D11. */
-        .FrontCounterClockwise = !(raster & NV_PGRAPH_SETUPRASTER_FRONTFACE),
+        .FrontCounterClockwise = !!(raster & NV_PGRAPH_SETUPRASTER_FRONTFACE),
         .DepthBias = integer_depth_bias,
         .DepthBiasClamp = 0.0f,
         .SlopeScaledDepthBias =
@@ -381,6 +381,12 @@ static bool d3d11_pack_vertices(NV2AState *d, D3D11VertexSource source,
 {
     PGRAPHState *pg = &d->pgraph;
     size_t inline_stride = 0;
+    if (first > UINT32_MAX - count ||
+        (source == D3D11_VERTEX_SOURCE_INLINE_BUFFER &&
+         (uint64_t)first + count > pg->inline_buffer_length)) {
+        error_setg(errp, "D3D11: invalid inline vertex range");
+        return false;
+    }
     if (source == D3D11_VERTEX_SOURCE_INLINE_ARRAY) {
         for (unsigned int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
             VertexAttribute *attr = &pg->vertex_attributes[i];
@@ -393,7 +399,7 @@ static bool d3d11_pack_vertices(NV2AState *d, D3D11VertexSource source,
             inline_stride = ROUND_UP(inline_stride, attr->size);
         }
         if (!inline_stride ||
-            (uint64_t)(first + count) * inline_stride >
+            ((uint64_t)first + count) * inline_stride >
                 (uint64_t)pg->inline_array_length * sizeof(uint32_t)) {
             error_setg(errp, "D3D11: invalid NV2A inline vertex array");
             return false;

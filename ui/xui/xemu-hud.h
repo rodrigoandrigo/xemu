@@ -51,6 +51,14 @@ void xemu_hud_process_sdl_events(SDL_Event *event);
 void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
 void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip);
 bool xemu_hud_uses_d3d12(void);
+bool xemu_hud_uses_native_d3d(void);
+bool xemu_hud_d3d11_init(void *device, void *context);
+bool xemu_hud_d3d11_rebuild_fonts(void);
+void xemu_hud_d3d11_shutdown(void);
+void xemu_hud_d3d11_request_reset(void);
+void xemu_hud_d3d11_prepare_frame(void);
+void xemu_hud_d3d11_render(void);
+bool xemu_hud_screenshot_pending(void);
 bool xemu_hud_d3d12_is_initialized(void);
 bool xemu_hud_d3d12_init(void *device, void *command_queue,
                          void *srv_descriptor_heap,

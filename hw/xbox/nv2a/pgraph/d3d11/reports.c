@@ -128,6 +128,7 @@ static bool d3d11_read_query(PGRAPHD3D11State *r, ID3D11Query *query,
                              uint64_t *samples)
 {
     ID3D11DeviceContext_Flush(r->context);
+    int64_t deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
     for (;;) {
         HRESULT hr = ID3D11DeviceContext_GetData(
             r->context, (ID3D11Asynchronous *)query, samples, sizeof(*samples),
@@ -135,13 +136,13 @@ static bool d3d11_read_query(PGRAPHD3D11State *r, ID3D11Query *query,
         if (hr == S_OK) {
             return true;
         }
-        if (FAILED(hr)) {
+        if (FAILED(hr) || g_get_monotonic_time() >= deadline) {
             r->device_lost = true;
             qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
-                               "D3D11: occlusion-query read failed");
+                               "D3D11: occlusion-query failed or timed out");
             return false;
         }
-        Sleep(0);
+        Sleep(1);
     }
 }
 
