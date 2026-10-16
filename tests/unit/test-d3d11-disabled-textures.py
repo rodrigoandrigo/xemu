@@ -6,8 +6,24 @@ import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[2]
 source = (root / "hw/xbox/nv2a/pgraph/d3d11/shaders.c").read_text()
-helper = source[source.index("static void d3d11_texture_coordinate_scale("):
-                source.index("static bool d3d11_update_pixel_constants(")]
+
+
+def extract_function(text, signature):
+    start = text.index(signature)
+    opening = text.index("{", start)
+    depth = 0
+    for end in range(opening, len(text)):
+        if text[end] == "{":
+            depth += 1
+        elif text[end] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:end + 1]
+    raise AssertionError(f"unterminated function: {signature}")
+
+
+helper = extract_function(
+    source, "static void d3d11_texture_coordinate_scale(")
 fixture = r'''
 #include <assert.h>
 #include <stdbool.h>

@@ -2,6 +2,7 @@
 """Exercise actual backbuffer retention and PCRTC lookup on native WARP."""
 import pathlib
 import subprocess
+import sys
 import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[2]
@@ -33,6 +34,7 @@ typedef struct {
     ID3D11Texture2D *texture;
     ID3D11ShaderResourceView *srv;
     uint32_t width, height;
+    uint32_t pitch;
     uint64_t vram_address;
     size_t storage_length;
 } PGRAPHD3D11RenderTarget;
@@ -74,6 +76,7 @@ int main(void) {
         D3D11_SUBRESOURCE_DATA data = {pixels,8,0};
         PGRAPHD3D11RenderTarget target = {0};
         target.width = target.height = 2;
+        target.pitch = 8;
         target.vram_address = i * 4096;
         target.storage_length = 128;
         assert(SUCCEEDED(ID3D11Device_CreateTexture2D(device,&desc,&data,&target.texture)));
@@ -92,7 +95,7 @@ int main(void) {
     for (unsigned int i = 3; i <= 10; i++) {
         d.pcrtc.start = i * 4096 + 64;
         PGRAPHD3D11CachedScanout *entry = d3d11_find_retained_scanout(&d);
-        assert(entry && entry->address == i*4096);
+        assert(entry && entry->address == i*4096 && entry->pitch == 8);
         ID3D11DeviceContext_CopyResource(context,(ID3D11Resource *)staging,
                                          (ID3D11Resource *)entry->texture);
         D3D11_MAPPED_SUBRESOURCE mapped;
@@ -121,7 +124,7 @@ int main(void) {
     PGRAPHD3D11CachedScanout *entry = d3d11_find_retained_scanout(&d);
     assert(entry);
     PGRAPHD3D11RenderTarget replacement = {
-        entry->texture, entry->srv, entry->width, entry->height,
+        entry->texture, entry->srv, entry->width, entry->height, entry->pitch,
         entry->address, entry->length
     };
     ID3D11Texture2D_AddRef(replacement.texture);
@@ -150,11 +153,14 @@ int main(void) {
     puts("PASS: future backbuffers, eight retained surfaces, PCRTC+64, GPU pixels, eviction, CPU invalidation");
 }
 '''
+if sys.platform != "win32":
+    print("SKIP: D3D11 WARP scanout-cache fixture requires Windows/MSYS2")
+    raise SystemExit(0)
+
 with tempfile.TemporaryDirectory(prefix='xemu-scanout-') as directory:
     tmp = pathlib.Path(directory)
     cfile = tmp / 'test.c'
     cfile.write_text(fixture + types + state + retain + lookup + main)
-    subprocess.run(['clang-format', '-i', str(cfile)], check=True)
     exe = tmp / 'test.exe'
     subprocess.run(['gcc', '-Wall', '-Wextra', '-Werror', str(cfile),
                     '-o', str(exe), '-ld3d11'], check=True)

@@ -17,6 +17,7 @@ typedef struct PGRAPHD3D11TextureBinding {
     ID3D11Resource *resource;
     ID3D11ShaderResourceView *view;
     uint64_t data_hash;
+    bool surface_copy;
     hwaddr address;
     size_t length;
     TextureShape shape;
@@ -27,6 +28,10 @@ typedef struct PGRAPHD3D11TextureState {
     ID3D11SamplerState *samplers[NV2A_MAX_TEXTURES];
     D3D11_SAMPLER_DESC sampler_descs[NV2A_MAX_TEXTURES];
     bool sampler_valid[NV2A_MAX_TEXTURES];
+    ID3D11VertexShader *transfer_vertex;
+    ID3D11RasterizerState *transfer_raster;
+    GHashTable *transfer_pixels;
+    bool transfer_disabled;
 } PGRAPHD3D11TextureState;
 
 bool pgraph_d3d11_textures_init(PGRAPHD3D11State *r, Error **errp);

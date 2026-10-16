@@ -110,6 +110,10 @@ static D3D11_BLEND d3d11_alpha_blend_factor(D3D11_BLEND value)
         return D3D11_BLEND_DEST_ALPHA;
     case D3D11_BLEND_INV_DEST_COLOR:
         return D3D11_BLEND_INV_DEST_ALPHA;
+    case D3D11_BLEND_SRC1_COLOR:
+        return D3D11_BLEND_SRC1_ALPHA;
+    case D3D11_BLEND_INV_SRC1_COLOR:
+        return D3D11_BLEND_INV_SRC1_ALPHA;
     case D3D11_BLEND_SRC_ALPHA_SAT:
         return D3D11_BLEND_ONE;
     default:
@@ -173,6 +177,27 @@ static D3D11_BLEND_OP d3d11_blend_op(unsigned int value)
         D3D11_BLEND_OP_ADD,
     };
     return value < ARRAY_SIZE(map) ? map[value] : D3D11_BLEND_OP_ADD;
+}
+
+bool pgraph_d3d11_dual_source_blend(uint32_t blend)
+{
+    return (blend & NV_PGRAPH_BLEND_EN) &&
+           !(blend & NV_PGRAPH_BLEND_LOGICOP_ENABLE) &&
+           d3d11_blend_factors_conflict(
+               GET_MASK(blend, NV_PGRAPH_BLEND_SFACTOR),
+               GET_MASK(blend, NV_PGRAPH_BLEND_DFACTOR),
+               d3d11_blend_op(GET_MASK(blend, NV_PGRAPH_BLEND_EQN)));
+}
+
+static D3D11_BLEND d3d11_dual_source_factor(unsigned int factor)
+{
+    if (factor == NV_PGRAPH_BLEND_SFACTOR_CONSTANT_ALPHA) {
+        return D3D11_BLEND_SRC1_ALPHA;
+    }
+    if (factor == NV_PGRAPH_BLEND_SFACTOR_ONE_MINUS_CONSTANT_ALPHA) {
+        return D3D11_BLEND_INV_SRC1_ALPHA;
+    }
+    return d3d11_blend_factor(factor);
 }
 
 static D3D11_LOGIC_OP d3d11_logic_op(unsigned int value)
@@ -1483,17 +1508,11 @@ bool pgraph_d3d11_update_output_merger(NV2AState *d, Error **errp)
     unsigned int destination_factor = GET_MASK(blend, NV_PGRAPH_BLEND_DFACTOR);
     D3D11_BLEND_OP blend_op =
         d3d11_blend_op(GET_MASK(blend, NV_PGRAPH_BLEND_EQN));
-    if (rt->BlendEnable &&
-        d3d11_blend_factors_conflict(source_factor, destination_factor,
-                                     blend_op)) {
-        error_setg(errp,
-                   "D3D11: simultaneous NV2A CONSTANT_COLOR and "
-                   "CONSTANT_ALPHA blend factors cannot be represented "
-                   "by one D3D11 blend-factor vector");
-        return false;
-    }
-    rt->SrcBlend = d3d11_blend_factor(source_factor);
-    rt->DestBlend = d3d11_blend_factor(destination_factor);
+    bool dual_source = pgraph_d3d11_dual_source_blend(blend);
+    rt->SrcBlend = dual_source ? d3d11_dual_source_factor(source_factor) :
+                                d3d11_blend_factor(source_factor);
+    rt->DestBlend = dual_source ? d3d11_dual_source_factor(destination_factor) :
+                                 d3d11_blend_factor(destination_factor);
     rt->BlendOp = blend_op;
     rt->SrcBlendAlpha = d3d11_alpha_blend_factor(rt->SrcBlend);
     rt->DestBlendAlpha = d3d11_alpha_blend_factor(rt->DestBlend);

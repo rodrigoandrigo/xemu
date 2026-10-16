@@ -16,6 +16,42 @@ registration = source[source.index("bool XemuHost::RegisterNativePresentTarget()
 start = source[source.index("bool XemuHost::Start("):
                source.index("void XemuHost::Run(")]
 assert start.index("RegisterNativePresentTarget()") < start.index("std::thread(")
+attach_start = source.index("long __cdecl XemuHost::AttachMesaSwapChain(")
+attach_end = source.index("bool XemuHost::UpdateRenderPanelSize(", attach_start)
+attach = source[attach_start:attach_end]
+assert "const bool detach = nativeSwapChain == nullptr;" in attach
+assert "panelNative->SetSwapChain(nullptr)" in attach
+assert "state->swapChain.Reset()" in attach
+assert "if (!detach && !state->active.load())" in attach
+assert "state->requestedSwapChain = retainedSwapChain" in attach
+assert "state->requestGeneration" in attach
+assert "state->pending.store(true)" in attach
+assert "recordResult(result)" in attach
+assert "state->pending.store(false)" in attach
+assert "state->requestGeneration != generation" in attach
+
+host_error = source[source.index("std::string XemuHost::LastError() const"):
+                    source.index("void XemuHost::WriteDiagnostic(")]
+assert "bool XemuHost::RetrySwapChainAttach()" in host_error
+assert "bool XemuHost::IsSwapChainAttachPending() const" in host_error
+page = (root / "UWP-Port/DirectXPage.xaml.cpp").read_text(encoding="utf-8")
+rendering_start = page.index("void DirectXPage::OnRendering(")
+rendering_end = page.index("void DirectXPage::UpdateFpsOverlay(", rendering_start)
+rendering = page[rendering_start:rendering_end]
+assert "m_xemu->LastError()" in rendering
+assert "m_xemu->RetrySwapChainAttach()" in rendering
+assert "m_xemu->IsSwapChainAttachPending()" in rendering
+
+renderer = (root / "hw/xbox/nv2a/pgraph/d3d11/renderer.c").read_text(
+    encoding="utf-8"
+)
+release_start = renderer.index("static void d3d11_release_device_resources(")
+release_end = renderer.index("static void d3d11_release_state(", release_start)
+release = renderer[release_start:release_end]
+assert "target.attach(target.opaque, NULL)" in release
+assert release.index("d3d11_release_backbuffer(r);") < release.index("target.attach")
+assert release.index("target.attach") < release.index("IDXGISwapChain3_Release")
+
 for begin, end in [("bool XemuHost::AttachRenderPanel(",
                     "bool XemuHost::ResolveSDLInput()"),
                    ("bool XemuHost::UpdateRenderPanelSize(",
@@ -25,14 +61,19 @@ for begin, end in [("bool XemuHost::AttachRenderPanel(",
 
 fixture = r"""
 #include <cassert>
+#include <atomic>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <string>
 using Attach = long (*)(void *, void *);
+struct AttachState { std::atomic<long> lastResult{0}; };
 struct XemuHost {
     int (*m_setD3D12PresentTarget)(uint32_t, uint32_t, Attach, void *) = nullptr;
     void *m_renderPanel = nullptr;
     uint32_t m_renderWidth = 0, m_renderHeight = 0;
+    std::shared_ptr<AttachState> m_swapChainAttachState =
+        std::make_shared<AttachState>();
     std::string error, diagnostic;
     bool RegisterNativePresentTarget();
     static long AttachMesaSwapChain(void *, void *) { return 0; }

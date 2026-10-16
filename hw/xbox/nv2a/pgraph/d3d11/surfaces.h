@@ -48,6 +48,7 @@ void pgraph_d3d11_surfaces_finalize(PGRAPHD3D11State *r);
 bool pgraph_d3d11_render_targets_update(NV2AState *d, bool color, bool zeta,
                                         Error **errp);
 bool pgraph_d3d11_update_output_merger(NV2AState *d, Error **errp);
+bool pgraph_d3d11_dual_source_blend(uint32_t blend);
 void pgraph_d3d11_bind_render_targets(PGRAPHD3D11State *r);
 D3D11_RECT pgraph_d3d11_gl_scissor_rect(uint32_t viewport_height,
                                          uint32_t x, uint32_t y,

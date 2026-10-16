@@ -50,6 +50,9 @@ void pgraph_d3d11_draw_finalize(PGRAPHD3D11State *r)
     if (r->draw->index_buffer) {
         ID3D11Buffer_Release(r->draw->index_buffer);
     }
+    if (r->draw->raster_constants) {
+        ID3D11Buffer_Release(r->draw->raster_constants);
+    }
     g_free(r->draw);
     r->draw = NULL;
 }
@@ -59,6 +62,8 @@ void pgraph_d3d11_draw_trim(PGRAPHD3D11State *r)
     if (!r->draw) {
         return;
     }
+    ID3D11Buffer *no_constants = NULL;
+    ID3D11DeviceContext_GSSetConstantBuffers(r->context, 1, 1, &no_constants);
     if (r->draw->rasterizer_state) {
         ID3D11RasterizerState_Release(r->draw->rasterizer_state);
         r->draw->rasterizer_state = NULL;
@@ -70,6 +75,10 @@ void pgraph_d3d11_draw_trim(PGRAPHD3D11State *r)
     if (r->draw->index_buffer) {
         ID3D11Buffer_Release(r->draw->index_buffer);
         r->draw->index_buffer = NULL;
+    }
+    if (r->draw->raster_constants) {
+        ID3D11Buffer_Release(r->draw->raster_constants);
+        r->draw->raster_constants = NULL;
     }
     r->draw->rasterizer_state_valid = false;
     r->draw->vertex_buffer_size = 0;
@@ -146,23 +155,6 @@ static bool d3d11_antialiased_line_enable(bool multisample_enabled,
                                           bool line_smooth_enabled)
 {
     return !multisample_enabled && line_smooth_enabled;
-}
-
-static bool d3d11_wide_line_smoothing_requested(
-    bool multisample_enabled, bool line_smooth_enabled, bool wide_lines)
-{
-    return !multisample_enabled && line_smooth_enabled && wide_lines;
-}
-
-static bool d3d11_polygon_smoothing_requested(
-    bool multisample_enabled, bool polygon_smooth_enabled,
-    enum ShaderPrimitiveMode primitive_mode, unsigned int front_polygon_mode,
-    unsigned int back_polygon_mode)
-{
-    return !multisample_enabled && polygon_smooth_enabled &&
-           primitive_mode >= PRIM_TYPE_TRIANGLES &&
-           front_polygon_mode == POLY_MODE_FILL &&
-           back_polygon_mode == POLY_MODE_FILL;
 }
 
 static bool d3d11_finite_float(float value)
@@ -262,25 +254,11 @@ bool pgraph_d3d11_update_rasterizer(NV2AState *d, Error **errp)
     bool anti_aliasing = !!GET_MASK(
         pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING),
         NV_PGRAPH_ANTIALIASING_ENABLE);
-    bool polygon_smoothing_requested = d3d11_polygon_smoothing_requested(
-        anti_aliasing,
-        !!(raster & NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE),
-        pg->primitive_mode, polygon_mode, back_polygon_mode);
-    if (polygon_smoothing_requested) {
-        warn_report_once(
-            "D3D11: NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE is enabled for a "
-            "filled polygon draw, but fixed-function polygon smoothing is "
-            "unsupported and will be ignored");
-    }
-    bool wide_line_smoothing_requested = d3d11_wide_line_smoothing_requested(
-        anti_aliasing,
-        !!(raster & NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE), wide_lines);
-    if (wide_line_smoothing_requested) {
-        warn_report_once(
-            "D3D11: NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE is enabled for a "
-            "wide-line draw without PGRAPH anti-aliasing, but geometry-expanded "
-            "filled quads do not reproduce GL_LINE_SMOOTH coverage and will be "
-            "rendered without line smoothing");
+    bool raster_geometry = pgraph_d3d11_needs_raster_geometry(pg);
+    if (raster_geometry) {
+        /* Cull the source polygon in the GS, before expanding its edges. */
+        cull_mode = D3D11_CULL_NONE;
+        skip_draw = false;
     }
     float depth_bias = 0.0f, slope_bias = 0.0f;
     if (d3d11_polygon_offset_enabled(pg, raster)) {
@@ -299,19 +277,19 @@ bool pgraph_d3d11_update_rasterizer(NV2AState *d, Error **errp)
                 (int32_t)(depth_bias + (depth_bias >= 0 ? 0.5f : -0.5f));
     }
     D3D11_RASTERIZER_DESC desc = {
-        .FillMode = (wide_lines || point_primitive || polygon_point_mode) ?
+        .FillMode = (raster_geometry || wide_lines || point_primitive || polygon_point_mode) ?
                         D3D11_FILL_SOLID : d3d11_fill_mode(raster),
         .CullMode = cull_mode,
         /* The PGRAPH clip-space Y direction is inverted relative to D3D11. */
         .FrontCounterClockwise = !!(raster & NV_PGRAPH_SETUPRASTER_FRONTFACE),
-        .DepthBias = integer_depth_bias,
+        .DepthBias = raster_geometry ? 0 : integer_depth_bias,
         .DepthBiasClamp = 0.0f,
         .SlopeScaledDepthBias =
-            d3d11_finite_float(slope_bias) ? slope_bias : 0.0f,
+            !raster_geometry && d3d11_finite_float(slope_bias) ? slope_bias : 0.0f,
         .DepthClipEnable = FALSE,
         .ScissorEnable = TRUE,
         .MultisampleEnable = anti_aliasing,
-        .AntialiasedLineEnable = d3d11_antialiased_line_enable(
+        .AntialiasedLineEnable = !raster_geometry && d3d11_antialiased_line_enable(
             anti_aliasing,
             !!(raster & NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE)),
     };
@@ -727,6 +705,38 @@ static bool d3d11_emit_draw(NV2AState *d, D3D11VertexSource source,
     if (!d3d11_upload_vertices(d, source, first, vertex_count, state_vertex,
                                errp)) {
         return false;
+    }
+    if (r->shaders->raster_geometry && pg->primitive_mode == PRIM_TYPE_POLYGON) {
+        if (!r->draw->raster_constants) {
+            D3D11_BUFFER_DESC desc = {
+                .ByteWidth = 16, .Usage = D3D11_USAGE_DYNAMIC,
+                .BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+                .CPUAccessFlags = D3D11_CPU_ACCESS_WRITE,
+            };
+            HRESULT hr = ID3D11Device_CreateBuffer(
+                r->device, &desc, NULL, &r->draw->raster_constants);
+            if (FAILED(hr)) {
+                error_setg(errp, "D3D11: raster draw constants creation failed (0x%08lx)",
+                           (unsigned long)hr);
+                return false;
+            }
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        HRESULT hr = ID3D11DeviceContext_Map(r->context,
+            (ID3D11Resource *)r->draw->raster_constants, 0,
+            D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (FAILED(hr)) {
+            error_setg(errp, "D3D11: raster draw constants map failed (0x%08lx)",
+                       (unsigned long)hr);
+            return false;
+        }
+        uint32_t count = source_indices ? source_index_count : vertex_count;
+        uint32_t constants[4] = { count > 2 ? count - 2 : 0, 0, 0, 0 };
+        memcpy(mapped.pData, constants, sizeof(constants));
+        ID3D11DeviceContext_Unmap(r->context,
+            (ID3D11Resource *)r->draw->raster_constants, 0);
+        ID3D11DeviceContext_GSSetConstantBuffers(r->context, 1, 1,
+            &r->draw->raster_constants);
     }
     D3D11_PRIMITIVE_TOPOLOGY topology;
     bool native = d3d11_native_topology(pg->primitive_mode, &topology);

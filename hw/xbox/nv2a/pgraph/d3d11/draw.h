@@ -19,6 +19,7 @@ typedef struct PGRAPHD3D11DrawState {
     bool prepared;
     ID3D11Buffer *vertex_buffer;
     ID3D11Buffer *index_buffer;
+    ID3D11Buffer *raster_constants;
     size_t vertex_buffer_size;
     size_t index_buffer_size;
 } PGRAPHD3D11DrawState;

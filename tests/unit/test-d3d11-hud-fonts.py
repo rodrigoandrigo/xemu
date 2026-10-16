@@ -2,6 +2,7 @@
 """Check the real HUD atlas rebuild helper with ImGui and offscreen WARP."""
 import pathlib
 import subprocess
+import sys
 import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[2]
@@ -11,6 +12,10 @@ helper = source[source.index("bool xemu_hud_d3d11_rebuild_fonts("):
                 source.index("void xemu_hud_d3d11_shutdown(")]
 font_manager = (root / "ui/xui/font-manager.cc").read_text()
 assert "xemu_hud_d3d11_rebuild_fonts();" in font_manager
+if sys.platform != "win32" or not imgui.is_dir():
+    print("SKIP: HUD D3D11/WARP fixture requires Windows/MSYS2 and the ImGui submodule")
+    raise SystemExit(0)
+
 fixture = r'''
 #include <cassert>
 #include <cstdio>

@@ -10,12 +10,36 @@
 #include "qemu/osdep.h"
 #include "qemu/fast-hash.h"
 #include "qapi/error.h"
+#include "qemu/qemu-host.h"
 #include "hw/xbox/nv2a/nv2a.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/nv2a/pgraph/s3tc.h"
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
 #include "hw/xbox/nv2a/pgraph/texture.h"
 #include "renderer.h"
+#include <d3dcompiler.h>
+
+static void d3d11_transfer_pixel_release(gpointer data)
+{
+    ID3D11PixelShader_Release((ID3D11PixelShader *)data);
+}
+
+static void d3d11_transfer_trim(PGRAPHD3D11TextureState *textures)
+{
+    textures->transfer_disabled = false;
+    if (textures->transfer_vertex) {
+        ID3D11VertexShader_Release(textures->transfer_vertex);
+        textures->transfer_vertex = NULL;
+    }
+    if (textures->transfer_raster) {
+        ID3D11RasterizerState_Release(textures->transfer_raster);
+        textures->transfer_raster = NULL;
+    }
+    if (textures->transfer_pixels) {
+        g_hash_table_unref(textures->transfer_pixels);
+        textures->transfer_pixels = NULL;
+    }
+}
 
 static void d3d11_release_texture(PGRAPHD3D11TextureBinding *binding)
 {
@@ -46,6 +70,7 @@ void pgraph_d3d11_textures_finalize(PGRAPHD3D11State *r)
             ID3D11SamplerState_Release(r->textures->samplers[i]);
         }
     }
+    d3d11_transfer_trim(r->textures);
     g_free(r->textures);
     r->textures = NULL;
 }
@@ -69,6 +94,7 @@ void pgraph_d3d11_textures_trim(PGRAPHD3D11State *r)
         }
         r->textures->sampler_valid[i] = false;
     }
+    d3d11_transfer_trim(r->textures);
 }
 
 static uint8_t expand_bits(uint32_t value, unsigned int bits)
@@ -665,7 +691,7 @@ static bool d3d11_cubemap_shape_valid(bool cubemap, bool linear_format,
 static bool d3d11_cubemap_border_mips_supported(bool cubemap, bool border,
                                                 unsigned int levels)
 {
-    return !cubemap || !border || levels <= 1;
+    return !cubemap || !border || levels > 0;
 }
 
 static bool d3d11_texture_shape_valid(TextureShape shape)
@@ -706,10 +732,20 @@ static bool d3d11_texture_shape_valid(TextureShape shape)
     }
 
     unsigned int resource_width, resource_height, resource_depth;
-    return d3d11_border_resource_dimensions(
+    if (!d3d11_border_resource_dimensions(
         shape.border, linear_format, shape.dimensionality, shape.width,
         shape.height, shape.depth, &resource_width, &resource_height,
-        &resource_depth);
+        &resource_depth)) {
+        return false;
+    }
+    unsigned int extent =
+        MAX(resource_width, MAX(resource_height, resource_depth));
+    unsigned int max_levels = 0;
+    do {
+        max_levels++;
+        extent >>= 1;
+    } while (extent);
+    return levels <= max_levels;
 }
 
 static bool d3d11_update_sampler(PGRAPHD3D11State *r, PGRAPHState *pg,
@@ -788,7 +824,7 @@ static bool d3d11_create_texture(NV2AState *d, unsigned int stage,
     if (!d3d11_cubemap_border_mips_supported(
             shape.cubemap, shape.border, levels)) {
         error_setg(errp,
-                   "D3D11: bordered cubemap mip chains have no defined NV2A upload layout");
+                   "D3D11: invalid bordered cubemap mip count");
         return false;
     }
     if (!d3d11_cubemap_shape_valid(shape.cubemap, linear_format,
@@ -814,9 +850,11 @@ static bool d3d11_create_texture(NV2AState *d, unsigned int stage,
     unsigned int source_width = resource_width;
     unsigned int source_height = resource_height;
     unsigned int source_depth = resource_depth;
-    /* The GL cubemap loader discards the four-texel border.  Its mip-chain
-     * handling does not provide a well-defined D3D-compatible layout, so this
-     * exact crop is limited to the unambiguous single-level case. */
+    /* Match Vulkan's physical face/mip layout. Keep complete bordered faces
+     * for mip chains: cropping integer texels cannot retain a fractional
+     * border in the smaller levels. The shader maps logical cube directions
+     * into the stored face. Preserve the existing single-level crop path.
+     */
     bool discard_cube_border = shape.cubemap && shape.border &&
                                 !linear_format && levels == 1;
     if (discard_cube_border) {
@@ -948,6 +986,735 @@ static bool d3d11_create_texture(NV2AState *d, unsigned int stage,
     return true;
 }
 
+static char *d3d11_transfer_pixel_source(unsigned int source_format, bool depth,
+                                         bool z_float,
+                                         unsigned int destination_format)
+{
+    GString *s = g_string_new(
+        "Texture2D<float4> colorImage:register(t0);\n"
+        "Texture2D<float> depthImage:register(t0);\n"
+        "Texture2D<uint4> stencilImage:register(t1);\n"
+        "uint f16(float v){v=clamp(v,0.0,511.9375);if(v==0)return 0;"
+        "uint u=asuint(v);return "
+        "u<=0x3c000000u?1:min((u-0x3c000000u+0x400u)>>11,65535u);}\n"
+        "float unf16(uint u){uint e=(u>>10)&31u,m=u&1023u;"
+        "float v=e==0?m*exp2(-24.0):e==31?asfloat(0x7f800000u|(m<<13)):"
+        "(1.0+m/1024.0)*exp2((float)e-15.0);return (u&32768u)?-v:v;}\n"
+        "uint f24(float v){v=clamp(v,0.0,1.0e30);"
+        "return v==0?0:min((asuint(v)+0x40u)>>7,0xffffffu);}\n"
+        "float4 main(float4 position:SV_Position):SV_Target{\n"
+        "int3 p=int3(position.xy,0);uint bits=0;\n");
+    if (depth) {
+        g_string_append(s, "float z=saturate(depthImage.Load(p));\n");
+        if (source_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16) {
+            g_string_append(s, z_float ? "bits=f16(z*511.9375);\n" :
+                                         "bits=(uint)(z*65535.0+0.5);\n");
+        } else {
+            g_string_append(
+                s, "uint dz=min((uint)round(z*16777215.0),0xffffffu);\n");
+            if (z_float) {
+                g_string_append(s, "dz=f24(dz/16777215.0*1.0e30);\n");
+            }
+            g_string_append(s, "bits=(dz<<8)|(stencilImage.Load(p).g&255u);\n");
+        }
+    } else {
+        g_string_append(
+            s, "uint4 c=(uint4)(saturate(colorImage.Load(p))*255.0+0.5);\n");
+        switch (source_format) {
+        case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5:
+        case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5:
+            g_string_append_printf(
+                s,
+                "bits=((c.r>>3)<<10)|((c.g>>3)<<5)|(c.b>>3)|(%s?32768u:0u);\n",
+                source_format ==
+                        NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5 ?
+                    "true" :
+                    "c.a>=128u");
+            break;
+        case NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5:
+            g_string_append(s, "bits=((c.r>>3)<<11)|((c.g>>2)<<5)|(c.b>>3);\n");
+            break;
+        case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8:
+            g_string_append(s, "bits=c.r;\n");
+            break;
+        case NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8:
+            g_string_append(s, "bits=c.r|(c.g<<8);\n");
+            break;
+        case NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8:
+            g_string_append(s, "bits=c.b|(c.g<<8)|(c.r<<16)|0xff000000u;\n");
+            break;
+        case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8:
+        case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8:
+            g_string_append_printf(
+                s,
+                "bits=c.b|(c.g<<8)|(c.r<<16)|((((c.a*127u+127u)/"
+                "255u)|%uu)<<24);\n",
+                source_format ==
+                        NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8 ?
+                    128 :
+                    0);
+            break;
+        default:
+            g_string_append(s, "bits=c.b|(c.g<<8)|(c.r<<16)|(c.a<<24);\n");
+            break;
+        }
+    }
+    const char *expression = NULL;
+    switch (destination_format) {
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8:
+        expression = "float4((bits&255u).xxx,255)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_AY8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_AY8:
+        expression = "float4((bits&255u).xxxx)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8:
+        expression = "float4(255,255,255,bits&255u)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8Y8:
+        expression = "float4((bits&255u).xxx,(bits>>8)&255u)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_G8B8:
+        expression =
+            "float4(bits&255u,(bits>>8)&255u,bits&255u,(bits>>8)&255u)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8:
+        expression =
+            "float4((bits>>8)&255u,bits&255u,bits&255u,(bits>>8)&255u)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A1R5G5B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X1R5G5B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5:
+        g_string_append_printf(
+            s,
+            "return float4(((bits>>10)&31u)*255u/31u,((bits>>5)&31u)*255u/31u,"
+            "(bits&31u)*255u/31u,%s)/255.0;}\n",
+            destination_format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X1R5G5B5 ||
+                    destination_format ==
+                        NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5 ?
+                "255" :
+                "(bits&32768u)?255:0");
+        return g_string_free(s, FALSE);
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R5G6B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5:
+        expression = "float4(((bits>>11)&31u)*255u/31u,((bits>>5)&63u)*255u/"
+                     "63u,(bits&31u)*255u/31u,255)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A4R4G4B4:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A4R4G4B4:
+        expression = "float4(((bits>>8)&15u)*17u,((bits>>4)&15u)*17u,(bits&15u)"
+                     "*17u,((bits>>12)&15u)*17u)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8:
+        expression =
+            "float4((bits>>16)&255u,(bits>>8)&255u,bits&255u,bits>>24)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8:
+        expression = "float4((bits>>16)&255u,(bits>>8)&255u,bits&255u,255)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8:
+        expression =
+            "float4(bits&255u,(bits>>8)&255u,(bits>>16)&255u,bits>>24)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_B8G8R8A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8:
+        expression =
+            "float4(bits>>24,(bits>>16)&255u,(bits>>8)&255u,bits&255u)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y16:
+        g_string_append(
+            s, "float y=(bits&65535u)/65535.0;return float4(y,y,y,1);}\n");
+        return g_string_free(s, FALSE);
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5:
+        g_string_append(s, "bits^=528u;int r=(int)(((bits>>10)&63u)*127u/63u);"
+                           "int g=(int)(((bits>>5)&31u)*255u/31u)-128;"
+                           "int b=(int)((bits&31u)*255u/31u)-128;"
+                           "return float4(r,g,b,127)/127.0;}\n");
+        return g_string_free(s, FALSE);
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_DEPTH_Y16_FIXED:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FIXED:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FLOAT:
+        if (destination_format ==
+            NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FLOAT) {
+            g_string_append(
+                s, "bits=(uint)(saturate(unf16(bits&65535u))*65535.0+0.5);\n");
+        }
+        expression = "float4((bits>>8)&255u,bits&255u,0,255)";
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FIXED:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FLOAT:
+        expression = "float4(bits>>24,(bits>>16)&255u,(bits>>8)&255u,255)";
+        break;
+    default:
+        g_string_free(s, TRUE);
+        return NULL;
+    }
+    g_string_append_printf(s, "return %s/255.0;}\n", expression);
+    return g_string_free(s, FALSE);
+}
+
+static bool d3d11_transfer_shaders(PGRAPHD3D11State *r,
+                                   const PGRAPHD3D11RenderTarget *target,
+                                   bool depth, unsigned int format,
+                                   ID3D11PixelShader **pixel, Error **errp)
+{
+    PGRAPHD3D11TextureState *t = r->textures;
+    const char *vertex_source = "float4 main(uint id:SV_VertexID):SV_Position{"
+                                "return float4(id==1?3:-1,id==2?3:-1,0,1);}";
+    ID3DBlob *code = NULL, *errors = NULL;
+    HRESULT hr = S_OK;
+    if (!t->transfer_vertex) {
+        hr = D3DCompile(vertex_source, strlen(vertex_source), "surface-copy-vs",
+                        NULL, NULL, "main", "vs_4_0",
+                        D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, &errors);
+        if (SUCCEEDED(hr)) {
+            hr = ID3D11Device_CreateVertexShader(
+                r->device, ID3D10Blob_GetBufferPointer(code),
+                ID3D10Blob_GetBufferSize(code), NULL, &t->transfer_vertex);
+        }
+        if (code) {
+            ID3D10Blob_Release(code);
+            code = NULL;
+        }
+    }
+    if (SUCCEEDED(hr) && !t->transfer_raster) {
+        D3D11_RASTERIZER_DESC desc = {
+            .FillMode = D3D11_FILL_SOLID,
+            .CullMode = D3D11_CULL_NONE,
+        };
+        hr = ID3D11Device_CreateRasterizerState(r->device, &desc,
+                                                &t->transfer_raster);
+    }
+    if (!t->transfer_pixels) {
+        t->transfer_pixels = g_hash_table_new_full(
+            g_direct_hash, g_direct_equal, NULL, d3d11_transfer_pixel_release);
+    }
+    unsigned int key = 1 + format + (target->nv2a_format << 8) +
+                       ((unsigned int)depth << 16) +
+                       ((unsigned int)target->z_format << 17);
+    *pixel = g_hash_table_lookup(t->transfer_pixels, GUINT_TO_POINTER(key));
+    if (SUCCEEDED(hr) && !*pixel) {
+        if (errors) {
+            ID3D10Blob_Release(errors);
+            errors = NULL;
+        }
+        char *source = d3d11_transfer_pixel_source(target->nv2a_format, depth,
+                                                   target->z_format, format);
+        if (!source) {
+            error_setg(errp, "D3D11: unhandled surface transfer format");
+            if (errors) {
+                ID3D10Blob_Release(errors);
+            }
+            return false;
+        }
+        hr = D3DCompile(source, strlen(source), "surface-copy-ps", NULL, NULL,
+                        "main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0,
+                        &code, &errors);
+        g_free(source);
+        if (SUCCEEDED(hr)) {
+            hr = ID3D11Device_CreatePixelShader(
+                r->device, ID3D10Blob_GetBufferPointer(code),
+                ID3D10Blob_GetBufferSize(code), NULL, pixel);
+        }
+        if (SUCCEEDED(hr)) {
+            if (g_hash_table_size(t->transfer_pixels) >= 128) {
+                g_hash_table_remove_all(t->transfer_pixels);
+            }
+            g_hash_table_insert(t->transfer_pixels, GUINT_TO_POINTER(key),
+                                *pixel);
+        }
+    }
+    if (FAILED(hr)) {
+        error_setg(errp, "D3D11: surface transfer shaders failed (0x%08lx): %s",
+                   (unsigned long)hr,
+                   errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "");
+    }
+    if (code) {
+        ID3D10Blob_Release(code);
+    }
+    if (errors) {
+        ID3D10Blob_Release(errors);
+    }
+    return SUCCEEDED(hr);
+}
+
+static bool d3d11_transfer_views(PGRAPHD3D11State *r,
+                                 const PGRAPHD3D11RenderTarget *target,
+                                 bool depth, ID3D11ShaderResourceView **views,
+                                 Error **errp)
+{
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D_GetDesc(target->texture, &desc);
+    DXGI_FORMAT view_format = desc.Format;
+    if (depth) {
+        if (desc.Format == DXGI_FORMAT_D16_UNORM) {
+            desc.Format = DXGI_FORMAT_R16_TYPELESS;
+            view_format = DXGI_FORMAT_R16_UNORM;
+        } else if (desc.Format == DXGI_FORMAT_D32_FLOAT) {
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+            view_format = DXGI_FORMAT_R32_FLOAT;
+        } else if (desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+            desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+            view_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        } else {
+            error_setg(errp, "D3D11: unknown surface transfer depth format");
+            return false;
+        }
+    }
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+    ID3D11Texture2D *copy = NULL;
+    HRESULT hr = ID3D11Device_CreateTexture2D(r->device, &desc, NULL, &copy);
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv = {
+        .Format = view_format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipLevels = 1 },
+    };
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateShaderResourceView(
+            r->device, (ID3D11Resource *)copy, &srv, &views[0]);
+    }
+    if (SUCCEEDED(hr) && depth && desc.Format == DXGI_FORMAT_R24G8_TYPELESS) {
+        srv.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        hr = ID3D11Device_CreateShaderResourceView(
+            r->device, (ID3D11Resource *)copy, &srv, &views[1]);
+    }
+    if (SUCCEEDED(hr)) {
+        ID3D11DeviceContext_OMSetRenderTargets(r->context, 0, NULL, NULL);
+        ID3D11DeviceContext_CopyResource(r->context, (ID3D11Resource *)copy,
+                                         (ID3D11Resource *)target->texture);
+        pgraph_d3d11_bind_render_targets(r);
+    } else {
+        error_setg(errp, "D3D11: surface transfer SRV failed (0x%08lx)",
+                   (unsigned long)hr);
+    }
+    if (copy) {
+        ID3D11Texture2D_Release(copy);
+    }
+    return SUCCEEDED(hr);
+}
+
+static void d3d11_transfer_draw(PGRAPHD3D11State *r,
+                                ID3D11RenderTargetView *destination,
+                                ID3D11ShaderResourceView **sources,
+                                ID3D11PixelShader *pixel, UINT width,
+                                UINT height)
+{
+    ID3D11DeviceContext *c = r->context;
+    ID3D11VertexShader *vs = NULL;
+    ID3D11PixelShader *ps = NULL;
+    ID3D11GeometryShader *gs = NULL;
+    ID3D11InputLayout *layout = NULL;
+    ID3D11RasterizerState *raster = NULL;
+    ID3D11BlendState *blend = NULL;
+    FLOAT factors[4];
+    UINT mask, viewport_count =
+                   D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    D3D11_VIEWPORT
+    viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    D3D11_PRIMITIVE_TOPOLOGY topology;
+    ID3D11DeviceContext_VSGetShader(c, &vs, NULL, NULL);
+    ID3D11DeviceContext_PSGetShader(c, &ps, NULL, NULL);
+    ID3D11DeviceContext_GSGetShader(c, &gs, NULL, NULL);
+    ID3D11DeviceContext_IAGetInputLayout(c, &layout);
+    ID3D11DeviceContext_IAGetPrimitiveTopology(c, &topology);
+    ID3D11DeviceContext_RSGetState(c, &raster);
+    ID3D11DeviceContext_RSGetViewports(c, &viewport_count, viewports);
+    ID3D11DeviceContext_OMGetBlendState(c, &blend, factors, &mask);
+    ID3D11DeviceContext_IASetInputLayout(c, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(
+        c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(c, r->textures->transfer_vertex, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(c, NULL, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, pixel, NULL, 0);
+    ID3D11DeviceContext_RSSetState(c, r->textures->transfer_raster);
+    D3D11_VIEWPORT viewport = { .Width = width,
+                                .Height = height,
+                                .MaxDepth = 1 };
+    ID3D11DeviceContext_RSSetViewports(c, 1, &viewport);
+    ID3D11DeviceContext_OMSetBlendState(c, NULL, NULL, UINT_MAX);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 1, &destination, NULL);
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 2, sources);
+    ID3D11DeviceContext_Draw(c, 3, 0);
+    ID3D11ShaderResourceView *empty[2] = { 0 };
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 2, empty);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
+    pgraph_d3d11_bind_render_targets(r);
+    ID3D11DeviceContext_OMSetBlendState(c, blend, factors, mask);
+    ID3D11DeviceContext_RSSetState(c, raster);
+    ID3D11DeviceContext_RSSetViewports(c, viewport_count, viewports);
+    ID3D11DeviceContext_IASetInputLayout(c, layout);
+    ID3D11DeviceContext_IASetPrimitiveTopology(c, topology);
+    ID3D11DeviceContext_VSSetShader(c, vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, ps, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(c, gs, NULL, 0);
+    if (vs) {
+        ID3D11VertexShader_Release(vs);
+    }
+    if (ps) {
+        ID3D11PixelShader_Release(ps);
+    }
+    if (gs) {
+        ID3D11GeometryShader_Release(gs);
+    }
+    if (layout) {
+        ID3D11InputLayout_Release(layout);
+    }
+    if (raster) {
+        ID3D11RasterizerState_Release(raster);
+    }
+    if (blend) {
+        ID3D11BlendState_Release(blend);
+    }
+}
+
+/* Like vk/texture.c's surface compatibility gate, require the same guest
+ * extent and layout before taking a GPU snapshot. Unlike the Vulkan bitcast
+ * path, this first path only accepts identical ARGB8 texel interpretations.
+ */
+static bool
+d3d11_surface_texture_compatible(const PGRAPHD3D11RenderTarget *target,
+                                 const Surface *surface, TextureShape shape,
+                                 hwaddr address, size_t length)
+{
+    bool linear =
+        shape.color_format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8;
+    bool swizzled =
+        shape.color_format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8;
+    return (linear || swizzled) && target->texture && surface->draw_dirty &&
+           !surface->buffer_dirty && target->vram_address == address &&
+           target->storage_length == length &&
+           target->nv2a_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8 &&
+           target->format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+           shape.dimensionality == 2 && !shape.cubemap && !shape.border &&
+           shape.levels == 1 && shape.min_mipmap_level == 0 &&
+           shape.width == target->guest_width &&
+           shape.height == target->guest_height &&
+           ((linear && target->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_PITCH &&
+             shape.pitch == target->pitch) ||
+            (swizzled && target->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE));
+}
+
+static bool d3d11_snapshot_surface(PGRAPHD3D11State *r,
+                                   PGRAPHD3D11TextureBinding *binding,
+                                   const PGRAPHD3D11RenderTarget *target,
+                                   TextureShape shape, Error **errp)
+{
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D_GetDesc(target->texture, &desc);
+    bool reuse = false;
+    if (binding->surface_copy && binding->resource) {
+        D3D11_TEXTURE2D_DESC old;
+        ID3D11Texture2D_GetDesc((ID3D11Texture2D *)binding->resource, &old);
+        reuse = old.Width == desc.Width && old.Height == desc.Height &&
+                old.Format == desc.Format;
+    }
+    if (!reuse) {
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+        ID3D11Texture2D *texture = NULL;
+        ID3D11ShaderResourceView *view = NULL;
+        HRESULT hr = ID3D11Device_CreateTexture2D(r->device, &desc, NULL, &texture);
+        if (SUCCEEDED(hr)) {
+            hr = ID3D11Device_CreateShaderResourceView(
+                r->device, (ID3D11Resource *)texture, NULL, &view);
+        }
+        if (FAILED(hr)) {
+            if (view) {
+                ID3D11ShaderResourceView_Release(view);
+            }
+            if (texture) {
+                ID3D11Texture2D_Release(texture);
+            }
+            error_setg(errp, "D3D11: surface snapshot allocation failed (0x%08lx)",
+                       (unsigned long)hr);
+            return false;
+        }
+        d3d11_release_texture(binding);
+        binding->resource = (ID3D11Resource *)texture;
+        binding->view = view;
+    }
+    /* Never sample the live RTV or copy into a still-bound SRV. All PS SRVs
+     * are unbound at bind_textures entry; restore the OM after the copy.
+     */
+    ID3D11DeviceContext_OMSetRenderTargets(r->context, 0, NULL, NULL);
+    ID3D11DeviceContext_CopyResource(r->context, binding->resource,
+                                    (ID3D11Resource *)target->texture);
+    pgraph_d3d11_bind_render_targets(r);
+    binding->surface_copy = true;
+    binding->shape = shape;
+    binding->address = target->vram_address;
+    binding->length = target->storage_length;
+    return true;
+}
+
+static bool d3d11_transfer_chain(NV2AState *d, unsigned int stage,
+                                 TextureShape shape, hwaddr address,
+                                 size_t length, bool *handled, Error **errp)
+{
+    *handled = false;
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHD3D11State *r = pg->d3d11_renderer_state;
+    BasicColorFormatInfo format =
+        kelvin_color_format_info_map[shape.color_format];
+    if (r->textures->transfer_disabled || shape.dimensionality != 2 ||
+        shape.border) {
+        return true;
+    }
+    char *probe =
+        d3d11_transfer_pixel_source(NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8,
+                                    false, false, shape.color_format);
+    if (!probe) {
+        return true;
+    }
+    g_free(probe);
+    unsigned int levels =
+        d3d11_effective_mip_levels(format.linear, shape.levels);
+    unsigned int faces = shape.cubemap ? 6 : 1;
+    size_t face_size = length / faces;
+    PGRAPHD3D11RenderTarget *targets[] = {
+        &r->render_targets.color,
+        &r->render_targets.depth_stencil,
+    };
+    Surface *surfaces[] = { &pg->surface_color, &pg->surface_zeta };
+    struct {
+        unsigned int subresource, width, height;
+        bool found;
+    } plan[2] = { 0 };
+    unsigned int scale = 0;
+    for (unsigned int i = 0; i < 2; i++) {
+        PGRAPHD3D11RenderTarget *t = targets[i];
+        if (!t->texture || !surfaces[i]->draw_dirty ||
+            !d3d11_vram_ranges_overlap(address, length, t->vram_address,
+                                       t->storage_length)) {
+            continue;
+        }
+        if (surfaces[i]->buffer_dirty) {
+            return true;
+        }
+        unsigned int bpp =
+            i == 1 ?
+                (t->nv2a_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ? 2 : 4) :
+                (t->nv2a_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_B8 ? 1 :
+                 t->nv2a_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8 ||
+                         t->nv2a_format ==
+                             NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5 ||
+                         t->nv2a_format ==
+                             NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5 ||
+                         t->nv2a_format ==
+                             NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5 ?
+                                                                          2 :
+                                                                          4);
+        if (bpp != format.bytes_per_pixel || !t->guest_width ||
+            !t->guest_height || t->width % t->guest_width ||
+            t->height % t->guest_height ||
+            t->width / t->guest_width != t->height / t->guest_height ||
+            (format.linear ?
+                 (t->surface_type != NV097_SET_SURFACE_FORMAT_TYPE_PITCH ||
+                  t->pitch != shape.pitch) :
+                 t->surface_type != NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE)) {
+            return true;
+        }
+        unsigned int target_scale = t->width / t->guest_width;
+        if (!target_scale || (scale && scale != target_scale)) {
+            return true;
+        }
+        for (unsigned int face = 0; face < faces; face++) {
+            size_t offset = face * face_size;
+            for (unsigned int level = 0; level < levels; level++) {
+                unsigned int w = MAX(1, shape.width >> level);
+                unsigned int h = MAX(1, shape.height >> level);
+                size_t bytes = format.linear ? (size_t)shape.pitch * h :
+                                               (size_t)w * h * bpp;
+                if (t->vram_address == address + offset &&
+                    t->storage_length == bytes && t->guest_width == w &&
+                    t->guest_height == h) {
+                    plan[i].subresource = face * levels + level;
+                    plan[i].width = w * target_scale;
+                    plan[i].height = h * target_scale;
+                    plan[i].found = true;
+                    scale = target_scale;
+                }
+                offset += bytes;
+            }
+        }
+        if (!plan[i].found) {
+            return true; /* Partial aliases must still be resolved into guest
+                            bytes. */
+        }
+    }
+    if (!scale) {
+        return true;
+    }
+    unsigned int max_size =
+        ID3D11Device_GetFeatureLevel(r->device) >= D3D_FEATURE_LEVEL_11_0 ?
+            16384 :
+            8192;
+    if (shape.width > max_size / scale || shape.height > max_size / scale) {
+        return true;
+    }
+    D3D11_TEXTURE2D_DESC desc = {
+        .Width = shape.width * scale,
+        .Height = shape.height * scale,
+        .MipLevels = levels,
+        .ArraySize = faces,
+        .Format = d3d11_texture_dxgi_format(shape.color_format),
+        .SampleDesc = { 1, 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+        .MiscFlags = shape.cubemap ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0,
+    };
+    ID3D11Texture2D *texture = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    HRESULT hr = ID3D11Device_CreateTexture2D(r->device, &desc, NULL, &texture);
+    bool success = SUCCEEDED(hr);
+    unsigned int pixel_size = d3d11_texture_pixel_bytes(shape.color_format);
+    for (unsigned int face = 0; success && face < faces; face++) {
+        const uint8_t *source = d->vram_ptr + address + face * face_size;
+        for (unsigned int level = 0; level < levels; level++) {
+            unsigned int w = MAX(1, shape.width >> level);
+            unsigned int h = MAX(1, shape.height >> level);
+            unsigned int consumed, index = face * levels + level;
+            if ((plan[0].found && plan[0].subresource == index) ||
+                (plan[1].found && plan[1].subresource == index)) {
+                source += format.linear ?
+                              (size_t)shape.pitch * h :
+                              (size_t)w * h * format.bytes_per_pixel;
+                continue; /* GPU-owned mip: do not read stale VRAM or allocate
+                             CPU pixels. */
+            }
+            uint8_t *decoded =
+                d3d11_convert_level(shape, source, NULL, w, h, 1, &consumed);
+            source += consumed;
+            unsigned int scaled_w = w * scale, scaled_h = h * scale;
+            uint8_t *pixels = decoded;
+            if (scale != 1) {
+                pixels = g_try_malloc((size_t)scaled_w * scaled_h * pixel_size);
+                if (!pixels) {
+                    g_free(decoded);
+                    error_setg(
+                        errp,
+                        "D3D11: mip transfer CPU staging allocation failed");
+                    success = false;
+                    break;
+                }
+                for (unsigned int y = 0; y < scaled_h; y++) {
+                    for (unsigned int x = 0; x < scaled_w; x++) {
+                        memcpy(pixels + ((size_t)y * scaled_w + x) * pixel_size,
+                               decoded + ((size_t)(y / scale) * w + x / scale) *
+                                             pixel_size,
+                               pixel_size);
+                    }
+                }
+                g_free(decoded);
+            }
+            ID3D11DeviceContext_UpdateSubresource(
+                r->context, (ID3D11Resource *)texture, index, NULL, pixels,
+                scaled_w * pixel_size, 0);
+            g_free(pixels);
+        }
+    }
+    for (unsigned int i = 0; success && i < 2; i++) {
+        if (!plan[i].found) {
+            continue;
+        }
+        ID3D11PixelShader *pixel = NULL;
+        ID3D11ShaderResourceView *sources[2] = { 0 };
+        ID3D11RenderTargetView *rtv = NULL;
+        success = d3d11_transfer_shaders(r, targets[i], i == 1,
+                                         shape.color_format, &pixel, errp) &&
+                  d3d11_transfer_views(r, targets[i], i == 1, sources, errp);
+        if (success) {
+            unsigned int face = plan[i].subresource / levels;
+            unsigned int level = plan[i].subresource % levels;
+            D3D11_RENDER_TARGET_VIEW_DESC rd = {
+                .Format = desc.Format,
+                .ViewDimension = faces == 1 ?
+                                     D3D11_RTV_DIMENSION_TEXTURE2D :
+                                     D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
+            };
+            if (faces == 1) {
+                rd.Texture2D.MipSlice = level;
+            } else {
+                rd.Texture2DArray.MipSlice = level;
+                rd.Texture2DArray.FirstArraySlice = face;
+                rd.Texture2DArray.ArraySize = 1;
+            }
+            hr = ID3D11Device_CreateRenderTargetView(
+                r->device, (ID3D11Resource *)texture, &rd, &rtv);
+            success = SUCCEEDED(hr);
+        }
+        if (success) {
+            d3d11_transfer_draw(r, rtv, sources, pixel, plan[i].width,
+                                plan[i].height);
+        }
+        if (rtv) {
+            ID3D11RenderTargetView_Release(rtv);
+        }
+        for (unsigned int k = 0; k < 2; k++) {
+            if (sources[k]) {
+                ID3D11ShaderResourceView_Release(sources[k]);
+            }
+        }
+    }
+    if (success) {
+        unsigned int min_level = d3d11_effective_min_mipmap_level(
+            format.linear, shape.min_mipmap_level);
+        D3D11_SHADER_RESOURCE_VIEW_DESC vd = {
+            .Format = desc.Format,
+            .ViewDimension = faces == 1 ? D3D11_SRV_DIMENSION_TEXTURE2D :
+                                          D3D11_SRV_DIMENSION_TEXTURECUBE,
+        };
+        if (faces == 1) {
+            vd.Texture2D.MostDetailedMip = min_level;
+            vd.Texture2D.MipLevels = levels - min_level;
+        } else {
+            vd.TextureCube.MostDetailedMip = min_level;
+            vd.TextureCube.MipLevels = levels - min_level;
+        }
+        hr = ID3D11Device_CreateShaderResourceView(
+            r->device, (ID3D11Resource *)texture, &vd, &view);
+        success = SUCCEEDED(hr);
+    }
+    if (!success) {
+        if (!errp || !*errp) {
+            error_setg(errp, "D3D11: mip surface transfer failed (0x%08lx)",
+                       (unsigned long)hr);
+        }
+        if (texture) {
+            ID3D11Texture2D_Release(texture);
+        }
+        if (view) {
+            ID3D11ShaderResourceView_Release(view);
+        }
+        return false;
+    }
+    PGRAPHD3D11TextureBinding *binding = &r->textures->bindings[stage];
+    d3d11_release_texture(binding);
+    binding->resource = (ID3D11Resource *)texture;
+    binding->view = view;
+    binding->shape = shape;
+    binding->address = address;
+    binding->length = length;
+    binding->surface_copy = true;
+    *handled = true;
+    return true;
+}
+
 bool pgraph_d3d11_bind_textures(NV2AState *d, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -957,6 +1724,8 @@ bool pgraph_d3d11_bind_textures(NV2AState *d, Error **errp)
     }
     ID3D11ShaderResourceView *views[NV2A_MAX_TEXTURES] = { 0 };
     ID3D11SamplerState *samplers[NV2A_MAX_TEXTURES] = { 0 };
+    ID3D11DeviceContext_PSSetShaderResources(r->context, 0, NV2A_MAX_TEXTURES,
+                                             views);
     for (unsigned int stage = 0; stage < NV2A_MAX_TEXTURES; stage++) {
         if (!pgraph_is_texture_enabled(pg, stage)) {
             continue;
@@ -966,7 +1735,7 @@ bool pgraph_d3d11_bind_textures(NV2AState *d, Error **errp)
                 shape.cubemap, shape.border, shape.levels)) {
             error_setg(
                 errp,
-                "D3D11: bordered cubemap mip chains have no defined NV2A upload layout");
+                "D3D11: invalid bordered cubemap mip count");
             return false;
         }
         if (!d3d11_texture_shape_valid(shape)) {
@@ -1001,6 +1770,41 @@ bool pgraph_d3d11_bind_textures(NV2AState *d, Error **errp)
                 return false;
             }
         }
+        PGRAPHD3D11TextureBinding *binding = &r->textures->bindings[stage];
+        bool handled = false, transfer_failed = false;
+        Error *transfer_error = NULL;
+        if (!r->textures->transfer_disabled &&
+            d3d11_surface_texture_compatible(&r->render_targets.color,
+                                             &pg->surface_color, shape, address,
+                                             length)) {
+            handled = d3d11_snapshot_surface(
+                r, binding, &r->render_targets.color, shape, &transfer_error);
+            transfer_failed = !handled;
+        }
+        if (!handled && !transfer_failed) {
+            transfer_failed = !d3d11_transfer_chain(
+                d, stage, shape, address, length, &handled, &transfer_error);
+        }
+        if (transfer_failed) {
+            char message[1024];
+            snprintf(message, sizeof(message),
+                     "%s; using CPU surface resolve until resource trim",
+                     transfer_error ? error_get_pretty(transfer_error) :
+                                      "D3D11: surface transfer failed");
+            qemu_host_emit_log(QEMU_HOST_LOG_WARNING, message);
+            error_free(transfer_error);
+            r->textures->transfer_disabled = true;
+            handled = false;
+        }
+        if (handled) {
+            if (!d3d11_update_sampler(r, pg, stage, errp)) {
+                return false;
+            }
+            views[stage] = binding->view;
+            samplers[stage] = r->textures->samplers[stage];
+            pg->texture_dirty[stage] = false;
+            continue;
+        }
         /* Resolve an active render-to-texture surface before reading VRAM.
          * Include indexed palettes: their VRAM range may alias a dirty target
          * even when the texel range itself does not.
@@ -1029,8 +1833,7 @@ bool pgraph_d3d11_bind_textures(NV2AState *d, Error **errp)
         if (uses_palette) {
             hash ^= fast_hash(palette, palette_length);
         }
-        PGRAPHD3D11TextureBinding *binding = &r->textures->bindings[stage];
-        if (!binding->view || binding->data_hash != hash ||
+        if (binding->surface_copy || !binding->view || binding->data_hash != hash ||
             binding->address != address || binding->length != length ||
             memcmp(&binding->shape, &shape, sizeof(shape))) {
             if (!d3d11_create_texture(d, stage, shape, address, palette,

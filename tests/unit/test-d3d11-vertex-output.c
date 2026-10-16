@@ -5,7 +5,55 @@
 #include <d3dcompiler.h>
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include "vertex-output-generated.h"
+
+static void test_generated_fog_hlsl(ID3D11Device *device_10_0,
+                                   ID3D11Device *device_10_1,
+                                   ID3D11Device *device_11)
+{
+    static const char *profiles[] = { "vs_4_0", "vs_4_1", "vs_5_0" };
+    ID3D11Device *devices[] = { device_10_0, device_10_1, device_11 };
+    for (unsigned int i = 0; i < sizeof(fog_factors) / sizeof(fog_factors[0]);
+         i++) {
+        char source[4096];
+        int length = snprintf(
+            source, sizeof(source),
+            "cbuffer FogConstants:register(b0){float2 fogParam;float4 C[192];};"
+            "struct VSIn{float4 v5:ATTRIBUTE0;};"
+            "struct VSOut{float4 position:SV_Position;float fog:TEXCOORD0;};"
+            "VSOut main(VSIn input){"
+            "float4 tPosition=float4(1,2,3,1);"
+            "float4 specular=float4(0,0,0,0.5);"
+            "float4 oFog=float4(0.25,0,0,0);"
+            "%s"
+            "VSOut output;output.position=float4(0,0,0,1);"
+            "output.fog=fogFactor;return output;}", fog_factors[i]);
+        assert(length > 0 && (size_t)length < sizeof(source));
+        for (unsigned int profile = 0;
+             profile < sizeof(profiles) / sizeof(profiles[0]); profile++) {
+            ID3DBlob *blob = NULL;
+            ID3DBlob *errors = NULL;
+            HRESULT result = D3DCompile2(
+                source, (SIZE_T)length, "generated-fog", NULL, NULL,
+                "main", profiles[profile], 0, 0, 0, NULL, 0, &blob, &errors);
+            if (FAILED(result) && errors) {
+                fwrite(ID3D10Blob_GetBufferPointer(errors), 1,
+                       ID3D10Blob_GetBufferSize(errors), stderr);
+            }
+            assert(SUCCEEDED(result));
+            if (errors) {
+                ID3D10Blob_Release(errors);
+            }
+            ID3D11VertexShader *shader = NULL;
+            assert(SUCCEEDED(ID3D11Device_CreateVertexShader(
+                devices[profile], ID3D10Blob_GetBufferPointer(blob),
+                ID3D10Blob_GetBufferSize(blob), NULL, &shader)));
+            ID3D11VertexShader_Release(shader);
+            ID3D10Blob_Release(blob);
+        }
+    }
+}
 
 int main(void)
 {
@@ -14,6 +62,20 @@ int main(void)
     assert(SUCCEEDED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0,
                                        NULL, 0, D3D11_SDK_VERSION, &device,
                                        NULL, &context)));
+    const D3D_FEATURE_LEVEL requested_level_10_0 = D3D_FEATURE_LEVEL_10_0;
+    D3D_FEATURE_LEVEL obtained_level = D3D_FEATURE_LEVEL_9_1;
+    ID3D11Device *device_10_0 = NULL;
+    assert(SUCCEEDED(D3D11CreateDevice(
+        NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, &requested_level_10_0, 1,
+        D3D11_SDK_VERSION, &device_10_0, &obtained_level, NULL)));
+    assert(obtained_level == D3D_FEATURE_LEVEL_10_0);
+    const D3D_FEATURE_LEVEL requested_level = D3D_FEATURE_LEVEL_10_1;
+    ID3D11Device *device_10_1 = NULL;
+    assert(SUCCEEDED(D3D11CreateDevice(
+        NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, &requested_level, 1,
+        D3D11_SDK_VERSION, &device_10_1, &obtained_level, NULL)));
+    assert(obtained_level == D3D_FEATURE_LEVEL_10_1);
+    test_generated_fog_hlsl(device_10_0, device_10_1, device);
     const char *pixel_source =
         "float4 main():SV_Target{return float4(1,1,1,1);}";
     ID3DBlob *blob = NULL;
@@ -63,6 +125,24 @@ int main(void)
             "%s return oPos;}",
             i ? 32 : 16, i ? 32 : 16, i ? 1.5 : 0.5, epilogues[i]);
         assert(SUCCEEDED(D3DCompile(vertex_source, strlen(vertex_source),
+                                    "vertex-fl10-0", NULL, NULL, "main",
+                                    "vs_4_0", 0, 0, &blob, NULL)));
+        ID3D11VertexShader *vertex_4_0 = NULL;
+        assert(SUCCEEDED(ID3D11Device_CreateVertexShader(
+            device_10_0, ID3D10Blob_GetBufferPointer(blob),
+            ID3D10Blob_GetBufferSize(blob), NULL, &vertex_4_0)));
+        ID3D11VertexShader_Release(vertex_4_0);
+        ID3D10Blob_Release(blob);
+        assert(SUCCEEDED(D3DCompile(vertex_source, strlen(vertex_source),
+                                    "vertex-fl10", NULL, NULL, "main",
+                                    "vs_4_1", 0, 0, &blob, NULL)));
+        ID3D11VertexShader *vertex_4_1 = NULL;
+        assert(SUCCEEDED(ID3D11Device_CreateVertexShader(
+            device_10_1, ID3D10Blob_GetBufferPointer(blob),
+            ID3D10Blob_GetBufferSize(blob), NULL, &vertex_4_1)));
+        ID3D11VertexShader_Release(vertex_4_1);
+        ID3D10Blob_Release(blob);
+        assert(SUCCEEDED(D3DCompile(vertex_source, strlen(vertex_source),
                                     "vertex", NULL, NULL, "main", "vs_5_0", 0,
                                     0, &blob, NULL)));
         ID3D11VertexShader *vertex = NULL;
@@ -103,8 +183,12 @@ int main(void)
     ID3D11Texture2D_Release(target);
     ID3D11PixelShader_Release(pixel);
     ID3D11DeviceContext_Release(context);
+    ID3D11Device_Release(device_10_0);
+    ID3D11Device_Release(device_10_1);
     ID3D11Device_Release(device);
-    puts("PASS: vertex output, top-left pixels, culling, W=2; "
+    puts("PASS: vs_4_0/vs_4_1 output, top-left pixels, culling, W=2; "
          "old projection clips to black");
+    puts("PASS: generated vertex epilogues compile and create as vs_4_1 on WARP FL 10.1");
+    puts("PASS: generated fog helpers compile/create via D3DCompile2 at FL 10.0/10.1/11.0");
     return 0;
 }

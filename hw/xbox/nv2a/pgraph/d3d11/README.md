@@ -1,5 +1,25 @@
 # D3D11 renderer regression checks
 
+The surface transfer path now handles GPU color/depth format conversion and
+individual guest mip levels/cubemap faces. Z16/Z24S8 fixed/float packing,
+stencil, UNORM/SNORM and Y16 are checked against production CPU conversions on
+WARP FL10.0. Guest-authored mips are preserved, not auto-generated. Resource
+failures fall back to CPU resolve and are retried only after trim/recreation.
+See `Depth, format conversion and guest mip chains` in the Windows integration
+report below for supported layouts and validation boundaries.
+
+Compatible ARGB8 2D single-mip render-to-texture now uses GPU snapshots, following
+the Vulkan surface-copy path. Scaled render detail is retained without a CPU
+VRAM round-trip; incompatible layouts/formats keep the CPU fallback. WARP tests
+cover copy bytes, reuse, resize, feedback isolation, OM restoration and fallback.
+See the GPU surface snapshots section in the Windows integration report below.
+
+For current Windows validation, bordered cubemap mip chains, mixed constant
+blending, polygon POINT mode and rectangle point sprites, see
+[Windows integration](../../../../../renderer-parity/WINDOWS_INTEGRATION.md).
+That report supersedes the older untested/rejected descriptions of those cases
+in this historical audit.
+
 The D3D11 corrections use the Cxbx D3D8 implementation as reference:
 
 - `Rendering/Backend/HostResourceUpload.cpp`: row/slice pitch and mip uploads.
@@ -283,11 +303,12 @@ target constraints and avoids relying on a later API failure; the GCC regression
 tests the production predicate. It does not define or resolve bordered cubemap
 mip-chain behavior, which remains ambiguous in the GL upload path.
 
-Bordered cubemaps with more than one mip are now rejected before DMA range
-calculation/VRAM hashing and again before D3D11 resource creation. The GL upload
-path does not define a safe mip-chain layout for this case, so D3D11 does not
-guess at one; the portable GCC test covers the production predicate and guard
-ordering. This is an explicit unsupported case, not a parity claim.
+Bordered cubemaps with multiple mips preserve the Vulkan physical face layout,
+including aligned faces, block padding and every stored border texel. D3D11
+insets logical cube directions into each padded face and takes derivatives after
+that mapping. The single-level crop remains unchanged. WARP tests cover RGBA
+and DXT1/3/5 upload/readback, all six sampled faces, mip selection and filtering;
+see the Windows integration report for the remaining hardware-validation limits.
 
 Device creation now includes FL 10.0 and FL 10.1 fallbacks; shader profiles are
 selected from the created feature level (`vs/ps_4_0`, `_4_1`, or `_5_0`). This is
@@ -321,12 +342,17 @@ or OpenGL comparison coverage for triangles, quads, lines, or points. With
 Z16/Z24S8, filled triangle
 list/strip/fan/polygon, quads, quad-strips, lines, line-strips, line-loops, and
 points select the custom-depth PS path; direct points now pass through the
-point-to-quad GS before the custom-depth PS. Different
-front/back polygon modes are now rejected before shader setup rather than
-silently rendered as FILL; the OpenGL reference also marks two-sided polygon
-modes unsupported. For `surface_scale_factor > 1`, D3D11 expands direct lines and LINE polygon
+point-to-quad GS before the custom-depth PS. Independent front/back FILL, LINE
+and POINT modes now use a single triangle-output GS, with source-face culling
+and color selection before expansion. Unlike the shared GLSL path, this does
+not require the two modes to match. Line/polygon smoothing, when PGRAPH AA is
+off, selects analytic alpha coverage in GS/PS rather than ignoring the bits.
+See `Independent D3D11 face modes and analytic smoothing` in
+`renderer-parity/WINDOWS_INTEGRATION.md` for validation and
+coverage limitations. For `surface_scale_factor > 1`, D3D11 expands direct lines and LINE polygon
 modes into screen-space rectangles through a geometry shader; 1× keeps the
-native line path. Joins, caps, coverage, antialiasing, and the OpenGL device-
+native line path when analytic smoothing and independent modes are not needed.
+Joins, caps, exact NV2A coverage, and the OpenGL device-
 dependent width clamp remain unvalidated.
 Mappings 5–7 and BRDF only mirror current GLSL fallbacks;
 constant-eye reflection now uses `NV097_SET_EYE_VECTOR` and the Khronos equation,

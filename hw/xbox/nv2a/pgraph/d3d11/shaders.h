@@ -17,8 +17,10 @@
 #define PGRAPHD3D11_DEPTH_GS_VARIANTS \
     (2 * PGRAPHD3D11_DEPTH_GS_VARIANTS_PER_WIDTH)
 #define PGRAPHD3D11_POINT_GS_VARIANT PGRAPHD3D11_DEPTH_GS_VARIANTS
+#define PGRAPHD3D11_POLYGON_POINT_GS_VARIANT \
+    (PGRAPHD3D11_POINT_GS_VARIANT + 1)
 #define PGRAPHD3D11_GEOMETRY_SHADER_VARIANTS \
-    (PGRAPHD3D11_DEPTH_GS_VARIANTS + 1)
+    (PGRAPHD3D11_DEPTH_GS_VARIANTS + 3)
 
 typedef struct PGRAPHState PGRAPHState;
 typedef struct PGRAPHD3D11State PGRAPHD3D11State;
@@ -49,6 +51,8 @@ typedef struct PGRAPHD3D11ShaderState {
         PGRAPHD3D11_GEOMETRY_SHADER_VARIANTS];
     bool quad_adjacency_geometry;
     bool polygon_line_geometry;
+    bool raster_geometry;
+    GHashTable *raster_geometry_cache;
     ID3D11Buffer *vertex_constants;
     ID3D11Buffer *pixel_constants;
     char *cache_directory;
@@ -63,5 +67,6 @@ bool pgraph_d3d11_bind_pixel_shader(PGRAPHState *pg, Error **errp);
 bool pgraph_d3d11_needs_wide_lines(unsigned int primitive,
                                   unsigned int polygon_mode,
                                   unsigned int surface_scale_factor);
+bool pgraph_d3d11_needs_raster_geometry(PGRAPHState *pg);
 
 #endif
