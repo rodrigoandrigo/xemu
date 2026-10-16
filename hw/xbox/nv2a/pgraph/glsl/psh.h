@@ -46,12 +46,14 @@ typedef struct PshState {
 
     bool point_sprite;
     bool rect_tex[4];
+    bool clamp_ogl[4][3];
     bool snorm_tex[4];
     bool compare_mode[4][4];
     bool alphakill[4];
     int colorkey_mode[4];
     enum ConvolutionFilter conv_tex[4];
     bool tex_x8y24[4];
+    bool tex_depth_float[4];
     int dim_tex[4];
     bool tex_cubemap[4];
 

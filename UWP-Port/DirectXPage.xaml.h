@@ -1,4 +1,4 @@
-﻿//
+//
 // DirectXPage.xaml.h
 // Declaração da classe DirectXPage.
 //
@@ -103,6 +103,7 @@ namespace UWP_Port
 		Windows::Foundation::EventRegistrationToken m_panelScaleChangedToken;
 		bool m_windowVisible;
 		bool m_renderAttached;
+		bool m_swapChainRetryAttempted;
 		bool m_flashReady;
 		bool m_bootromReady;
 		bool m_hddReady;

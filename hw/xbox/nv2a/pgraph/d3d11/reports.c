@@ -22,6 +22,19 @@ static void d3d11_release_queries(ID3D11Query **queries, size_t count)
     g_free(queries);
 }
 
+static uint32_t d3d11_report_scaled_count(uint64_t samples,
+                                         uint32_t scale_factor)
+{
+    uint64_t scale = scale_factor ? scale_factor : 1;
+    return (uint32_t)(samples / (scale * scale));
+}
+
+static void d3d11_report_accumulate_count(uint32_t *total, uint64_t samples,
+                                         uint32_t scale_factor)
+{
+    *total += d3d11_report_scaled_count(samples, scale_factor);
+}
+
 bool pgraph_d3d11_reports_init(PGRAPHD3D11State *r)
 {
     r->reports = g_new0(PGRAPHD3D11ReportState, 1);
@@ -69,7 +82,8 @@ bool pgraph_d3d11_report_draw_begin(NV2AState *d)
     if (FAILED(hr)) {
         qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
                            "D3D11: failed to create occlusion query");
-        return false;
+        /* Reports are optional instrumentation; keep rendering the draw. */
+        return true;
     }
     ID3D11DeviceContext_Begin(r->context,
                               (ID3D11Asynchronous *)r->reports->active_query);
@@ -146,6 +160,27 @@ static bool d3d11_read_query(PGRAPHD3D11State *r, ID3D11Query *query,
     }
 }
 
+static bool d3d11_report_accumulate_queries(PGRAPHD3D11State *r,
+                                           ID3D11Query **queries,
+                                           size_t query_count,
+                                           uint32_t scale_factor,
+                                           uint32_t *total)
+{
+    if (r->device_lost) {
+        *total = 0;
+        return false;
+    }
+    for (size_t i = 0; i < query_count; i++) {
+        uint64_t samples = 0;
+        if (!d3d11_read_query(r, queries[i], &samples)) {
+            *total = 0;
+            return false;
+        }
+        d3d11_report_accumulate_count(total, samples, scale_factor);
+    }
+    return true;
+}
+
 void pgraph_d3d11_process_pending_reports(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -163,17 +198,16 @@ void pgraph_d3d11_process_pending_reports(NV2AState *d)
                 qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
                                    "D3D11: unsupported NV2A report type");
             } else {
-                for (size_t i = 0; i < report->query_count; i++) {
-                    uint64_t samples = 0;
-                    if (d3d11_read_query(r, report->queries[i], &samples)) {
-                        uint64_t scale = MAX(1U, pg->surface_scale_factor);
-                        r->reports->zpass_pixel_count +=
-                            samples / (scale * scale);
-                    }
+                bool success = d3d11_report_accumulate_queries(
+                    r, report->queries, report->query_count,
+                    pg->surface_scale_factor,
+                    &r->reports->zpass_pixel_count);
+                if (!success) {
+                    /* Do not expose an earlier report's count on query loss. */
+                    r->reports->zpass_pixel_count = 0;
                 }
                 pgraph_write_zpass_pixel_cnt_report(
-                    d, report->parameter,
-                    MIN(r->reports->zpass_pixel_count, UINT32_MAX));
+                    d, report->parameter, r->reports->zpass_pixel_count);
             }
         }
         QSIMPLEQ_REMOVE_HEAD(&r->reports->queue, entry);

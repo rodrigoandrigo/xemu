@@ -22,6 +22,26 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "qemu/main-loop.h"
 
+static void nv2a_d3d11_callback_barrier(CPUState *cpu,
+                                        run_on_cpu_data data)
+{
+    /* A synchronous run_on_cpu item is a FIFO barrier behind async removals. */
+    (void)cpu;
+    (void)data;
+}
+
+void nv2a_d3d11_callbacks_shutdown(NV2AState *d)
+{
+    qatomic_set(&d->vram_access_callbacks_disabled, true);
+    if (tcg_enabled()) {
+        CPUState *cpu = qemu_get_cpu(0);
+        if (cpu && cpu->created) {
+            /* Called with BQL held and without PGRAPH/PFIFO locks. */
+            run_on_cpu(cpu, nv2a_d3d11_callback_barrier, RUN_ON_CPU_NULL);
+        }
+    }
+}
+
 void nv2a_update_irq(NV2AState *d)
 {
     /* PFIFO */
@@ -75,6 +95,62 @@ DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address)
         .address    = (frame & NV_DMA_ADDRESS) | GET_MASK(flags, NV_DMA_ADJUST),
         .limit      = limit,
     };
+}
+
+bool nv_dma_load_checked(NV2AState *d, hwaddr dma_obj_address,
+                         DMAObject *dma)
+{
+    if (dma) {
+        memset(dma, 0, sizeof(*dma));
+    }
+    if (!d || !dma || !d->ramin_ptr) {
+        return false;
+    }
+
+    hwaddr ramin_size = memory_region_size(&d->ramin);
+    if (dma_obj_address >= ramin_size ||
+        ramin_size - dma_obj_address < 3 * sizeof(uint32_t)) {
+        return false;
+    }
+
+    *dma = nv_dma_load(d, dma_obj_address);
+    return true;
+}
+
+bool nv_dma_map_checked(NV2AState *d, hwaddr dma_obj_address,
+                        uint8_t **mapping, hwaddr *len)
+{
+    if (mapping) {
+        *mapping = NULL;
+    }
+    if (len) {
+        *len = 0;
+    }
+    if (!d || !mapping || !len || !d->vram || !d->vram_ptr) {
+        return false;
+    }
+
+    DMAObject dma;
+    if (!nv_dma_load_checked(d, dma_obj_address, &dma)) {
+        return false;
+    }
+
+    trace_nv2a_dma_map(dma_obj_address, dma.dma_class, dma.dma_target,
+                       dma.address, dma.limit);
+    /* This checked path only exposes NV2A in-memory objects as VRAM. */
+    if (dma.dma_class != NV_DMA_IN_MEMORY_CLASS) {
+        return false;
+    }
+    dma.address &= 0x07FFFFFF;
+    hwaddr vram_size = memory_region_size(d->vram);
+    if (dma.address >= vram_size) {
+        return false;
+    }
+
+    *mapping = d->vram_ptr + dma.address;
+    /* The DMA limit is inclusive: offsets [0, limit] cover limit + 1 bytes. */
+    *len = MIN((uint64_t)dma.limit + 1, vram_size - dma.address);
+    return true;
 }
 
 void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len)
@@ -361,6 +437,7 @@ static void nv2a_realize(PCIDevice *dev, Error **errp)
                                     &d->block_mmio[i]);
     }
 
+    qatomic_set(&d->vram_access_callbacks_disabled, false);
     qemu_mutex_init(&d->pfifo.lock);
     qemu_cond_init(&d->pfifo.fifo_cond);
     qemu_cond_init(&d->pfifo.fifo_idle_cond);
@@ -371,10 +448,16 @@ static void nv2a_exitfn(PCIDevice *dev)
     NV2AState *d;
     d = NV2A_DEVICE(dev);
 
+    /* Keep PFIFO alive until any callback already inside its flush path exits. */
+    nv2a_d3d11_callbacks_shutdown(d);
+    qemu_mutex_lock(&d->pfifo.lock);
     d->exiting = true;
-
     qemu_cond_broadcast(&d->pfifo.fifo_cond);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    /* PGRAPH context switches may need BQL to let the PFIFO thread exit. */
+    bql_unlock();
     qemu_thread_join(&d->pfifo.thread);
+    bql_lock();
 
     pgraph_destroy(&d->pgraph);
 }

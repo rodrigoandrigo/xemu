@@ -130,11 +130,24 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
                 NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FIXED ||
             color_format ==
                 NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FLOAT;
+        state->tex_depth_float[i] =
+            color_format ==
+            NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FLOAT;
 
         uint32_t border_source =
             GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_BORDER_SOURCE);
         bool cubemap = GET_MASK(tex_fmt, NV_PGRAPH_TEXFMT0_CUBEMAPENABLE);
         state->tex_cubemap[i] = cubemap;
+        uint32_t address = pgraph_reg_r(pg, NV_PGRAPH_TEXADDRESS0 + i * 4);
+        state->clamp_ogl[i][0] =
+            !cubemap && GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRU) ==
+                            NV_PGRAPH_TEXADDRESS0_ADDRU_CLAMP_OGL;
+        state->clamp_ogl[i][1] =
+            !cubemap && GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRV) ==
+                            NV_PGRAPH_TEXADDRESS0_ADDRU_CLAMP_OGL;
+        state->clamp_ogl[i][2] =
+            !cubemap && GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRP) ==
+                            NV_PGRAPH_TEXADDRESS0_ADDRU_CLAMP_OGL;
         state->border_logical_size[i][0] = 0.0f;
         state->border_logical_size[i][1] = 0.0f;
         state->border_logical_size[i][2] = 0.0f;
@@ -721,11 +734,23 @@ static void psh_append_shadowmap(const struct PixelShader *ps, int i, bool compa
     const char *comparison = shadow_comparison_map[ps->state->shadow_depth_func];
 
     bool extract_msb_24b = ps->state->tex_x8y24[i] && ps->opts.vulkan;
-
-    mstring_append_fmt(
-        vars, "%svec4 t%d_depth%s = textureProj(texSamp%d, %s(pT%d.xyw));\n",
-        extract_msb_24b ? "u" : "", i, extract_msb_24b ? "_raw" : "", i,
-        tex_remap, i);
+    bool project2d_3d = !compare_z && ps->state->dim_tex[i] == 3;
+    if (project2d_3d) {
+        /* PROJECT2D on a volume samples the z=0 slice. Keep this vec4 overload
+         * valid for sampler3D and let normN(vec4) normalize only x/y. */
+        mstring_append_fmt(
+            vars,
+            "%svec4 t%d_depth%s = textureProj(texSamp%d, %s(vec4(pT%d.xy, "
+            "0.0, pT%d.w)));\n",
+            extract_msb_24b ? "u" : "", i,
+            extract_msb_24b ? "_raw" : "", i, tex_remap, i, i);
+    } else {
+        mstring_append_fmt(
+            vars,
+            "%svec4 t%d_depth%s = textureProj(texSamp%d, %s(pT%d.xyw));\n",
+            extract_msb_24b ? "u" : "", i,
+            extract_msb_24b ? "_raw" : "", i, tex_remap, i);
+    }
 
     if (extract_msb_24b) {
         mstring_append_fmt(vars,
@@ -1418,9 +1443,9 @@ static MString* psh_convert(struct PixelShader *ps)
             if (ps->state->rect_tex[i]) {
                 mstring_append_fmt(preflight,
                 "vec2 norm%d(vec2 coord) {\n"
-                "    return coord / (textureSize(texSamp%d, 0) / texScale[%d]);\n"
+                "    return coord / (textureSize(texSamp%d, 0)%s / texScale[%d]);\n"
                 "}\n",
-                i, i, i);
+                i, i, ps->state->dim_tex[i] == 3 ? ".xy" : "", i);
                 mstring_append_fmt(preflight,
                 "vec3 norm%d(vec3 coord) {\n"
                 "    return vec3(norm%d(coord.xy), coord.z);\n"

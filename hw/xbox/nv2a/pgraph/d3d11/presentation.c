@@ -10,10 +10,23 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
 #include <d3dcompiler.h>
+#include <math.h>
 #include "ui/xemu-settings.h"
 #include "ui/xui/xemu-hud.h"
 #include "ui/xemu-widescreen.h"
+#include "hw/xbox/nv2a/pgraph/util.h"
 #include "presentation.h"
+
+typedef struct D3D11PresentationConstants {
+    float viewport[4];
+    float display[4];
+    float pvideo_pos[4];
+    float pvideo_in_scale[4];
+    float pvideo_color_key[4];
+    float pvideo_control[4];
+} D3D11PresentationConstants;
+
+G_STATIC_ASSERT(sizeof(D3D11PresentationConstants) == 96);
 
 static const char d3d11_presentation_shader[] =
     "struct VSOut { float4 position:SV_Position; float2 uv:TEXCOORD0; };"
@@ -24,10 +37,34 @@ static const char d3d11_presentation_shader[] =
     "  else { o.position=float4(3,-1,0,1); o.uv=float2(2,1); }"
     "  return o;"
     "}"
+    "cbuffer PresentationConstants:register(b0){"
+    "float4 viewportRect;float4 displayInfo;float4 pvideoPos;"
+    "float4 pvideoInScale;float4 pvideoColorKey;float4 pvideoControl;};"
     "Texture2D source_texture:register(t0);"
+    "Texture2D pvideo_texture:register(t1);"
     "SamplerState source_sampler:register(s0);"
+    "SamplerState pvideo_sampler:register(s1);"
     "float4 ps_main(VSOut input):SV_Target {"
-    "  return source_texture.Sample(source_sampler,input.uv);"
+    "  float2 sourceUV=input.uv;"
+    "  sourceUV.y*=displayInfo.z;"
+    "  float4 color=source_texture.Sample(source_sampler,sourceUV);"
+    "  if(pvideoControl.x>0.5){"
+    "    float2 displayCoord=(input.position.xy-viewportRect.xy)*"
+    "                        displayInfo.xy/viewportRect.zw;"
+    "    float2 screenCoord=float2(displayCoord.x-0.5,"
+    "                        displayInfo.y-displayCoord.y-0.5);"
+    "    bool inside=all(screenCoord>=pvideoPos.xy)&&"
+    "                all(screenCoord<=pvideoPos.xy+pvideoPos.zw);"
+    "    bool colorKeyMatch=all(color.rgb==pvideoColorKey.rgb);"
+    "    if(inside&&(pvideoControl.y<0.5||colorKeyMatch)){"
+    "      float2 outXY=(screenCoord-pvideoPos.xy)*displayInfo.w;"
+    "      float2 inSt=(pvideoInScale.xy+outXY*pvideoInScale.zw)/"
+    "                  pvideoControl.zw;"
+    "      inSt.y=1.0-inSt.y;"
+    "      color=pvideo_texture.Sample(pvideo_sampler,inSt);"
+    "    }"
+    "  }"
+    "  return color;"
     "}";
 
 static bool d3d11_compile_presentation_shader(const char *entry,
@@ -36,9 +73,11 @@ static bool d3d11_compile_presentation_shader(const char *entry,
 {
     ID3DBlob *messages = NULL;
     HRESULT hr =
-        D3DCompile(d3d11_presentation_shader, strlen(d3d11_presentation_shader),
-                   "d3d11-presentation", NULL, NULL, entry, profile,
-                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, &messages);
+        D3DCompile2(d3d11_presentation_shader,
+                    strlen(d3d11_presentation_shader), "d3d11-presentation",
+                    NULL, NULL, entry, profile,
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, 0, NULL, 0, blob,
+                    &messages);
     if (FAILED(hr)) {
         const char *details = messages ? ID3D10Blob_GetBufferPointer(messages) :
                                          "no compiler diagnostics";
@@ -54,13 +93,14 @@ static bool d3d11_compile_presentation_shader(const char *entry,
 }
 
 static bool d3d11_create_sampler(PGRAPHD3D11State *r, D3D11_FILTER filter,
+                                 D3D11_TEXTURE_ADDRESS_MODE address,
                                  ID3D11SamplerState **sampler, Error **errp)
 {
     D3D11_SAMPLER_DESC desc = {
         .Filter = filter,
-        .AddressU = D3D11_TEXTURE_ADDRESS_CLAMP,
-        .AddressV = D3D11_TEXTURE_ADDRESS_CLAMP,
-        .AddressW = D3D11_TEXTURE_ADDRESS_CLAMP,
+        .AddressU = address,
+        .AddressV = address,
+        .AddressW = address,
         .ComparisonFunc = D3D11_COMPARISON_NEVER,
         .MinLOD = 0,
         .MaxLOD = D3D11_FLOAT32_MAX,
@@ -103,10 +143,29 @@ bool pgraph_d3d11_presentation_init(PGRAPHD3D11State *r, Error **errp)
                    (unsigned long)hr);
         goto fail;
     }
+    D3D11_BUFFER_DESC constants_desc = {
+        .ByteWidth = sizeof(D3D11PresentationConstants),
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+    };
+    hr = ID3D11Device_CreateBuffer(r->device, &constants_desc, NULL,
+                                   &presentation->constants);
+    if (FAILED(hr)) {
+        error_setg(errp,
+                   "D3D11: presentation constant-buffer creation failed "
+                   "(HRESULT 0x%08lx)",
+                   (unsigned long)hr);
+        goto fail;
+    }
     if (!d3d11_create_sampler(r, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                              D3D11_TEXTURE_ADDRESS_CLAMP,
                               &presentation->linear_sampler, errp) ||
         !d3d11_create_sampler(r, D3D11_FILTER_MIN_MAG_MIP_POINT,
-                              &presentation->nearest_sampler, errp)) {
+                              D3D11_TEXTURE_ADDRESS_CLAMP,
+                              &presentation->nearest_sampler, errp) ||
+        !d3d11_create_sampler(r, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                              D3D11_TEXTURE_ADDRESS_WRAP,
+                              &presentation->pvideo_sampler, errp)) {
         goto fail;
     }
     ID3D10Blob_Release(vertex);
@@ -136,6 +195,12 @@ void pgraph_d3d11_presentation_finalize(PGRAPHD3D11State *r)
     if (presentation->scanout_texture) {
         ID3D11Texture2D_Release(presentation->scanout_texture);
     }
+    if (presentation->pvideo_srv) {
+        ID3D11ShaderResourceView_Release(presentation->pvideo_srv);
+    }
+    if (presentation->pvideo_texture) {
+        ID3D11Texture2D_Release(presentation->pvideo_texture);
+    }
     for (unsigned int i = 0; i < ARRAY_SIZE(presentation->retained); i++) {
         if (presentation->retained[i].srv) {
             ID3D11ShaderResourceView_Release(presentation->retained[i].srv);
@@ -145,8 +210,14 @@ void pgraph_d3d11_presentation_finalize(PGRAPHD3D11State *r)
     if (presentation->nearest_sampler) {
         ID3D11SamplerState_Release(presentation->nearest_sampler);
     }
+    if (presentation->pvideo_sampler) {
+        ID3D11SamplerState_Release(presentation->pvideo_sampler);
+    }
     if (presentation->linear_sampler) {
         ID3D11SamplerState_Release(presentation->linear_sampler);
+    }
+    if (presentation->constants) {
+        ID3D11Buffer_Release(presentation->constants);
     }
     if (presentation->pixel_shader) {
         ID3D11PixelShader_Release(presentation->pixel_shader);
@@ -201,6 +272,7 @@ static bool d3d11_retain_scanout(PGRAPHD3D11State *r,
                 .srv = color->srv,
                 .width = color->width,
                 .height = color->height,
+                .pitch = color->pitch,
                 .address = color->vram_address,
                 .length = color->storage_length,
                 .serial = ++presentation->retained_serial,
@@ -415,6 +487,192 @@ d3d11_presentation_viewport(const PGRAPHD3D11State *r,
     };
 }
 
+static float d3d11_pvideo_calculate_scale(unsigned int din_dout,
+                                           unsigned int output_size)
+{
+    float calculated_in = din_dout * (output_size - 1);
+    calculated_in = floorf(calculated_in / (1 << 20) + 0.5f);
+    return (calculated_in + 1.0f) / output_size;
+}
+
+static bool d3d11_prepare_pvideo_overlay(
+    NV2AState *d, D3D11PresentationConstants *constants, Error **errp)
+{
+    PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
+    PGRAPHD3D11PresentationState *presentation = r->presentation;
+    uint32_t *regs = d->pvideo.regs;
+    if (!(regs[NV_PVIDEO_BUFFER] & NV_PVIDEO_BUFFER_0_USE) ||
+        regs[NV_PVIDEO_SIZE_IN] == 0xFFFFFFFF) {
+        return true;
+    }
+
+    unsigned int input_width =
+        GET_MASK(regs[NV_PVIDEO_SIZE_IN], NV_PVIDEO_SIZE_IN_WIDTH);
+    unsigned int input_height =
+        GET_MASK(regs[NV_PVIDEO_SIZE_IN], NV_PVIDEO_SIZE_IN_HEIGHT);
+    unsigned int output_width =
+        GET_MASK(regs[NV_PVIDEO_SIZE_OUT], NV_PVIDEO_SIZE_OUT_WIDTH);
+    unsigned int output_height =
+        GET_MASK(regs[NV_PVIDEO_SIZE_OUT], NV_PVIDEO_SIZE_OUT_HEIGHT);
+    unsigned int pitch =
+        GET_MASK(regs[NV_PVIDEO_FORMAT], NV_PVIDEO_FORMAT_PITCH);
+    unsigned int format =
+        GET_MASK(regs[NV_PVIDEO_FORMAT], NV_PVIDEO_FORMAT_COLOR);
+    if (!input_width || !input_height || !output_width || !output_height) {
+        return true;
+    }
+    if (format != NV_PVIDEO_FORMAT_COLOR_LE_CR8YB8CB8YA8) {
+        error_setg(errp, "D3D11: unsupported PVIDEO color format %u", format);
+        return false;
+    }
+    unsigned int in_s =
+        GET_MASK(regs[NV_PVIDEO_POINT_IN], NV_PVIDEO_POINT_IN_S);
+    unsigned int in_t =
+        GET_MASK(regs[NV_PVIDEO_POINT_IN], NV_PVIDEO_POINT_IN_T);
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
+    unsigned int ds_dx = regs[NV_PVIDEO_DS_DX];
+    unsigned int dt_dy = regs[NV_PVIDEO_DT_DY];
+    if (ds_dx != NV_PVIDEO_DIN_DOUT_UNITY) {
+        scale_x = d3d11_pvideo_calculate_scale(ds_dx, output_width);
+    }
+    if (dt_dy != NV_PVIDEO_DIN_DOUT_UNITY) {
+        scale_y = d3d11_pvideo_calculate_scale(dt_dy, output_height);
+    }
+    if (input_width > output_width) {
+        input_width = floorf((float)output_width * scale_x + 0.5f);
+    }
+    if (input_height > output_height) {
+        input_height = floorf((float)output_height * scale_y + 0.5f);
+    }
+    if (!input_width || !input_height) {
+        return true;
+    }
+    uint64_t required_pitch = ((uint64_t)input_width + 1) / 2 * 4;
+    uint64_t bytes = (uint64_t)pitch * input_height;
+    hwaddr base = regs[NV_PVIDEO_BASE];
+    hwaddr offset = regs[NV_PVIDEO_OFFSET];
+    hwaddr limit = regs[NV_PVIDEO_LIMIT];
+    uint64_t vram_size = memory_region_size(d->vram);
+    if (pitch < required_pitch || offset > limit || bytes > limit - offset ||
+        base > UINT64_MAX - offset || base + offset > vram_size ||
+        bytes > vram_size - (base + offset)) {
+        error_setg(errp,
+                   "D3D11: PVIDEO buffer is invalid or exceeds VRAM "
+                   "(base=0x%" HWADDR_PRIx " offset=%" HWADDR_PRIx
+                   " pitch=%u size=%ux%u)",
+                   base, offset, pitch, input_width, input_height);
+        return false;
+    }
+
+    if (!presentation->pvideo_texture ||
+        presentation->pvideo_width != input_width ||
+        presentation->pvideo_height != input_height) {
+        ID3D11Texture2D *texture = NULL;
+        ID3D11ShaderResourceView *view = NULL;
+        D3D11_TEXTURE2D_DESC desc = {
+            .Width = input_width,
+            .Height = input_height,
+            .MipLevels = 1,
+            .ArraySize = 1,
+            .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+            .SampleDesc = { 1, 0 },
+            .Usage = D3D11_USAGE_DEFAULT,
+            .BindFlags = D3D11_BIND_SHADER_RESOURCE,
+        };
+        HRESULT hr = ID3D11Device_CreateTexture2D(r->device, &desc, NULL,
+                                                  &texture);
+        if (SUCCEEDED(hr)) {
+            hr = ID3D11Device_CreateShaderResourceView(
+                r->device, (ID3D11Resource *)texture, NULL, &view);
+        }
+        if (FAILED(hr)) {
+            if (view) {
+                ID3D11ShaderResourceView_Release(view);
+            }
+            if (texture) {
+                ID3D11Texture2D_Release(texture);
+            }
+            error_setg(errp,
+                       "D3D11: PVIDEO texture creation failed "
+                       "(HRESULT 0x%08lx)",
+                       (unsigned long)hr);
+            return false;
+        }
+        if (presentation->pvideo_srv) {
+            ID3D11ShaderResourceView_Release(presentation->pvideo_srv);
+        }
+        if (presentation->pvideo_texture) {
+            ID3D11Texture2D_Release(presentation->pvideo_texture);
+        }
+        presentation->pvideo_texture = texture;
+        presentation->pvideo_srv = view;
+        presentation->pvideo_width = input_width;
+        presentation->pvideo_height = input_height;
+    }
+
+    uint32_t destination_pitch = input_width * 4;
+    uint8_t *pixels = g_malloc((size_t)destination_pitch * input_height);
+    const uint8_t *source = d->vram_ptr + base + offset;
+    for (unsigned int y = 0; y < input_height; y++) {
+        const uint8_t *line = source + (size_t)y * pitch;
+        for (unsigned int x = 0; x < input_width; x++) {
+            uint8_t *pixel = pixels + ((size_t)y * input_width + x) * 4;
+            convert_yuy2_to_rgb(line, x, &pixel[0], &pixel[1], &pixel[2]);
+            pixel[3] = 255;
+        }
+    }
+    ID3D11DeviceContext_UpdateSubresource(
+        r->context, (ID3D11Resource *)presentation->pvideo_texture, 0, NULL,
+        pixels, destination_pitch, 0);
+    g_free(pixels);
+
+    unsigned int out_x =
+        GET_MASK(regs[NV_PVIDEO_POINT_OUT], NV_PVIDEO_POINT_OUT_X);
+    unsigned int out_y =
+        GET_MASK(regs[NV_PVIDEO_POINT_OUT], NV_PVIDEO_POINT_OUT_Y);
+    pgraph_apply_scaling_factor(&d->pgraph, &out_x, &out_y);
+    pgraph_apply_scaling_factor(&d->pgraph, &output_width, &output_height);
+    out_y = MAX((int)constants->display[1] - 1 -
+                    (int)(out_y + output_height),
+                0);
+
+    constants->pvideo_pos[0] = out_x;
+    constants->pvideo_pos[1] = out_y;
+    constants->pvideo_pos[2] = output_width;
+    constants->pvideo_pos[3] = output_height;
+    constants->pvideo_in_scale[0] = in_s / 16.0f;
+    constants->pvideo_in_scale[1] = in_t / 8.0f;
+    constants->pvideo_in_scale[2] = scale_x;
+    constants->pvideo_in_scale[3] = scale_y;
+    uint32_t color_key = regs[NV_PVIDEO_COLOR_KEY] & 0xFFFFFF;
+    constants->pvideo_color_key[0] =
+        GET_MASK(color_key, NV_PVIDEO_COLOR_KEY_RED) / 255.0f;
+    constants->pvideo_color_key[1] =
+        GET_MASK(color_key, NV_PVIDEO_COLOR_KEY_GREEN) / 255.0f;
+    constants->pvideo_color_key[2] =
+        GET_MASK(color_key, NV_PVIDEO_COLOR_KEY_BLUE) / 255.0f;
+    constants->pvideo_control[0] = 1.0f;
+    constants->pvideo_control[1] =
+        GET_MASK(regs[NV_PVIDEO_FORMAT], NV_PVIDEO_FORMAT_DISPLAY);
+    constants->pvideo_control[2] = presentation->pvideo_width;
+    constants->pvideo_control[3] = presentation->pvideo_height;
+    return true;
+}
+
+static float d3d11_scanout_texcoord_scale_y(uint32_t display_height,
+                                            uint32_t source_height,
+                                            uint32_t surface_pitch,
+                                            uint32_t display_pitch)
+{
+    if (!source_height) {
+        return 1.0f;
+    }
+    uint32_t line_offset = display_pitch ? surface_pitch / display_pitch : 1;
+    line_offset = MAX(line_offset, 1u);
+    return (float)display_height / (float)source_height / (float)line_offset;
+}
+
 static bool d3d11_present_color(NV2AState *d, Error **errp)
 {
     PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
@@ -450,8 +708,12 @@ static bool d3d11_present_color(NV2AState *d, Error **errp)
     PGRAPHD3D11PresentationState *presentation = r->presentation;
     bool retained_scanout = false;
     bool raw_scanout = false;
+    uint32_t source_pitch = 0;
     if (color_contains_scanout && !d3d11_retain_scanout(r, color, errp)) {
         return false;
+    }
+    if (color_contains_scanout) {
+        source_pitch = color->pitch;
     }
     if (!source_view) {
         PGRAPHD3D11CachedScanout *retained = d3d11_find_retained_scanout(d);
@@ -459,6 +721,7 @@ static bool d3d11_present_color(NV2AState *d, Error **errp)
             source_view = retained->srv;
             source_width = retained->width;
             source_height = retained->height;
+            source_pitch = retained->pitch;
             retained_scanout = true;
         }
     }
@@ -479,6 +742,7 @@ static bool d3d11_present_color(NV2AState *d, Error **errp)
         source_view = color->srv;
         source_width = color->width;
         source_height = color->height;
+        source_pitch = color->pitch;
     }
     if (!source_view) {
         /* The guest has not programmed a display mode or color surface yet. */
@@ -514,24 +778,73 @@ static bool d3d11_present_color(NV2AState *d, Error **errp)
     scanout.width = source_width;
     scanout.height = source_height;
     D3D11_VIEWPORT viewport = d3d11_presentation_viewport(r, &scanout);
+    D3D11PresentationConstants constants = { 0 };
+    constants.viewport[0] = viewport.TopLeftX;
+    constants.viewport[1] = viewport.TopLeftY;
+    constants.viewport[2] = viewport.Width;
+    constants.viewport[3] = viewport.Height;
+    int display_width, display_height;
+    d->vga.get_resolution(&d->vga, &display_width, &display_height);
+    if (display_width <= 0 || display_height <= 0) {
+        display_width = source_width;
+        display_height = source_height;
+    }
+    if (d->vga.cr[NV_PRMCIO_INTERLACE_MODE] !=
+        NV_PRMCIO_INTERLACE_MODE_DISABLED) {
+        display_height *= 2;
+    }
+    unsigned int scaled_display_width = display_width;
+    unsigned int scaled_display_height = display_height;
+    pgraph_apply_scaling_factor(&d->pgraph, &scaled_display_width,
+                                &scaled_display_height);
+    constants.display[0] = scaled_display_width;
+    constants.display[1] = scaled_display_height;
+    constants.display[2] =
+        source_pitch ? d3d11_scanout_texcoord_scale_y(
+                           scaled_display_height, source_height, source_pitch,
+                           params.line_offset) :
+                       1.0f;
+    constants.display[3] = d->pgraph.surface_scale_factor ?
+                               1.0f / d->pgraph.surface_scale_factor :
+                               1.0f;
+    if (!d3d11_prepare_pvideo_overlay(d, &constants, errp)) {
+        return false;
+    }
+    ID3D11DeviceContext_UpdateSubresource(
+        r->context, (ID3D11Resource *)presentation->constants, 0, NULL,
+        &constants, 0, 0);
     ID3D11SamplerState *sampler =
         g_config.display.filtering == CONFIG_DISPLAY_FILTERING_LINEAR ?
             presentation->linear_sampler :
             presentation->nearest_sampler;
+    ID3D11ShaderResourceView *presentation_views[2] = {
+        source_view, presentation->pvideo_srv,
+    };
+    ID3D11SamplerState *presentation_samplers[2] = {
+        sampler, presentation->pvideo_sampler,
+    };
     ID3D11DeviceContext_RSSetViewports(r->context, 1, &viewport);
     ID3D11DeviceContext_IASetInputLayout(r->context, NULL);
     ID3D11DeviceContext_IASetPrimitiveTopology(
         r->context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_VSSetShader(r->context, presentation->vertex_shader,
-                                    NULL, 0);
+                                   NULL, 0);
+    ID3D11DeviceContext_GSSetShader(r->context, NULL, NULL, 0);
     ID3D11DeviceContext_PSSetShader(r->context, presentation->pixel_shader,
                                     NULL, 0);
-    ID3D11DeviceContext_PSSetSamplers(r->context, 0, 1, &sampler);
-    ID3D11DeviceContext_PSSetShaderResources(r->context, 0, 1, &source_view);
+    ID3D11DeviceContext_PSSetConstantBuffers(r->context, 0, 1,
+                                             &presentation->constants);
+    ID3D11DeviceContext_PSSetSamplers(r->context, 0,
+                                      ARRAY_SIZE(presentation_samplers),
+                                      presentation_samplers);
+    ID3D11DeviceContext_PSSetShaderResources(r->context, 0,
+                                             ARRAY_SIZE(presentation_views),
+                                             presentation_views);
     ID3D11DeviceContext_Draw(r->context, 3, 0);
 
-    ID3D11ShaderResourceView *null_view = NULL;
-    ID3D11DeviceContext_PSSetShaderResources(r->context, 0, 1, &null_view);
+    ID3D11ShaderResourceView *null_views[2] = { NULL, NULL };
+    ID3D11DeviceContext_PSSetShaderResources(r->context, 0,
+                                             ARRAY_SIZE(null_views), null_views);
     if (xemu_hud_screenshot_pending()) {
         D3D11_TEXTURE2D_DESC desc;
         ID3D11Texture2D_GetDesc(r->backbuffer, &desc);
@@ -587,6 +900,7 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     ID3D11PixelShader *pixel;
     ID3D11ShaderResourceView *views[NV2A_MAX_TEXTURES];
     ID3D11SamplerState *samplers[NV2A_MAX_TEXTURES];
+    ID3D11Buffer *constant_buffers[1];
     ID3D11DeviceContext_OMGetRenderTargets(context, ARRAY_SIZE(targets),
                                            targets, &depth);
     ID3D11DeviceContext_OMGetBlendState(context, &blend, blend_factor,
@@ -603,6 +917,9 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
                                              views);
     ID3D11DeviceContext_PSGetSamplers(context, 0, ARRAY_SIZE(samplers),
                                       samplers);
+    ID3D11DeviceContext_PSGetConstantBuffers(context, 0,
+                                             ARRAY_SIZE(constant_buffers),
+                                             constant_buffers);
 
     bool result = d3d11_present_color(d, errp);
 
@@ -617,11 +934,15 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     ID3D11DeviceContext_IASetInputLayout(context, layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(context, topology);
     ID3D11DeviceContext_VSSetShader(context, vertex, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(context, NULL, NULL, 0);
     ID3D11DeviceContext_PSSetShader(context, pixel, NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(context, 0, ARRAY_SIZE(views),
                                              views);
     ID3D11DeviceContext_PSSetSamplers(context, 0, ARRAY_SIZE(samplers),
                                       samplers);
+    ID3D11DeviceContext_PSSetConstantBuffers(context, 0,
+                                             ARRAY_SIZE(constant_buffers),
+                                             constant_buffers);
 #define RELEASE_SAVED(type, object) \
     if (object) {                   \
         type##_Release(object);     \
@@ -632,6 +953,9 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     for (unsigned int i = 0; i < ARRAY_SIZE(views); i++) {
         RELEASE_SAVED(ID3D11ShaderResourceView, views[i]);
         RELEASE_SAVED(ID3D11SamplerState, samplers[i]);
+    }
+    for (unsigned int i = 0; i < ARRAY_SIZE(constant_buffers); i++) {
+        RELEASE_SAVED(ID3D11Buffer, constant_buffers[i]);
     }
     RELEASE_SAVED(ID3D11DepthStencilView, depth);
     RELEASE_SAVED(ID3D11BlendState, blend);

@@ -23,6 +23,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "hw/xbox/nv2a/nv2a.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
@@ -80,6 +81,9 @@ static D3D11_CULL_MODE d3d11_cull_mode(PGRAPHState *pg, bool *skip_draw)
 {
     uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
     *skip_draw = false;
+    if (pg->primitive_mode == PRIM_TYPE_POINTS) {
+        return D3D11_CULL_NONE;
+    }
     if (!(raster & NV_PGRAPH_SETUPRASTER_CULLENABLE)) {
         return D3D11_CULL_NONE;
     }
@@ -94,6 +98,20 @@ static D3D11_CULL_MODE d3d11_cull_mode(PGRAPHState *pg, bool *skip_draw)
     default:
         return D3D11_CULL_NONE;
     }
+}
+
+static bool d3d11_primitive_uses_face_culling(
+    enum ShaderPrimitiveMode primitive_mode, bool polygon_line_mode,
+    bool polygon_point_mode)
+{
+    if (primitive_mode == PRIM_TYPE_POINTS ||
+        primitive_mode == PRIM_TYPE_LINES ||
+        primitive_mode == PRIM_TYPE_LINE_LOOP ||
+        primitive_mode == PRIM_TYPE_LINE_STRIP || polygon_line_mode ||
+        polygon_point_mode) {
+        return false;
+    }
+    return true;
 }
 
 static D3D11_FILL_MODE d3d11_fill_mode(uint32_t raster)
@@ -120,8 +138,31 @@ static bool d3d11_polygon_offset_enabled(PGRAPHState *pg, uint32_t raster)
             (raster & NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE)) ||
            (mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_LINE &&
             (raster & NV_PGRAPH_SETUPRASTER_POFFSETLINEENABLE)) ||
-           (mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_POINT &&
+            (mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_POINT &&
             (raster & NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE));
+}
+
+static bool d3d11_antialiased_line_enable(bool multisample_enabled,
+                                          bool line_smooth_enabled)
+{
+    return !multisample_enabled && line_smooth_enabled;
+}
+
+static bool d3d11_wide_line_smoothing_requested(
+    bool multisample_enabled, bool line_smooth_enabled, bool wide_lines)
+{
+    return !multisample_enabled && line_smooth_enabled && wide_lines;
+}
+
+static bool d3d11_polygon_smoothing_requested(
+    bool multisample_enabled, bool polygon_smooth_enabled,
+    enum ShaderPrimitiveMode primitive_mode, unsigned int front_polygon_mode,
+    unsigned int back_polygon_mode)
+{
+    return !multisample_enabled && polygon_smooth_enabled &&
+           primitive_mode >= PRIM_TYPE_TRIANGLES &&
+           front_polygon_mode == POLY_MODE_FILL &&
+           back_polygon_mode == POLY_MODE_FILL;
 }
 
 static bool d3d11_finite_float(float value)
@@ -133,14 +174,21 @@ static bool d3d11_finite_float(float value)
 
 static void G_GNUC_UNUSED d3d11_append_sequence_indices(
     GArray *indices, enum ShaderPrimitiveMode mode, const uint32_t *source,
-    uint32_t count, bool clockwise)
+    uint32_t count, bool clockwise, bool polygon_line)
 {
 #define APPEND_INDEX(v)                 \
     do {                                \
         uint32_t n = (v);               \
         g_array_append_val(indices, n); \
     } while (0)
-    if (mode == PRIM_TYPE_LINE_LOOP) {
+    if (mode == PRIM_TYPE_POLYGON && polygon_line) {
+        if (count > 1) {
+            for (uint32_t i = 0; i < count; i++) {
+                APPEND_INDEX(source[i]);
+                APPEND_INDEX(source[(i + 1) % count]);
+            }
+        }
+    } else if (mode == PRIM_TYPE_LINE_LOOP) {
         for (uint32_t i = 1; i < count; i++) {
             APPEND_INDEX(source[i - 1]);
             APPEND_INDEX(source[i]);
@@ -190,6 +238,50 @@ bool pgraph_d3d11_update_rasterizer(NV2AState *d, Error **errp)
     PGRAPHD3D11DrawState *draw = r->draw;
     uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
     bool skip_draw;
+    unsigned int polygon_mode = GET_MASK(
+        raster, NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+    unsigned int back_polygon_mode = GET_MASK(
+        raster, NV_PGRAPH_SETUPRASTER_BACKFACEMODE);
+    bool polygon_line_mode = pg->primitive_mode >= PRIM_TYPE_TRIANGLES &&
+        (polygon_mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_LINE ||
+         back_polygon_mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_LINE);
+    bool wide_lines = pgraph_d3d11_needs_wide_lines(
+        pg->primitive_mode, polygon_mode, pg->surface_scale_factor);
+    bool point_primitive = pg->primitive_mode == PRIM_TYPE_POINTS;
+    bool polygon_point_mode = pg->primitive_mode >= PRIM_TYPE_TRIANGLES &&
+        (polygon_mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_POINT ||
+         back_polygon_mode == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_POINT);
+    D3D11_CULL_MODE cull_mode = d3d11_cull_mode(pg, &skip_draw);
+    if (!d3d11_primitive_uses_face_culling(pg->primitive_mode,
+                                          polygon_line_mode,
+                                          polygon_point_mode)) {
+        /* The GL geometry path emits lines/points, not cullable polygons. */
+        cull_mode = D3D11_CULL_NONE;
+        skip_draw = false;
+    }
+    bool anti_aliasing = !!GET_MASK(
+        pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING),
+        NV_PGRAPH_ANTIALIASING_ENABLE);
+    bool polygon_smoothing_requested = d3d11_polygon_smoothing_requested(
+        anti_aliasing,
+        !!(raster & NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE),
+        pg->primitive_mode, polygon_mode, back_polygon_mode);
+    if (polygon_smoothing_requested) {
+        warn_report_once(
+            "D3D11: NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE is enabled for a "
+            "filled polygon draw, but fixed-function polygon smoothing is "
+            "unsupported and will be ignored");
+    }
+    bool wide_line_smoothing_requested = d3d11_wide_line_smoothing_requested(
+        anti_aliasing,
+        !!(raster & NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE), wide_lines);
+    if (wide_line_smoothing_requested) {
+        warn_report_once(
+            "D3D11: NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE is enabled for a "
+            "wide-line draw without PGRAPH anti-aliasing, but geometry-expanded "
+            "filled quads do not reproduce GL_LINE_SMOOTH coverage and will be "
+            "rendered without line smoothing");
+    }
     float depth_bias = 0.0f, slope_bias = 0.0f;
     if (d3d11_polygon_offset_enabled(pg, raster)) {
         uint32_t bias_bits = pgraph_reg_r(pg, NV_PGRAPH_ZOFFSETBIAS);
@@ -207,8 +299,9 @@ bool pgraph_d3d11_update_rasterizer(NV2AState *d, Error **errp)
                 (int32_t)(depth_bias + (depth_bias >= 0 ? 0.5f : -0.5f));
     }
     D3D11_RASTERIZER_DESC desc = {
-        .FillMode = d3d11_fill_mode(raster),
-        .CullMode = d3d11_cull_mode(pg, &skip_draw),
+        .FillMode = (wide_lines || point_primitive || polygon_point_mode) ?
+                        D3D11_FILL_SOLID : d3d11_fill_mode(raster),
+        .CullMode = cull_mode,
         /* The PGRAPH clip-space Y direction is inverted relative to D3D11. */
         .FrontCounterClockwise = !!(raster & NV_PGRAPH_SETUPRASTER_FRONTFACE),
         .DepthBias = integer_depth_bias,
@@ -217,11 +310,10 @@ bool pgraph_d3d11_update_rasterizer(NV2AState *d, Error **errp)
             d3d11_finite_float(slope_bias) ? slope_bias : 0.0f,
         .DepthClipEnable = FALSE,
         .ScissorEnable = TRUE,
-        .MultisampleEnable =
-            !!GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_ANTIALIASING),
-                       NV_PGRAPH_ANTIALIASING_ENABLE),
-        .AntialiasedLineEnable =
-            !!(raster & NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE),
+        .MultisampleEnable = anti_aliasing,
+        .AntialiasedLineEnable = d3d11_antialiased_line_enable(
+            anti_aliasing,
+            !!(raster & NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE)),
     };
     draw->skip_draw = skip_draw;
     if (!draw->rasterizer_state_valid ||
@@ -266,12 +358,8 @@ bool pgraph_d3d11_update_rasterizer(NV2AState *d, Error **errp)
     pgraph_apply_anti_aliasing_factor(pg, &width, &height);
     pgraph_apply_scaling_factor(pg, &x, &y);
     pgraph_apply_scaling_factor(pg, &width, &height);
-    D3D11_RECT scissor = {
-        .left = x,
-        .top = y,
-        .right = x + width,
-        .bottom = y + height,
-    };
+    D3D11_RECT scissor = pgraph_d3d11_gl_scissor_rect(
+        viewport_height, x, y, width, height);
     ID3D11DeviceContext_RSSetScissorRects(r->context, 1, &scissor);
     return true;
 }
@@ -375,8 +463,51 @@ static void d3d11_decode_attribute(const VertexAttribute *attr,
     }
 }
 
+static bool d3d11_state_vertex_index(uint32_t first, uint32_t count,
+                                     const uint32_t *source_indices,
+                                     uint32_t source_index_count,
+                                     uint32_t *state_vertex)
+{
+    if (!count || first > UINT32_MAX - count || !state_vertex) {
+        return false;
+    }
+    if (source_indices) {
+        if (!source_index_count) {
+            return false;
+        }
+        for (uint32_t i = 0; i < source_index_count; i++) {
+            if (source_indices[i] < first ||
+                source_indices[i] - first >= count) {
+                return false;
+            }
+        }
+        *state_vertex = source_indices[source_index_count - 1];
+    } else {
+        if (source_index_count) {
+            return false;
+        }
+        *state_vertex = first + count - 1;
+    }
+    return *state_vertex >= first && *state_vertex - first < count;
+}
+
+static bool d3d11_indexed_vertex_span(uint32_t minimum, uint32_t maximum,
+                                      uint32_t *vertex_count)
+{
+    if (!vertex_count || maximum < minimum) {
+        return false;
+    }
+    uint64_t span = (uint64_t)maximum - minimum + 1;
+    if (span > UINT32_MAX) {
+        return false;
+    }
+    *vertex_count = (uint32_t)span;
+    return true;
+}
+
 static bool d3d11_pack_vertices(NV2AState *d, D3D11VertexSource source,
                                 uint32_t first, uint32_t count,
+                                uint32_t state_vertex,
                                 D3D11PackedVertex *vertices, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -385,6 +516,10 @@ static bool d3d11_pack_vertices(NV2AState *d, D3D11VertexSource source,
         (source == D3D11_VERTEX_SOURCE_INLINE_BUFFER &&
          (uint64_t)first + count > pg->inline_buffer_length)) {
         error_setg(errp, "D3D11: invalid inline vertex range");
+        return false;
+    }
+    if (state_vertex < first || state_vertex - first >= count) {
+        error_setg(errp, "D3D11: invalid vertex state index");
         return false;
     }
     if (source == D3D11_VERTEX_SOURCE_INLINE_ARRAY) {
@@ -436,16 +571,17 @@ static bool d3d11_pack_vertices(NV2AState *d, D3D11VertexSource source,
                         attr->inline_array_offset;
             stride = inline_stride;
         } else {
-            hwaddr dma_len;
-            base = nv_dma_map(
-                d, attr->dma_select ? pg->dma_vertex_b : pg->dma_vertex_a,
-                &dma_len);
-            if (!base || attr->offset >= dma_len) {
+            hwaddr dma_len = 0;
+            uint8_t *mapping = NULL;
+            if (!nv_dma_map_checked(
+                    d, attr->dma_select ? pg->dma_vertex_b : pg->dma_vertex_a,
+                    &mapping, &dma_len) ||
+                attr->offset >= dma_len) {
                 error_setg(errp, "D3D11: vertex attribute %u is outside DMA",
                            attr_index);
                 return false;
             }
-            base += attr->offset;
+            base = mapping + attr->offset;
             available = dma_len - attr->offset;
             stride = attr->stride;
         }
@@ -479,14 +615,16 @@ static bool d3d11_pack_vertices(NV2AState *d, D3D11VertexSource source,
             d3d11_decode_attribute(attr, base + (first + vertex) * stride,
                                    vertices[vertex].attributes[attr_index]);
         }
-        memcpy(attr->inline_value, vertices[count - 1].attributes[attr_index],
+        memcpy(attr->inline_value,
+               vertices[state_vertex - first].attributes[attr_index],
                sizeof(attr->inline_value));
     }
     return true;
 }
 
 static bool d3d11_upload_vertices(NV2AState *d, D3D11VertexSource source,
-                                  uint32_t first, uint32_t count, Error **errp)
+                                  uint32_t first, uint32_t count,
+                                  uint32_t state_vertex, Error **errp)
 {
     PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
     size_t size = count * sizeof(D3D11PackedVertex);
@@ -504,8 +642,8 @@ static bool d3d11_upload_vertices(NV2AState *d, D3D11VertexSource source,
                    (unsigned long)hr);
         return false;
     }
-    bool packed =
-        d3d11_pack_vertices(d, source, first, count, mapped.pData, errp);
+    bool packed = d3d11_pack_vertices(d, source, first, count, state_vertex,
+                                      mapped.pData, errp);
     ID3D11DeviceContext_Unmap(r->context,
                               (ID3D11Resource *)r->draw->vertex_buffer, 0);
     if (!packed) {
@@ -580,13 +718,32 @@ static bool d3d11_emit_draw(NV2AState *d, D3D11VertexSource source,
     if (!vertex_count || r->draw->skip_draw) {
         return true;
     }
-    if (!d3d11_upload_vertices(d, source, first, vertex_count, errp)) {
+    uint32_t state_vertex;
+    if (!d3d11_state_vertex_index(first, vertex_count, source_indices,
+                                  source_index_count, &state_vertex)) {
+        error_setg(errp, "D3D11: invalid draw vertex index range");
+        return false;
+    }
+    if (!d3d11_upload_vertices(d, source, first, vertex_count, state_vertex,
+                               errp)) {
         return false;
     }
     D3D11_PRIMITIVE_TOPOLOGY topology;
     bool native = d3d11_native_topology(pg->primitive_mode, &topology);
+    if (r->shaders->polygon_line_geometry) {
+        topology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
+        native = true;
+    } else if (r->shaders->quad_adjacency_geometry) {
+        if (pg->primitive_mode == PRIM_TYPE_QUADS) {
+            topology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
+            native = true;
+        } else if (pg->primitive_mode == PRIM_TYPE_QUAD_STRIP) {
+            topology = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ;
+            native = true;
+        }
+    }
     ID3D11DeviceContext_IASetPrimitiveTopology(r->context, topology);
-    if (!source_indices && native) {
+    if (!source_indices && native && !r->shaders->polygon_line_geometry) {
         ID3D11DeviceContext_Draw(r->context, vertex_count, 0);
         return true;
     }
@@ -604,11 +761,12 @@ static bool d3d11_emit_draw(NV2AState *d, D3D11VertexSource source,
             g_array_append_val(indices, index);
         }
     }
-    if (!native) {
+    if (!native || r->shaders->polygon_line_geometry) {
         GArray *converted = g_array_new(FALSE, FALSE, sizeof(uint32_t));
         d3d11_append_sequence_indices(converted, pg->primitive_mode,
                                       (const uint32_t *)indices->data,
-                                      indices->len, true);
+                                      indices->len, true,
+                                      r->shaders->polygon_line_geometry);
         g_array_unref(indices);
         indices = converted;
     }
@@ -640,8 +798,14 @@ bool pgraph_d3d11_flush_draw(NV2AState *d, Error **errp)
             min_element = MIN(min_element, pg->inline_elements[i]);
             max_element = MAX(max_element, pg->inline_elements[i]);
         }
+        uint32_t vertex_count;
+        if (!d3d11_indexed_vertex_span(min_element, max_element,
+                                       &vertex_count)) {
+            error_setg(errp, "D3D11: inline element vertex range overflows");
+            return false;
+        }
         return d3d11_emit_draw(d, D3D11_VERTEX_SOURCE_ARRAY, min_element,
-                               max_element - min_element + 1,
+                               vertex_count,
                                pg->inline_elements, pg->inline_elements_length,
                                errp);
     }

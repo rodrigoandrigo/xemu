@@ -469,6 +469,11 @@ void *pfifo_thread(void *arg)
 
         pgraph_process_pending_reports(d);
 
+        /* PGRAPH work may drop pfifo.lock while the exit path signals us. */
+        if (d->exiting) {
+            break;
+        }
+
         if (!d->pfifo.fifo_kick) {
             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);
 

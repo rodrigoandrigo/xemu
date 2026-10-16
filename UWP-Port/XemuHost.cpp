@@ -147,6 +147,7 @@ XemuHost::XemuHost()
       m_virtualJoystick(nullptr), m_uwpGamepad(nullptr),
       m_gamepadErrorLogged(false), m_lastGamepadTimestamp(0),
       m_gamepadChangeLogs(0), m_renderPanel(nullptr),
+      m_swapChainAttachState(std::make_shared<SwapChainAttachState>()),
       m_renderWidth(0), m_renderHeight(0),
       m_getApiVersion(nullptr), m_getVideoMetrics(nullptr),
       m_init(nullptr), m_start(nullptr),
@@ -175,6 +176,19 @@ XemuHost::~XemuHost()
 {
     WriteDiagnostic("[host] Shutting down XemuHost");
     Stop();
+    if (m_swapChainAttachState) {
+        m_swapChainAttachState->active.store(false);
+    }
+    if (m_setMesaSwapChainAttach) {
+        m_setMesaSwapChainAttach(nullptr, nullptr);
+    }
+    if (m_setD3D12PresentTarget) {
+        int result = m_setD3D12PresentTarget(0, 0, nullptr, nullptr);
+        if (result) {
+            SetError("Failed to clear the native presentation target (error " +
+                     std::to_string(result) + ")");
+        }
+    }
     DetachUWPGamepad();
     if (m_module) {
         FreeLibrary(m_module);
@@ -503,23 +517,69 @@ long __cdecl XemuHost::AttachMesaSwapChain(void* opaque, void* swapchain)
 {
     auto host = static_cast<XemuHost*>(opaque);
     auto panel = host ? host->m_renderPanel : nullptr;
+    auto state = host ? host->m_swapChainAttachState : nullptr;
     auto nativeSwapChain = static_cast<IDXGISwapChain*>(swapchain);
-    if (!panel || !nativeSwapChain) {
+    const bool detach = nativeSwapChain == nullptr;
+    if (!panel || !state) {
         return E_POINTER;
     }
 
     Microsoft::WRL::ComPtr<IDXGISwapChain> retainedSwapChain = nativeSwapChain;
-    auto attach = [host, panel, retainedSwapChain]() -> HRESULT {
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->requestedSwapChain = retainedSwapChain;
+        state->requestedDetach = detach;
+        generation = ++state->requestGeneration;
+        state->lastResult.store(S_FALSE);
+        state->pending.store(true);
+    }
+    auto recordResult = [state, generation](HRESULT result) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->requestGeneration == generation) {
+            state->lastResult.store(result);
+            state->pending.store(false);
+        }
+    };
+    auto attach = [state, panel, retainedSwapChain, detach, generation,
+                   recordResult]() -> HRESULT {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->requestGeneration != generation) {
+                return S_FALSE;
+            }
+        }
+        if (!detach && !state->active.load()) {
+            recordResult(E_ABORT);
+            return E_ABORT;
+        }
         Microsoft::WRL::ComPtr<ISwapChainPanelNative> panelNative;
         HRESULT result = reinterpret_cast<IUnknown*>(panel)->QueryInterface(
             IID_PPV_ARGS(&panelNative));
         if (FAILED(result)) {
+            recordResult(result);
+            return result;
+        }
+
+        if (detach) {
+            result = panelNative->SetSwapChain(nullptr);
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->requestGeneration == generation) {
+                if (SUCCEEDED(result)) {
+                    state->swapChain.Reset();
+                    state->requestedSwapChain.Reset();
+                    state->requestedDetach = false;
+                }
+                state->lastResult.store(result);
+                state->pending.store(false);
+            }
             return result;
         }
 
         Microsoft::WRL::ComPtr<IDXGISwapChain2> swapChain2;
         result = retainedSwapChain.As(&swapChain2);
         if (FAILED(result)) {
+            recordResult(result);
             return result;
         }
 
@@ -528,12 +588,20 @@ long __cdecl XemuHost::AttachMesaSwapChain(void* opaque, void* swapchain)
         inverseScale._22 = 1.0f / panel->CompositionScaleY;
         result = swapChain2->SetMatrixTransform(&inverseScale);
         if (FAILED(result)) {
+            recordResult(result);
             return result;
         }
 
         result = panelNative->SetSwapChain(retainedSwapChain.Get());
-        if (SUCCEEDED(result)) {
-            host->m_swapChain = swapChain2;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->requestGeneration == generation) {
+            if (SUCCEEDED(result)) {
+                state->swapChain = swapChain2;
+                state->requestedSwapChain.Reset();
+                state->requestedDetach = false;
+            }
+            state->lastResult.store(result);
+            state->pending.store(false);
         }
         return result;
     };
@@ -545,15 +613,11 @@ long __cdecl XemuHost::AttachMesaSwapChain(void* opaque, void* swapchain)
     try {
         panel->Dispatcher->RunAsync(
             Windows::UI::Core::CoreDispatcherPriority::High,
-            ref new Windows::UI::Core::DispatchedHandler([host, attach]() {
-                HRESULT result = attach();
-                if (FAILED(result)) {
-                    host->WriteDiagnostic(
-                        "[display] Failed to attach renderer swapchain on the UI thread: " +
-                        std::to_string(result));
-                }
+            ref new Windows::UI::Core::DispatchedHandler([attach]() {
+                attach();
             }));
     } catch (Platform::Exception^ exception) {
+        recordResult(exception->HResult);
         return exception->HResult;
     }
     /*
@@ -592,11 +656,16 @@ bool XemuHost::UpdateRenderPanelSize(
         return false;
     }
 
-    if (m_swapChain) {
+    Microsoft::WRL::ComPtr<IDXGISwapChain2> swapChain;
+    if (m_swapChainAttachState) {
+        std::lock_guard<std::mutex> lock(m_swapChainAttachState->mutex);
+        swapChain = m_swapChainAttachState->swapChain;
+    }
+    if (swapChain) {
         DXGI_MATRIX_3X2_F inverseScale{};
         inverseScale._11 = 1.0f / panel->CompositionScaleX;
         inverseScale._22 = 1.0f / panel->CompositionScaleY;
-        HRESULT result = m_swapChain->SetMatrixTransform(&inverseScale);
+        HRESULT result = swapChain->SetMatrixTransform(&inverseScale);
         if (FAILED(result)) {
             std::ostringstream message;
             message << "Failed to remove XAML scaling from the swapchain (0x"
@@ -625,6 +694,9 @@ bool XemuHost::RegisterNativePresentTarget()
         SetError("Failed to register native renderer presentation target (error " +
                  std::to_string(result) + ")");
         return false;
+    }
+    if (m_swapChainAttachState) {
+        m_swapChainAttachState->lastResult.store(0);
     }
     WriteDiagnostic("[display] Native renderer presentation target registered: " +
                     std::to_string(m_renderWidth) + "x" +
@@ -958,8 +1030,48 @@ void XemuHost::SetError(const std::string& error)
 
 std::string XemuHost::LastError() const
 {
+    if (m_swapChainAttachState) {
+        long result = m_swapChainAttachState->lastResult.load();
+        if (FAILED(result)) {
+            std::ostringstream message;
+            message << "Failed to attach/detach renderer swapchain on the UI thread (0x"
+                    << std::hex << static_cast<unsigned long>(result) << ")";
+            return message.str();
+        }
+    }
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_error;
+}
+
+bool XemuHost::RetrySwapChainAttach()
+{
+    auto state = m_swapChainAttachState;
+    if (!state || state->pending.load() ||
+        !FAILED(state->lastResult.load())) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGISwapChain> requestedSwapChain;
+    bool detach;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->pending.load() || !FAILED(state->lastResult.load())) {
+            return false;
+        }
+        detach = state->requestedDetach;
+        requestedSwapChain = state->requestedSwapChain;
+        if (!detach && !requestedSwapChain) {
+            return false;
+        }
+    }
+
+    AttachMesaSwapChain(this, detach ? nullptr : requestedSwapChain.Get());
+    return true;
+}
+
+bool XemuHost::IsSwapChainAttachPending() const
+{
+    return m_swapChainAttachState && m_swapChainAttachState->pending.load();
 }
 
 void XemuHost::WriteDiagnostic(const std::string& message)

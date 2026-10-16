@@ -13,6 +13,13 @@
 
 #include "qapi/error.h"
 
+#define PGRAPHD3D11_DEPTH_GS_VARIANTS_PER_WIDTH 42
+#define PGRAPHD3D11_DEPTH_GS_VARIANTS \
+    (2 * PGRAPHD3D11_DEPTH_GS_VARIANTS_PER_WIDTH)
+#define PGRAPHD3D11_POINT_GS_VARIANT PGRAPHD3D11_DEPTH_GS_VARIANTS
+#define PGRAPHD3D11_GEOMETRY_SHADER_VARIANTS \
+    (PGRAPHD3D11_DEPTH_GS_VARIANTS + 1)
+
 typedef struct PGRAPHState PGRAPHState;
 typedef struct PGRAPHD3D11State PGRAPHD3D11State;
 
@@ -36,6 +43,12 @@ typedef struct PGRAPHD3D11ShaderState {
     GHashTable *failed_pixel_cache;
     PGRAPHD3D11VertexShader *vertex;
     PGRAPHD3D11PixelShader *pixel;
+    ID3D11GeometryShader *depth_geometry_shaders[
+        PGRAPHD3D11_GEOMETRY_SHADER_VARIANTS];
+    bool depth_geometry_shader_failed[
+        PGRAPHD3D11_GEOMETRY_SHADER_VARIANTS];
+    bool quad_adjacency_geometry;
+    bool polygon_line_geometry;
     ID3D11Buffer *vertex_constants;
     ID3D11Buffer *pixel_constants;
     char *cache_directory;
@@ -47,5 +60,8 @@ void pgraph_d3d11_shaders_finalize(PGRAPHD3D11State *r);
 void pgraph_d3d11_shaders_trim(PGRAPHD3D11State *r);
 bool pgraph_d3d11_bind_vertex_shader(PGRAPHState *pg, Error **errp);
 bool pgraph_d3d11_bind_pixel_shader(PGRAPHState *pg, Error **errp);
+bool pgraph_d3d11_needs_wide_lines(unsigned int primitive,
+                                  unsigned int polygon_mode,
+                                  unsigned int surface_scale_factor);
 
 #endif

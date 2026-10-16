@@ -1,4 +1,4 @@
-﻿//
+//
 // DirectXPage.xaml.cpp
 // Implementação da classe DirectXPage.
 //
@@ -121,10 +121,11 @@ const char *BoolText(bool value)
 }
 }
 
-DirectXPage::DirectXPage():
-	m_windowVisible(true),
-	m_renderAttached(false),
-	m_flashReady(false),
+	DirectXPage::DirectXPage():
+		m_windowVisible(true),
+		m_renderAttached(false),
+		m_swapChainRetryAttempted(false),
+		m_flashReady(false),
 	m_bootromReady(false),
 	m_hddReady(false),
 	m_dvdReady(false),
@@ -312,7 +313,22 @@ void DirectXPage::OnRendering(Object^, Object^)
 			scraperStatus->Text = m_screenScraper->Status;
 			scraperRepository->Text = m_screenScraper->RepositoryPath;
 		}
-	}
+		if (m_renderAttached && m_xemu) {
+			std::string error = m_xemu->LastError();
+			if (!error.empty()) {
+				errorText->Text = ref new String(
+					std::wstring(error.begin(), error.end()).c_str());
+				if (!m_swapChainRetryAttempted) {
+					m_swapChainRetryAttempted =
+						m_xemu->RetrySwapChainAttach();
+				}
+			} else if (m_swapChainRetryAttempted &&
+				   !m_xemu->IsSwapChainAttachPending()) {
+				errorText->Text = "";
+				m_swapChainRetryAttempted = false;
+			}
+		}
+		}
 	if (m_windowVisible && m_xemu) {
 		if (m_xemu->IsRunning()) {
 			HideSystemPointer();
@@ -434,7 +450,7 @@ void DirectXPage::OnRenderPanelScaleChanged(SwapChainPanel^, Object^)
 // Chamado quando você clica no botão da barra de aplicativos.
 void DirectXPage::AppBarButton_Click(Object^ sender, RoutedEventArgs^ e)
 {
-	// Use a barra de aplicativos se ela for apropriada para seu aplicativo. Crie a barra de aplicativos, 
+// Use a barra de aplicativos se ela for apropriada para seu aplicativo. Crie a barra de aplicativos,
 	// depois preencha os manipuladores de eventos (como este).
 }
 

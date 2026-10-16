@@ -12,10 +12,29 @@
 #include "renderer.h"
 #include "surfaces.h"
 
+static LONG d3d11_scissor_coordinate(int64_t value)
+{
+    return (LONG)CLAMP(value, (int64_t)INT32_MIN, (int64_t)INT32_MAX);
+}
+
+D3D11_RECT pgraph_d3d11_gl_scissor_rect(uint32_t viewport_height,
+                                         uint32_t x, uint32_t y,
+                                         uint32_t width, uint32_t height)
+{
+    return (D3D11_RECT) {
+        .left = d3d11_scissor_coordinate(x),
+        .top = d3d11_scissor_coordinate((int64_t)viewport_height - y - height),
+        .right = d3d11_scissor_coordinate((int64_t)x + width),
+        .bottom = d3d11_scissor_coordinate((int64_t)viewport_height - y),
+    };
+}
+
 static void d3d11_release_target(PGRAPHD3D11RenderTarget *target)
 {
     if (target->access_cb && tcg_enabled()) {
-        mem_access_callback_remove_by_ref(qemu_get_cpu(0), target->access_cb);
+        MemAccessCallback *access_cb = target->access_cb;
+        target->access_cb = NULL;
+        mem_access_callback_remove_by_ref_async(qemu_get_cpu(0), access_cb);
     }
     if (target->dsv) {
         ID3D11DepthStencilView_Release(target->dsv);
@@ -35,9 +54,11 @@ static void d3d11_release_target(PGRAPHD3D11RenderTarget *target)
 static bool d3d11_ranges_overlap(hwaddr first, size_t first_length,
                                  hwaddr second, size_t second_length)
 {
-    uint64_t first_end = first + first_length;
-    uint64_t second_end = second + second_length;
-    return first < second_end && second < first_end;
+    if (!first_length || !second_length) {
+        return false;
+    }
+    return first <= second ? second - first < first_length :
+                             first - second < second_length;
 }
 
 static D3D11_COMPARISON_FUNC d3d11_comparison(unsigned int value)
@@ -96,6 +117,53 @@ static D3D11_BLEND d3d11_alpha_blend_factor(D3D11_BLEND value)
     }
 }
 
+static bool d3d11_blend_factors_use_constant_alpha(unsigned int source,
+                                                    unsigned int destination)
+{
+    return source == NV_PGRAPH_BLEND_SFACTOR_CONSTANT_ALPHA ||
+           source == NV_PGRAPH_BLEND_SFACTOR_ONE_MINUS_CONSTANT_ALPHA ||
+           destination == NV_PGRAPH_BLEND_DFACTOR_CONSTANT_ALPHA ||
+           destination == NV_PGRAPH_BLEND_DFACTOR_ONE_MINUS_CONSTANT_ALPHA;
+}
+
+static bool d3d11_blend_factors_use_constant_color(unsigned int source,
+                                                    unsigned int destination)
+{
+    return source == NV_PGRAPH_BLEND_SFACTOR_CONSTANT_COLOR ||
+           source == NV_PGRAPH_BLEND_SFACTOR_ONE_MINUS_CONSTANT_COLOR ||
+           destination == NV_PGRAPH_BLEND_DFACTOR_CONSTANT_COLOR ||
+           destination == NV_PGRAPH_BLEND_DFACTOR_ONE_MINUS_CONSTANT_COLOR;
+}
+
+static bool d3d11_blend_factors_conflict(unsigned int source,
+                                         unsigned int destination,
+                                         D3D11_BLEND_OP operation)
+{
+    /* MIN/MAX use the unmodified source and destination components. */
+    if (operation == D3D11_BLEND_OP_MIN || operation == D3D11_BLEND_OP_MAX) {
+        return false;
+    }
+    return d3d11_blend_factors_use_constant_alpha(source, destination) &&
+           d3d11_blend_factors_use_constant_color(source, destination);
+}
+
+static void d3d11_adjust_blend_factor_constant_alpha(float factor[4],
+                                                      unsigned int source,
+                                                      unsigned int destination)
+{
+    bool constant_alpha =
+        d3d11_blend_factors_use_constant_alpha(source, destination);
+    bool constant_color =
+        d3d11_blend_factors_use_constant_color(source, destination);
+
+    /* D3D11 applies a float4 blend factor per channel; NV2A constant alpha is
+     * scalar for RGB. A single D3D11 vector cannot represent both modes at once.
+     */
+    if (constant_alpha && !constant_color) {
+        factor[0] = factor[1] = factor[2] = factor[3];
+    }
+}
+
 static D3D11_BLEND_OP d3d11_blend_op(unsigned int value)
 {
     static const D3D11_BLEND_OP map[] = {
@@ -127,13 +195,18 @@ static void d3d11_surface_access_callback(void *opaque, MemoryRegion *mr,
                                           bool write)
 {
     NV2AState *d = opaque;
+    if (qatomic_read(&d->vram_access_callbacks_disabled)) {
+        return;
+    }
     PGRAPHState *pg = &d->pgraph;
     bool synchronize = false;
     (void)mr;
 
     qemu_mutex_lock(&pg->lock);
-    PGRAPHD3D11State *r = pg->d3d11_renderer_state;
-    if (r) {
+    if (pg->renderer &&
+        pg->renderer->type == CONFIG_DISPLAY_RENDERER_D3D11 &&
+        pg->d3d11_renderer_state) {
+        PGRAPHD3D11State *r = pg->d3d11_renderer_state;
         PGRAPHD3D11RenderTarget *targets[] = {
             &r->render_targets.color,
             &r->render_targets.depth_stencil,
@@ -155,6 +228,7 @@ static void d3d11_surface_access_callback(void *opaque, MemoryRegion *mr,
     qemu_mutex_unlock(&pg->lock);
 
     if (synchronize) {
+        /* Never nest PGRAPH -> PFIFO: PFIFO may need PGRAPH to flush. */
         qemu_mutex_lock(&d->pfifo.lock);
         qemu_event_reset(&pg->flush_complete);
         qatomic_set(&pg->flush_pending, true);
@@ -175,6 +249,74 @@ void pgraph_d3d11_surfaces_finalize(PGRAPHD3D11State *r)
     if (r->render_targets.depth_stencil_state) {
         ID3D11DepthStencilState_Release(r->render_targets.depth_stencil_state);
         r->render_targets.depth_stencil_state = NULL;
+    }
+}
+
+static bool d3d11_surface_color_format_supported(unsigned int format)
+{
+    switch (format) {
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static DXGI_FORMAT d3d11_color_target_format(unsigned int nv2a_format,
+                                             unsigned int format_support,
+                                             bool logic_op_enabled)
+{
+    const unsigned int required_support =
+        D3D11_FORMAT_SUPPORT_TEXTURE2D |
+        D3D11_FORMAT_SUPPORT_RENDER_TARGET |
+        D3D11_FORMAT_SUPPORT_BLENDABLE |
+        D3D11_FORMAT_SUPPORT_SHADER_SAMPLE |
+        D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+
+    if (nv2a_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5 &&
+        !logic_op_enabled &&
+        (format_support & required_support) == required_support) {
+        return DXGI_FORMAT_B5G5R5A1_UNORM;
+    }
+    return DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+
+static unsigned int d3d11_color_target_bytes_per_pixel(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_B5G5R5A1_UNORM ? 2 : 4;
+}
+
+static bool d3d11_surface_zeta_format_supported(unsigned int format)
+{
+    return format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ||
+           format == NV097_SET_SURFACE_FORMAT_ZETA_Z24S8;
+}
+
+static DXGI_FORMAT d3d11_z16_depth_format(bool z_format)
+{
+    return z_format ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_D16_UNORM;
+}
+
+static DXGI_FORMAT d3d11_depth_staging_format(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_D16_UNORM:
+        return DXGI_FORMAT_R16_TYPELESS;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT:
+        return DXGI_FORMAT_R32_TYPELESS;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
     }
 }
 
@@ -237,6 +379,7 @@ static void d3d11_convert_color_to_bgra8(
         uint8_t *dst = destination + y * destination_pitch;
         for (uint32_t x = 0; x < width; x++, dst += 4) {
             switch (format) {
+            /* OpenGL maps this packed format to RGB5_A1; bit 15 is alpha. */
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5:
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5: {
                 uint16_t pixel;
@@ -248,7 +391,7 @@ static void d3d11_convert_color_to_bgra8(
                     format ==
                             NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5 ?
                         0xff :
-                        0;
+                        ((pixel & 0x8000) ? 0xff : 0);
                 break;
             }
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5: {
@@ -261,24 +404,28 @@ static void d3d11_convert_color_to_bgra8(
                 break;
             }
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8:
-                dst[0] = src[x];
-                dst[1] = dst[2] = 0;
+                dst[0] = dst[1] = 0;
+                dst[2] = src[x];
                 dst[3] = 0xff;
                 break;
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8:
-                dst[0] = src[x * 2];
+                dst[0] = 0;
                 dst[1] = src[x * 2 + 1];
-                dst[2] = 0;
+                dst[2] = src[x * 2];
                 dst[3] = 0xff;
                 break;
+            /* OpenGL maps the Z8 variant to RGBA8 and preserves byte 3. */
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8:
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8:
-                memcpy(dst, src + x * 4, 3);
-                dst[3] =
-                    format ==
-                            NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8 ?
-                        0xff :
-                        0;
+                memcpy(dst, src + x * 4,
+                       format ==
+                               NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8 ?
+                           3 :
+                           4);
+                if (format ==
+                    NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8) {
+                    dst[3] = 0xff;
+                }
                 break;
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8:
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8:
@@ -307,7 +454,8 @@ static void d3d11_convert_bgra8_to_color(
                 uint16_t pixel = ((src[2] >> 3) << 10) | ((src[1] >> 3) << 5) |
                                  (src[0] >> 3);
                 if (format ==
-                    NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5) {
+                        NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_O1R5G5B5 ||
+                    src[3] >= 0x80) {
                     pixel |= 0x8000;
                 }
                 memcpy(dst + x * 2, &pixel, sizeof(pixel));
@@ -320,20 +468,23 @@ static void d3d11_convert_bgra8_to_color(
                 break;
             }
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8:
-                dst[x] = src[0];
+                dst[x] = src[2];
                 break;
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8:
-                dst[x * 2] = src[0];
+                dst[x * 2] = src[2];
                 dst[x * 2 + 1] = src[1];
                 break;
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8:
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8:
-                memcpy(dst + x * 4, src, 3);
-                dst[x * 4 + 3] =
-                    format ==
-                            NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8 ?
-                        0xff :
-                        0;
+                memcpy(dst + x * 4, src,
+                       format ==
+                               NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8 ?
+                           3 :
+                           4);
+                if (format ==
+                    NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_O8R8G8B8) {
+                    dst[x * 4 + 3] = 0xff;
+                }
                 break;
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8:
             case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8:
@@ -360,16 +511,55 @@ static void d3d11_surface_dimensions(PGRAPHState *pg, uint32_t *guest_width,
         *guest_width = 1U << pg->surface_shape.log_width;
         *guest_height = 1U << pg->surface_shape.log_height;
     } else {
-        *guest_width = pg->surface_shape.clip_width + pg->surface_shape.clip_x;
-        *guest_height =
-            pg->surface_shape.clip_height + pg->surface_shape.clip_y;
+        *guest_width = pg->surface_shape.clip_width;
+        *guest_height = pg->surface_shape.clip_height;
+    }
+    pgraph_apply_anti_aliasing_factor(pg, guest_width, guest_height);
+    if (pg->surface_type != NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
+        *guest_width += pg->surface_shape.clip_x;
+        *guest_height += pg->surface_shape.clip_y;
     }
     *guest_width = MAX(*guest_width, 1U);
     *guest_height = MAX(*guest_height, 1U);
-    pgraph_apply_anti_aliasing_factor(pg, guest_width, guest_height);
     *width = *guest_width;
     *height = *guest_height;
     pgraph_apply_scaling_factor(pg, width, height);
+}
+
+static void d3d11_update_surface_binding_dim(PGRAPHState *pg)
+{
+    uint32_t guest_width, guest_height, width, height;
+
+    d3d11_surface_dimensions(pg, &guest_width, &guest_height, &width, &height);
+    /* Draw and shader setup apply surface_scale_factor after reading these. */
+    pg->surface_binding_dim.width = guest_width;
+    pg->surface_binding_dim.height = guest_height;
+    pg->surface_binding_dim.clip_x = pg->surface_shape.clip_x;
+    pg->surface_binding_dim.clip_y = pg->surface_shape.clip_y;
+    pg->surface_binding_dim.clip_width = pg->surface_shape.clip_width;
+    pg->surface_binding_dim.clip_height = pg->surface_shape.clip_height;
+}
+
+static bool d3d11_target_storage_range(uint32_t width, uint32_t height,
+                                       uint32_t pitch, unsigned int bpp,
+                                       hwaddr offset, size_t *storage_length,
+                                       uint64_t *end)
+{
+    if (!storage_length || !end || !bpp) {
+        return false;
+    }
+    uint64_t row_bytes = (uint64_t)width * bpp;
+    uint64_t row_pitch = MAX((uint64_t)pitch, row_bytes);
+    if (height && row_pitch > UINT64_MAX / height) {
+        return false;
+    }
+    uint64_t length = (uint64_t)height * row_pitch;
+    if (length > SIZE_MAX || (uint64_t)offset > UINT64_MAX - length) {
+        return false;
+    }
+    *storage_length = length;
+    *end = (uint64_t)offset + length;
+    return true;
 }
 
 static bool d3d11_target_address(NV2AState *d, bool color, uint32_t width,
@@ -379,11 +569,18 @@ static bool d3d11_target_address(NV2AState *d, bool color, uint32_t width,
 {
     PGRAPHState *pg = &d->pgraph;
     Surface *surface = color ? &pg->surface_color : &pg->surface_zeta;
-    DMAObject dma = nv_dma_load(d, color ? pg->dma_color : pg->dma_zeta);
-    uint64_t row_bytes = (uint64_t)width * bpp;
-    uint64_t length =
-        (uint64_t)height * MAX((uint64_t)surface->pitch, row_bytes);
-    uint64_t end = (uint64_t)surface->offset + length;
+    DMAObject dma;
+    if (!nv_dma_load_checked(d, color ? pg->dma_color : pg->dma_zeta, &dma)) {
+        error_setg(errp, "D3D11: invalid %s render-target DMA object",
+                   color ? "color" : "depth/stencil");
+        return false;
+    }
+    uint64_t end;
+    if (!d3d11_target_storage_range(width, height, surface->pitch, bpp,
+                                    surface->offset, storage_length, &end)) {
+        error_setg(errp, "D3D11: render-target storage range overflows");
+        return false;
+    }
     uint64_t vram_size = memory_region_size(d->vram);
 
     /*
@@ -403,11 +600,45 @@ static bool d3d11_target_address(NV2AState *d, bool color, uint32_t width,
                    "size=%ux%u bpp=%u length=0x%" PRIx64 " vram=0x%" PRIx64 ")",
                    color ? "color" : "depth/stencil", dma.dma_class,
                    dma.address, dma.limit, surface->offset, surface->pitch,
-                   width, height, bpp, length, vram_size);
+                   width, height, bpp, *storage_length, vram_size);
         return false;
     }
     *address = dma.address + surface->offset;
-    *storage_length = length;
+    return true;
+}
+
+static bool d3d11_validate_active_target_overlap(NV2AState *d, bool color,
+                                                 bool zeta, Error **errp)
+{
+    PGRAPHState *pg = &d->pgraph;
+    if (!color || !zeta ||
+        !d3d11_surface_color_format_supported(pg->surface_shape.color_format) ||
+        !d3d11_surface_zeta_format_supported(pg->surface_shape.zeta_format)) {
+        return true;
+    }
+
+    uint32_t guest_width, guest_height, width, height;
+    d3d11_surface_dimensions(pg, &guest_width, &guest_height, &width, &height);
+    unsigned int color_bpp =
+        d3d11_color_bytes_per_pixel(pg->surface_shape.color_format);
+    unsigned int zeta_bpp =
+        pg->surface_shape.zeta_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ?
+            2 : 4;
+    hwaddr color_address, zeta_address;
+    size_t color_length, zeta_length;
+    if (!d3d11_target_address(d, true, guest_width, guest_height, color_bpp,
+                              &color_address, &color_length, errp) ||
+        !d3d11_target_address(d, false, guest_width, guest_height, zeta_bpp,
+                              &zeta_address, &zeta_length, errp)) {
+        return false;
+    }
+    if (d3d11_ranges_overlap(color_address, color_length, zeta_address,
+                             zeta_length)) {
+        error_setg(errp,
+                   "D3D11: overlapping color and depth/stencil VRAM targets "
+                   "are unsupported");
+        return false;
+    }
     return true;
 }
 
@@ -423,7 +654,7 @@ static void d3d11_upload_color(NV2AState *d)
     size_t guest_pitch = (size_t)target->guest_width * bpp;
     uint8_t *linear = g_malloc(guest_pitch * target->guest_height);
     const uint8_t *vram = d->vram_ptr + target->vram_address;
-    if (pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
+    if (target->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
         unswizzle_rect(vram, target->guest_width, target->guest_height, linear,
                        guest_pitch, bpp);
     } else {
@@ -431,6 +662,30 @@ static void d3d11_upload_color(NV2AState *d)
             memcpy(linear + (size_t)y * guest_pitch,
                    vram + (size_t)y * target->pitch, guest_pitch);
         }
+    }
+
+    if (target->format == DXGI_FORMAT_B5G5R5A1_UNORM) {
+        unsigned int host_bpp =
+            d3d11_color_target_bytes_per_pixel(target->format);
+        size_t host_pitch = (size_t)target->width * host_bpp;
+        uint8_t *host = g_malloc(host_pitch * target->height);
+        for (uint32_t y = 0; y < target->height; y++) {
+            uint32_t sy = (uint64_t)y * target->guest_height / target->height;
+            for (uint32_t x = 0; x < target->width; x++) {
+                uint32_t sx =
+                    (uint64_t)x * target->guest_width / target->width;
+                memcpy(host + (size_t)y * host_pitch + x * host_bpp,
+                       linear + (size_t)sy * guest_pitch + sx * host_bpp,
+                       host_bpp);
+            }
+        }
+        ID3D11DeviceContext_UpdateSubresource(
+            r->context, (ID3D11Resource *)target->texture, 0, NULL, host,
+            host_pitch, 0);
+        g_free(host);
+        g_free(linear);
+        pg->surface_color.buffer_dirty = false;
+        return;
     }
 
     size_t source_pitch = (size_t)target->guest_width * 4;
@@ -458,20 +713,77 @@ static void d3d11_upload_color(NV2AState *d)
     pg->surface_color.buffer_dirty = false;
 }
 
-static void d3d11_upload_depth_stencil(NV2AState *d)
+static bool d3d11_upload_depth_stencil_texture(
+    PGRAPHD3D11State *r, PGRAPHD3D11RenderTarget *target,
+    const uint8_t *pixels, size_t source_pitch, Error **errp)
+{
+    if (ID3D11Device_GetFeatureLevel(r->device) < D3D_FEATURE_LEVEL_10_1) {
+        error_setg(errp,
+                   "D3D11: depth/stencil upload requires feature level "
+                   "10_1 or newer");
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D_GetDesc(target->texture, &desc);
+    desc.Format = d3d11_depth_staging_format(target->format);
+    if (desc.Format == DXGI_FORMAT_UNKNOWN) {
+        error_setg(errp, "D3D11: unsupported depth/stencil upload format");
+        return false;
+    }
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    desc.MiscFlags = 0;
+
+    ID3D11Texture2D *staging = NULL;
+    HRESULT hr = ID3D11Device_CreateTexture2D(r->device, &desc, NULL, &staging);
+    if (FAILED(hr)) {
+        error_setg(errp,
+                   "D3D11: depth/stencil upload staging allocation failed "
+                   "(HRESULT 0x%08lx)",
+                   (unsigned long)hr);
+        return false;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = ID3D11DeviceContext_Map(r->context, (ID3D11Resource *)staging, 0,
+                                 D3D11_MAP_WRITE, 0, &mapped);
+    if (FAILED(hr)) {
+        ID3D11Texture2D_Release(staging);
+        error_setg(errp,
+                   "D3D11: depth/stencil upload staging map failed "
+                   "(HRESULT 0x%08lx)",
+                   (unsigned long)hr);
+        return false;
+    }
+    for (UINT y = 0; y < desc.Height; y++) {
+        memcpy((uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch,
+               pixels + (size_t)y * source_pitch, source_pitch);
+    }
+    ID3D11DeviceContext_Unmap(r->context, (ID3D11Resource *)staging, 0);
+    ID3D11DeviceContext_OMSetRenderTargets(r->context, 0, NULL, NULL);
+    ID3D11DeviceContext_CopyResource(r->context,
+                                     (ID3D11Resource *)target->texture,
+                                     (ID3D11Resource *)staging);
+    ID3D11Texture2D_Release(staging);
+    pgraph_d3d11_bind_render_targets(r);
+    return true;
+}
+
+static bool d3d11_upload_depth_stencil(NV2AState *d, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHD3D11State *r = pg->d3d11_renderer_state;
     PGRAPHD3D11RenderTarget *target = &r->render_targets.depth_stencil;
     if (!target->texture) {
-        return;
+        return true;
     }
     unsigned int guest_bpp =
         target->nv2a_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ? 2 : 4;
     size_t guest_pitch = (size_t)target->guest_width * guest_bpp;
     uint8_t *linear = g_malloc(guest_pitch * target->guest_height);
     const uint8_t *vram = d->vram_ptr + target->vram_address;
-    if (pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
+    if (target->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
         unswizzle_rect(vram, target->guest_width, target->guest_height, linear,
                        guest_pitch, guest_bpp);
     } else {
@@ -481,13 +793,20 @@ static void d3d11_upload_depth_stencil(NV2AState *d)
         }
     }
 
-    size_t host_pitch = (size_t)target->width * 4;
+    unsigned int host_bpp = target->format == DXGI_FORMAT_D16_UNORM ? 2 : 4;
+    size_t host_pitch = (size_t)target->width * host_bpp;
     uint8_t *host = g_malloc(host_pitch * target->height);
     for (uint32_t y = 0; y < target->height; y++) {
         uint32_t sy = (uint64_t)y * target->guest_height / target->height;
         for (uint32_t x = 0; x < target->width; x++) {
             uint32_t sx = (uint64_t)x * target->guest_width / target->width;
-            if (guest_bpp == 2) {
+            if (target->format == DXGI_FORMAT_D16_UNORM) {
+                uint16_t packed;
+                memcpy(&packed, linear + (size_t)sy * guest_pitch + sx * 2,
+                       sizeof(packed));
+                memcpy(host + (size_t)y * host_pitch + x * 2, &packed,
+                       sizeof(packed));
+            } else if (guest_bpp == 2) {
                 uint16_t packed;
                 memcpy(&packed, linear + (size_t)sy * guest_pitch + sx * 2,
                        sizeof(packed));
@@ -513,18 +832,20 @@ static void d3d11_upload_depth_stencil(NV2AState *d)
         }
     }
     g_free(linear);
-    ID3D11DeviceContext_UpdateSubresource(r->context,
-                                          (ID3D11Resource *)target->texture, 0,
-                                          NULL, host, host_pitch, 0);
+    bool success = d3d11_upload_depth_stencil_texture(
+        r, target, host, host_pitch, errp);
     g_free(host);
+    if (!success) {
+        return false;
+    }
     pg->surface_zeta.buffer_dirty = false;
+    return true;
 }
 
-static void d3d11_store_color(PGRAPHState *pg, PGRAPHD3D11RenderTarget *target,
-                              uint8_t *vram, const uint8_t *linear,
-                              unsigned int bpp)
+static void d3d11_store_color(PGRAPHD3D11RenderTarget *target, uint8_t *vram,
+                              const uint8_t *linear, unsigned int bpp)
 {
-    if (pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
+    if (target->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
         swizzle_rect(linear, target->guest_width, target->guest_height, vram,
                      (size_t)target->guest_width * bpp, bpp);
         return;
@@ -536,12 +857,11 @@ static void d3d11_store_color(PGRAPHState *pg, PGRAPHD3D11RenderTarget *target,
     }
 }
 
-static void d3d11_store_depth_stencil(PGRAPHState *pg,
-                                      PGRAPHD3D11RenderTarget *target,
+static void d3d11_store_depth_stencil(PGRAPHD3D11RenderTarget *target,
                                       uint8_t *vram, const uint8_t *linear,
                                       unsigned int bpp)
 {
-    if (pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
+    if (target->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
         swizzle_rect(linear, target->guest_width, target->guest_height, vram,
                      (size_t)target->guest_width * bpp, bpp);
         return;
@@ -591,6 +911,36 @@ static bool d3d11_flush_color(NV2AState *d, Error **errp)
         return false;
     }
 
+    if (target->format == DXGI_FORMAT_B5G5R5A1_UNORM) {
+        unsigned int host_bpp =
+            d3d11_color_target_bytes_per_pixel(target->format);
+        size_t linear_pitch = (size_t)target->guest_width * host_bpp;
+        uint8_t *linear = g_malloc(linear_pitch * target->guest_height);
+        for (uint32_t y = 0; y < target->guest_height; y++) {
+            uint32_t sy = (uint64_t)y * target->height / target->guest_height;
+            for (uint32_t x = 0; x < target->guest_width; x++) {
+                uint32_t sx = (uint64_t)x * target->width / target->guest_width;
+                memcpy(linear + (size_t)y * linear_pitch + x * host_bpp,
+                       (uint8_t *)mapped.pData + (size_t)sy * mapped.RowPitch +
+                           sx * host_bpp,
+                       host_bpp);
+            }
+        }
+        ID3D11DeviceContext_Unmap(r->context, (ID3D11Resource *)staging, 0);
+        ID3D11Texture2D_Release(staging);
+        d3d11_store_color(target, d->vram_ptr + target->vram_address,
+                          linear, d3d11_color_bytes_per_pixel(
+                                      target->nv2a_format));
+        g_free(linear);
+        memory_region_set_client_dirty(d->vram, target->vram_address,
+                                       target->storage_length, DIRTY_MEMORY_VGA);
+        memory_region_set_client_dirty(d->vram, target->vram_address,
+                                       target->storage_length,
+                                       DIRTY_MEMORY_NV2A_TEX);
+        pg->surface_color.draw_dirty = false;
+        return true;
+    }
+
     size_t bgra_pitch = (size_t)target->guest_width * 4;
     uint8_t *bgra = g_malloc(bgra_pitch * target->guest_height);
     for (uint32_t y = 0; y < target->guest_height; y++) {
@@ -613,7 +963,7 @@ static bool d3d11_flush_color(NV2AState *d, Error **errp)
                                  bgra, bgra_pitch, target->guest_width,
                                  target->guest_height);
     g_free(bgra);
-    d3d11_store_color(pg, target, d->vram_ptr + target->vram_address, linear,
+    d3d11_store_color(target, d->vram_ptr + target->vram_address, linear,
                       bpp);
     g_free(linear);
     memory_region_set_client_dirty(d->vram, target->vram_address,
@@ -636,6 +986,11 @@ static bool d3d11_flush_depth_stencil(NV2AState *d, Error **errp)
 
     D3D11_TEXTURE2D_DESC desc;
     ID3D11Texture2D_GetDesc(target->texture, &desc);
+    desc.Format = d3d11_depth_staging_format(target->format);
+    if (desc.Format == DXGI_FORMAT_UNKNOWN) {
+        error_setg(errp, "D3D11: unsupported depth/stencil readback format");
+        return false;
+    }
     desc.Usage = D3D11_USAGE_STAGING;
     desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -672,8 +1027,11 @@ static bool d3d11_flush_depth_stencil(NV2AState *d, Error **errp)
         for (uint32_t x = 0; x < target->guest_width; x++) {
             uint32_t sx = (uint64_t)x * target->width / target->guest_width;
             const uint8_t *source =
-                (uint8_t *)mapped.pData + (size_t)sy * mapped.RowPitch + sx * 4;
-            if (bpp == 2) {
+                (uint8_t *)mapped.pData + (size_t)sy * mapped.RowPitch +
+                sx * (target->format == DXGI_FORMAT_D16_UNORM ? 2 : 4);
+            if (target->format == DXGI_FORMAT_D16_UNORM) {
+                memcpy(linear + (size_t)y * linear_pitch + x * 2, source, 2);
+            } else if (bpp == 2) {
                 float depth;
                 memcpy(&depth, source, sizeof(depth));
                 depth = CLAMP(depth, 0.0f, 1.0f);
@@ -699,7 +1057,7 @@ static bool d3d11_flush_depth_stencil(NV2AState *d, Error **errp)
     }
     ID3D11DeviceContext_Unmap(r->context, (ID3D11Resource *)staging, 0);
     ID3D11Texture2D_Release(staging);
-    d3d11_store_depth_stencil(pg, target, d->vram_ptr + target->vram_address,
+    d3d11_store_depth_stencil(target, d->vram_ptr + target->vram_address,
                               linear, bpp);
     g_free(linear);
     memory_region_set_client_dirty(d->vram, target->vram_address,
@@ -743,6 +1101,23 @@ void pgraph_d3d11_surface_invalidate_range(NV2AState *d, hwaddr address,
     }
 }
 
+static bool d3d11_target_matches(
+    const PGRAPHD3D11RenderTarget *target, bool color, const PGRAPHState *pg,
+    const Surface *surface, hwaddr address, size_t storage_length,
+    uint32_t width, uint32_t height, uint32_t guest_width,
+    uint32_t guest_height, DXGI_FORMAT format, unsigned int nv2a_format)
+{
+    return target->texture && target->vram_address == address &&
+           target->width == width && target->height == height &&
+           target->guest_width == guest_width &&
+           target->guest_height == guest_height &&
+           target->pitch == surface->pitch &&
+           target->storage_length == storage_length &&
+           target->surface_type == pg->surface_type &&
+           target->format == format && target->nv2a_format == nv2a_format &&
+           (color || target->z_format == pg->surface_shape.z_format);
+}
+
 static bool d3d11_create_target(NV2AState *d, bool color, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -754,6 +1129,16 @@ static bool d3d11_create_target(NV2AState *d, bool color, Error **errp)
     d3d11_surface_dimensions(pg, &guest_width, &guest_height, &width, &height);
     unsigned int nv2a_format =
         color ? pg->surface_shape.color_format : pg->surface_shape.zeta_format;
+    if (color && !d3d11_surface_color_format_supported(nv2a_format)) {
+        error_setg(errp, "D3D11: unsupported color surface format 0x%x",
+                   nv2a_format);
+        return false;
+    }
+    if (!color && !d3d11_surface_zeta_format_supported(nv2a_format)) {
+        error_setg(errp, "D3D11: unsupported zeta surface format 0x%x",
+                   nv2a_format);
+        return false;
+    }
     unsigned int bpp =
         color ? d3d11_color_bytes_per_pixel(nv2a_format) :
                 (nv2a_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ? 2 : 4);
@@ -763,26 +1148,44 @@ static bool d3d11_create_target(NV2AState *d, bool color, Error **errp)
                               &address, &storage_length, errp)) {
         return false;
     }
-    DXGI_FORMAT format = color ?
-                             DXGI_FORMAT_B8G8R8A8_UNORM :
-                             (nv2a_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ?
-                                  DXGI_FORMAT_D32_FLOAT :
-                                  DXGI_FORMAT_D24_UNORM_S8_UINT);
+    DXGI_FORMAT format;
+    if (color) {
+        unsigned int format_support = 0;
+        bool logic_op_enabled = !!(pgraph_reg_r(pg, NV_PGRAPH_BLEND) &
+                                   NV_PGRAPH_BLEND_LOGICOP_ENABLE);
+        if (nv2a_format ==
+            NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5 &&
+            FAILED(ID3D11Device_CheckFormatSupport(
+                r->device, DXGI_FORMAT_B5G5R5A1_UNORM, &format_support))) {
+            format_support = 0;
+        }
+        format = d3d11_color_target_format(nv2a_format, format_support,
+                                           logic_op_enabled);
+        if (nv2a_format ==
+                NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5 &&
+            format != DXGI_FORMAT_B5G5R5A1_UNORM) {
+            warn_report_once("D3D11: B5G5R5A1 render/blend/sample support is "
+                             "or CPU-lockable staging is unavailable, or "
+                             "NV2A logic operations are active; X1 surfaces "
+                             "use BGRA8 with 5:5:5:1 quantization deferred "
+                             "until VRAM readback");
+        }
+    } else {
+        format = nv2a_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ?
+                     d3d11_z16_depth_format(pg->surface_shape.z_format) :
+                     DXGI_FORMAT_D24_UNORM_S8_UINT;
+    }
     surface->buffer_dirty |= memory_region_test_and_clear_dirty(
         d->vram, address, storage_length, DIRTY_MEMORY_NV2A);
 
-    if (target->texture && target->vram_address == address &&
-        target->width == width && target->height == height &&
-        target->guest_width == guest_width &&
-        target->guest_height == guest_height &&
-        target->pitch == surface->pitch && target->format == format &&
-        target->nv2a_format == nv2a_format &&
-        (color || target->z_format == pg->surface_shape.z_format)) {
+    if (d3d11_target_matches(target, color, pg, surface, address,
+                             storage_length, width, height, guest_width,
+                             guest_height, format, nv2a_format)) {
         if (surface->buffer_dirty) {
             if (color) {
                 d3d11_upload_color(d);
-            } else {
-                d3d11_upload_depth_stencil(d);
+            } else if (!d3d11_upload_depth_stencil(d, errp)) {
+                return false;
             }
         }
         return true;
@@ -791,6 +1194,17 @@ static bool d3d11_create_target(NV2AState *d, bool color, Error **errp)
     ID3D11DeviceContext_OMSetRenderTargets(r->context, 0, NULL, NULL);
     if (color && target->texture &&
         !pgraph_d3d11_retain_color_scanout(d, errp)) {
+        pgraph_d3d11_bind_render_targets(r);
+        return false;
+    }
+    if (color && target->texture && pg->surface_color.draw_dirty &&
+        !d3d11_flush_color(d, errp)) {
+        pgraph_d3d11_bind_render_targets(r);
+        return false;
+    }
+    if (!color && target->texture && pg->surface_zeta.draw_dirty &&
+        !d3d11_flush_depth_stencil(d, errp)) {
+        pgraph_d3d11_bind_render_targets(r);
         return false;
     }
     d3d11_release_target(target);
@@ -835,13 +1249,15 @@ static bool d3d11_create_target(NV2AState *d, bool color, Error **errp)
     target->guest_height = guest_height;
     target->pitch = surface->pitch;
     target->storage_length = storage_length;
+    target->surface_type = pg->surface_type;
     target->format = format;
     target->nv2a_format = nv2a_format;
     target->z_format = pg->surface_shape.z_format;
     if (color) {
         d3d11_upload_color(d);
-    } else {
-        d3d11_upload_depth_stencil(d);
+    } else if (!d3d11_upload_depth_stencil(d, errp)) {
+        d3d11_release_target(target);
+        return false;
     }
     if (tcg_enabled()) {
         target->access_cb = mem_access_callback_insert(
@@ -858,6 +1274,9 @@ bool pgraph_d3d11_render_targets_update(NV2AState *d, bool color, bool zeta,
     pg->surface_shape.z_format =
         GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
                  NV_PGRAPH_SETUPRASTER_Z_FORMAT);
+    if (!d3d11_validate_active_target_overlap(d, color, zeta, errp)) {
+        return false;
+    }
     if (color && pg->surface_shape.color_format &&
         !d3d11_create_target(d, true, errp)) {
         return false;
@@ -866,6 +1285,7 @@ bool pgraph_d3d11_render_targets_update(NV2AState *d, bool color, bool zeta,
         !d3d11_create_target(d, false, errp)) {
         return false;
     }
+    d3d11_update_surface_binding_dim(pg);
     pg->draw_time++;
     return true;
 }
@@ -953,6 +1373,98 @@ static bool d3d11_update_depth_stencil_state(
     return true;
 }
 
+static uint8_t d3d11_surface_color_format_mask(unsigned int format)
+{
+    uint8_t format_mask = D3D11_COLOR_WRITE_ENABLE_RED |
+                          D3D11_COLOR_WRITE_ENABLE_GREEN |
+                          D3D11_COLOR_WRITE_ENABLE_BLUE;
+    switch (format) {
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8:
+        /* B8 is represented as logical R in the GL_R8 and BGRA8 mappings. */
+        format_mask = D3D11_COLOR_WRITE_ENABLE_RED;
+        break;
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8:
+        /* G8B8 is represented as logical RG in GL_RG8 and BGRA8 mappings. */
+        format_mask = D3D11_COLOR_WRITE_ENABLE_RED |
+                      D3D11_COLOR_WRITE_ENABLE_GREEN;
+        break;
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8:
+        format_mask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
+        break;
+    default:
+        break;
+    }
+    return format_mask;
+}
+
+static uint8_t d3d11_surface_color_write_mask(uint32_t control0,
+                                              unsigned int format)
+{
+    uint8_t mask =
+        ((control0 & NV_PGRAPH_CONTROL_0_RED_WRITE_ENABLE) ?
+             D3D11_COLOR_WRITE_ENABLE_RED :
+             0) |
+        ((control0 & NV_PGRAPH_CONTROL_0_GREEN_WRITE_ENABLE) ?
+             D3D11_COLOR_WRITE_ENABLE_GREEN :
+             0) |
+        ((control0 & NV_PGRAPH_CONTROL_0_BLUE_WRITE_ENABLE) ?
+             D3D11_COLOR_WRITE_ENABLE_BLUE :
+             0) |
+        ((control0 & NV_PGRAPH_CONTROL_0_ALPHA_WRITE_ENABLE) ?
+             D3D11_COLOR_WRITE_ENABLE_ALPHA :
+             0);
+    /* The target is commonly BGRA8 even when the guest surface is R8/RG8.
+     * Its SRV must not expose values in channels absent from the guest format.
+     */
+    return mask & d3d11_surface_color_format_mask(format);
+}
+
+static uint32_t d3d11_surface_color_clear_mask(uint32_t parameter,
+                                              unsigned int format)
+{
+    uint8_t format_mask = d3d11_surface_color_format_mask(format);
+    uint32_t mask = 0;
+    if ((format_mask & D3D11_COLOR_WRITE_ENABLE_RED) &&
+        (parameter & NV097_CLEAR_SURFACE_R)) {
+        mask |= NV097_CLEAR_SURFACE_R;
+    }
+    if ((format_mask & D3D11_COLOR_WRITE_ENABLE_GREEN) &&
+        (parameter & NV097_CLEAR_SURFACE_G)) {
+        mask |= NV097_CLEAR_SURFACE_G;
+    }
+    if ((format_mask & D3D11_COLOR_WRITE_ENABLE_BLUE) &&
+        (parameter & NV097_CLEAR_SURFACE_B)) {
+        mask |= NV097_CLEAR_SURFACE_B;
+    }
+    if ((format_mask & D3D11_COLOR_WRITE_ENABLE_ALPHA) &&
+        (parameter & NV097_CLEAR_SURFACE_A)) {
+        mask |= NV097_CLEAR_SURFACE_A;
+    }
+    return mask;
+}
+
+static bool d3d11_surface_color_clear_supported(unsigned int format)
+{
+    switch (format) {
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static bool d3d11_color_target_active(uint8_t write_mask, bool logic_op_enable,
+                                     DXGI_FORMAT format)
+{
+    return write_mask != 0 ||
+           (logic_op_enable && format == DXGI_FORMAT_B5G5R5A1_UNORM);
+}
+
 bool pgraph_d3d11_update_output_merger(NV2AState *d, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -967,38 +1479,32 @@ bool pgraph_d3d11_update_output_merger(NV2AState *d, Error **errp)
     D3D11_RENDER_TARGET_BLEND_DESC1 *rt = &blend_desc.RenderTarget[0];
     rt->LogicOpEnable = !!(blend & NV_PGRAPH_BLEND_LOGICOP_ENABLE);
     rt->BlendEnable = !rt->LogicOpEnable && !!(blend & NV_PGRAPH_BLEND_EN);
-    rt->SrcBlend = d3d11_blend_factor(GET_MASK(blend, NV_PGRAPH_BLEND_SFACTOR));
-    rt->DestBlend =
-        d3d11_blend_factor(GET_MASK(blend, NV_PGRAPH_BLEND_DFACTOR));
-    rt->BlendOp = d3d11_blend_op(GET_MASK(blend, NV_PGRAPH_BLEND_EQN));
+    unsigned int source_factor = GET_MASK(blend, NV_PGRAPH_BLEND_SFACTOR);
+    unsigned int destination_factor = GET_MASK(blend, NV_PGRAPH_BLEND_DFACTOR);
+    D3D11_BLEND_OP blend_op =
+        d3d11_blend_op(GET_MASK(blend, NV_PGRAPH_BLEND_EQN));
+    if (rt->BlendEnable &&
+        d3d11_blend_factors_conflict(source_factor, destination_factor,
+                                     blend_op)) {
+        error_setg(errp,
+                   "D3D11: simultaneous NV2A CONSTANT_COLOR and "
+                   "CONSTANT_ALPHA blend factors cannot be represented "
+                   "by one D3D11 blend-factor vector");
+        return false;
+    }
+    rt->SrcBlend = d3d11_blend_factor(source_factor);
+    rt->DestBlend = d3d11_blend_factor(destination_factor);
+    rt->BlendOp = blend_op;
     rt->SrcBlendAlpha = d3d11_alpha_blend_factor(rt->SrcBlend);
     rt->DestBlendAlpha = d3d11_alpha_blend_factor(rt->DestBlend);
     rt->BlendOpAlpha = rt->BlendOp;
     rt->LogicOp = d3d11_logic_op(GET_MASK(blend, NV_PGRAPH_BLEND_LOGICOP));
-    rt->RenderTargetWriteMask =
-        ((control0 & NV_PGRAPH_CONTROL_0_RED_WRITE_ENABLE) ?
-             D3D11_COLOR_WRITE_ENABLE_RED :
-             0) |
-        ((control0 & NV_PGRAPH_CONTROL_0_GREEN_WRITE_ENABLE) ?
-             D3D11_COLOR_WRITE_ENABLE_GREEN :
-             0) |
-        ((control0 & NV_PGRAPH_CONTROL_0_BLUE_WRITE_ENABLE) ?
-             D3D11_COLOR_WRITE_ENABLE_BLUE :
-             0) |
-        ((control0 & NV_PGRAPH_CONTROL_0_ALPHA_WRITE_ENABLE) ?
-             D3D11_COLOR_WRITE_ENABLE_ALPHA :
-             0);
-    switch (pg->surface_shape.color_format) {
-    case NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8:
-    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8:
-    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8:
-        break;
-    default:
-        rt->RenderTargetWriteMask &= ~D3D11_COLOR_WRITE_ENABLE_ALPHA;
-        break;
-    }
+    rt->RenderTargetWriteMask = d3d11_surface_color_write_mask(
+        control0, pg->surface_shape.color_format);
     pgraph_argb_pack32_to_rgba_float(pgraph_reg_r(pg, NV_PGRAPH_BLENDCOLOR),
                                      targets->blend_factor);
+    d3d11_adjust_blend_factor_constant_alpha(
+        targets->blend_factor, source_factor, destination_factor);
 
     D3D11_DEPTH_STENCIL_DESC depth_desc = {
         .DepthEnable = !!(control0 & NV_PGRAPH_CONTROL_0_ZENABLE),
@@ -1027,10 +1533,12 @@ bool pgraph_d3d11_update_output_merger(NV2AState *d, Error **errp)
     depth_desc.FrontFace = stencil;
     depth_desc.BackFace = stencil;
 
+    bool color_target_update = d3d11_color_target_active(
+        rt->RenderTargetWriteMask, rt->LogicOpEnable, targets->color.format);
     if (!d3d11_update_blend_state(r, &blend_desc, errp) ||
         !d3d11_update_depth_stencil_state(r, &depth_desc, errp) ||
         !pgraph_d3d11_render_targets_update(
-            d, rt->RenderTargetWriteMask != 0,
+            d, color_target_update,
             depth_desc.DepthEnable || depth_desc.StencilEnable, errp)) {
         return false;
     }
@@ -1043,12 +1551,19 @@ bool pgraph_d3d11_update_output_merger(NV2AState *d, Error **errp)
 
 void pgraph_d3d11_bind_render_targets(PGRAPHD3D11State *r)
 {
-    ID3D11RenderTargetView *rtv = r->render_targets.color.rtv;
+    PGRAPHD3D11RenderTargets *targets = &r->render_targets;
+    D3D11_RENDER_TARGET_BLEND_DESC1 *blend =
+        &targets->blend_desc.RenderTarget[0];
+    bool color_active = d3d11_color_target_active(
+        blend->RenderTargetWriteMask, blend->LogicOpEnable,
+        targets->color.format);
+    ID3D11RenderTargetView *rtv =
+        color_active ? targets->color.rtv : NULL;
     ID3D11DeviceContext_OMSetRenderTargets(r->context, rtv ? 1 : 0,
                                            rtv ? &rtv : NULL,
-                                           r->render_targets.depth_stencil.dsv);
+                                           targets->depth_stencil.dsv);
     PGRAPHD3D11RenderTarget *target =
-        rtv ? &r->render_targets.color : &r->render_targets.depth_stencil;
+        rtv ? &targets->color : &targets->depth_stencil;
     if (target->texture) {
         D3D11_VIEWPORT viewport = {
             .Width = target->width,
@@ -1057,6 +1572,290 @@ void pgraph_d3d11_bind_render_targets(PGRAPHD3D11State *r)
         };
         ID3D11DeviceContext_RSSetViewports(r->context, 1, &viewport);
     }
+}
+
+static uint8_t d3d11_clear_unorm8(float value)
+{
+    if (!(value > 0.0f)) {
+        return 0;
+    }
+    if (value >= 1.0f) {
+        return UINT8_MAX;
+    }
+    return (uint8_t)(value * 255.0f + 0.5f);
+}
+
+static uint16_t d3d11_clear_unorm5(float value)
+{
+    if (!(value > 0.0f)) {
+        return 0;
+    }
+    if (value >= 1.0f) {
+        return 31;
+    }
+    return (uint16_t)(value * 31.0f + 0.5f);
+}
+
+static void d3d11_apply_masked_color_clear(uint8_t *pixels, size_t row_pitch,
+                                          unsigned int width,
+                                          unsigned int height,
+                                          uint32_t parameter,
+                                          const float clear_color[4])
+{
+    const uint8_t red = d3d11_clear_unorm8(clear_color[0]);
+    const uint8_t green = d3d11_clear_unorm8(clear_color[1]);
+    const uint8_t blue = d3d11_clear_unorm8(clear_color[2]);
+    const uint8_t alpha = d3d11_clear_unorm8(clear_color[3]);
+
+    for (unsigned int y = 0; y < height; y++) {
+        uint8_t *row = pixels + (size_t)y * row_pitch;
+        for (unsigned int x = 0; x < width; x++) {
+            uint8_t *pixel = row + x * 4;
+            if (parameter & NV097_CLEAR_SURFACE_R) {
+                pixel[2] = red;
+            }
+            if (parameter & NV097_CLEAR_SURFACE_G) {
+                pixel[1] = green;
+            }
+            if (parameter & NV097_CLEAR_SURFACE_B) {
+                pixel[0] = blue;
+            }
+            if (parameter & NV097_CLEAR_SURFACE_A) {
+                pixel[3] = alpha;
+            }
+        }
+    }
+}
+
+static void d3d11_apply_masked_color_clear_b5g5r5a1(
+    uint8_t *pixels, size_t row_pitch, unsigned int width, unsigned int height,
+    uint32_t parameter, const float clear_color[4])
+{
+    const uint16_t red = d3d11_clear_unorm5(clear_color[0]);
+    const uint16_t green = d3d11_clear_unorm5(clear_color[1]);
+    const uint16_t blue = d3d11_clear_unorm5(clear_color[2]);
+    const bool alpha = clear_color[3] >= 0.5f;
+
+    for (unsigned int y = 0; y < height; y++) {
+        uint8_t *row = pixels + (size_t)y * row_pitch;
+        for (unsigned int x = 0; x < width; x++) {
+            uint16_t pixel;
+            memcpy(&pixel, row + x * 2, sizeof(pixel));
+            if (parameter & NV097_CLEAR_SURFACE_R) {
+                pixel = (pixel & ~0x7c00U) | (red << 10);
+            }
+            if (parameter & NV097_CLEAR_SURFACE_G) {
+                pixel = (pixel & ~0x03e0U) | (green << 5);
+            }
+            if (parameter & NV097_CLEAR_SURFACE_B) {
+                pixel = (pixel & ~0x001fU) | blue;
+            }
+            if (parameter & NV097_CLEAR_SURFACE_A) {
+                pixel = alpha ? pixel | 0x8000U : pixel & ~0x8000U;
+            }
+            memcpy(row + x * 2, &pixel, sizeof(pixel));
+        }
+    }
+}
+
+static bool d3d11_clear_color_region_cpu(PGRAPHD3D11State *r,
+                                         PGRAPHD3D11RenderTarget *target,
+                                         D3D11_RECT rect, uint32_t parameter,
+                                         const float clear_color[4],
+                                         Error **errp)
+{
+    UINT width = rect.right - rect.left;
+    UINT height = rect.bottom - rect.top;
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D *staging = NULL;
+    HRESULT hr;
+    bool success = false;
+
+    ID3D11Texture2D_GetDesc(target->texture, &desc);
+    desc.Width = width;
+    desc.Height = height;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+    desc.MiscFlags = 0;
+
+    ID3D11DeviceContext_OMSetRenderTargets(r->context, 0, NULL, NULL);
+    hr = ID3D11Device_CreateTexture2D(r->device, &desc, NULL, &staging);
+    if (FAILED(hr)) {
+        error_setg(errp,
+                   "D3D11: masked color-clear staging allocation failed "
+                   "(HRESULT 0x%08lx)",
+                   (unsigned long)hr);
+        goto out;
+    }
+
+    D3D11_BOX source_box = {
+        .left = rect.left,
+        .top = rect.top,
+        .front = 0,
+        .right = rect.right,
+        .bottom = rect.bottom,
+        .back = 1,
+    };
+    ID3D11DeviceContext_CopySubresourceRegion(
+        r->context, (ID3D11Resource *)staging, 0, 0, 0, 0,
+        (ID3D11Resource *)target->texture, 0, &source_box);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = ID3D11DeviceContext_Map(r->context, (ID3D11Resource *)staging, 0,
+                                 D3D11_MAP_READ_WRITE, 0, &mapped);
+    if (FAILED(hr)) {
+        error_setg(errp,
+                   "D3D11: masked color-clear staging map failed "
+                   "(HRESULT 0x%08lx)",
+                   (unsigned long)hr);
+        goto out;
+    }
+    if (target->format == DXGI_FORMAT_B5G5R5A1_UNORM) {
+        d3d11_apply_masked_color_clear_b5g5r5a1(
+            mapped.pData, mapped.RowPitch, width, height, parameter,
+            clear_color);
+    } else {
+        d3d11_apply_masked_color_clear(mapped.pData, mapped.RowPitch, width,
+                                       height, parameter, clear_color);
+    }
+    ID3D11DeviceContext_Unmap(r->context, (ID3D11Resource *)staging, 0);
+    ID3D11DeviceContext_CopySubresourceRegion(
+        r->context, (ID3D11Resource *)target->texture, 0, rect.left, rect.top, 0,
+        (ID3D11Resource *)staging, 0, NULL);
+    success = true;
+
+out:
+    if (staging) {
+        ID3D11Texture2D_Release(staging);
+    }
+    pgraph_d3d11_bind_render_targets(r);
+    return success;
+}
+
+static void d3d11_apply_depth_stencil_clear(uint8_t *pixel,
+                                             bool clear_depth,
+                                             bool clear_stencil,
+                                             float depth, int stencil,
+                                             bool depth_float,
+                                             bool depth_unorm16)
+{
+    if (depth_float) {
+        if (clear_depth) {
+            depth = CLAMP(depth, 0.0f, 1.0f);
+            memcpy(pixel, &depth, sizeof(depth));
+        }
+        return;
+    }
+    if (depth_unorm16) {
+        if (clear_depth) {
+            uint16_t packed =
+                CLAMP(depth, 0.0f, 1.0f) * 65535.0f + 0.5f;
+            memcpy(pixel, &packed, sizeof(packed));
+        }
+        return;
+    }
+
+    uint32_t packed;
+    memcpy(&packed, pixel, sizeof(packed));
+    if (clear_depth) {
+        uint32_t depth_bits =
+            (uint32_t)(CLAMP(depth, 0.0f, 1.0f) * 16777215.0f + 0.5f);
+        packed = (packed & 0xff000000U) | (depth_bits & 0x00ffffffU);
+    }
+    if (clear_stencil) {
+        packed = (packed & 0x00ffffffU) | ((stencil & 0xff) << 24);
+    }
+    memcpy(pixel, &packed, sizeof(packed));
+}
+
+static bool d3d11_clear_depth_stencil_region_cpu(
+    PGRAPHD3D11State *r, PGRAPHD3D11RenderTarget *target, D3D11_RECT rect,
+    uint32_t parameter, float depth, int stencil, Error **errp)
+{
+    if (rect.right <= rect.left || rect.bottom <= rect.top) {
+        return true;
+    }
+
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D_GetDesc(target->texture, &desc);
+    if (ID3D11Device_GetFeatureLevel(r->device) < D3D_FEATURE_LEVEL_10_1) {
+        error_setg(errp,
+                   "D3D11: partial depth/stencil clear requires feature "
+                   "level 10_1 or newer");
+        return false;
+    }
+    if (desc.SampleDesc.Count != 1) {
+        error_setg(errp,
+                   "D3D11: partial depth/stencil clear does not support "
+                   "multisampled targets");
+        return false;
+    }
+    desc.Format = d3d11_depth_staging_format(target->format);
+    if (desc.Format == DXGI_FORMAT_UNKNOWN) {
+        error_setg(errp, "D3D11: unsupported depth/stencil clear format");
+        return false;
+    }
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+    desc.MiscFlags = 0;
+
+    ID3D11Texture2D *staging = NULL;
+    HRESULT hr;
+    bool mapped = false;
+    bool success = false;
+    D3D11_MAPPED_SUBRESOURCE resource;
+
+    ID3D11DeviceContext_OMSetRenderTargets(r->context, 0, NULL, NULL);
+    hr = ID3D11Device_CreateTexture2D(r->device, &desc, NULL, &staging);
+    if (FAILED(hr)) {
+        error_setg(errp,
+                   "D3D11: depth/stencil staging allocation failed "
+                   "(HRESULT 0x%08lx)",
+                   (unsigned long)hr);
+        goto out;
+    }
+    ID3D11DeviceContext_CopyResource(r->context, (ID3D11Resource *)staging,
+                                    (ID3D11Resource *)target->texture);
+    hr = ID3D11DeviceContext_Map(r->context, (ID3D11Resource *)staging, 0,
+                                 D3D11_MAP_READ_WRITE, 0, &resource);
+    if (FAILED(hr)) {
+        error_setg(errp,
+                   "D3D11: depth/stencil staging map failed "
+                   "(HRESULT 0x%08lx)",
+                   (unsigned long)hr);
+        goto out;
+    }
+    mapped = true;
+    for (LONG y = rect.top; y < rect.bottom; y++) {
+        uint8_t *row = (uint8_t *)resource.pData +
+                       (size_t)y * resource.RowPitch;
+        for (LONG x = rect.left; x < rect.right; x++) {
+            d3d11_apply_depth_stencil_clear(
+                row + (size_t)x *
+                          (target->format == DXGI_FORMAT_D16_UNORM ? 2 : 4),
+                !!(parameter & NV097_CLEAR_SURFACE_Z),
+                !!(parameter & NV097_CLEAR_SURFACE_STENCIL), depth, stencil,
+                target->format == DXGI_FORMAT_D32_FLOAT,
+                target->format == DXGI_FORMAT_D16_UNORM);
+        }
+    }
+    ID3D11DeviceContext_Unmap(r->context, (ID3D11Resource *)staging, 0);
+    mapped = false;
+    ID3D11DeviceContext_CopyResource(
+        r->context, (ID3D11Resource *)target->texture,
+        (ID3D11Resource *)staging);
+    success = true;
+
+out:
+    if (mapped) {
+        ID3D11DeviceContext_Unmap(r->context, (ID3D11Resource *)staging, 0);
+    }
+    if (staging) {
+        ID3D11Texture2D_Release(staging);
+    }
+    pgraph_d3d11_bind_render_targets(r);
+    return success;
 }
 
 bool pgraph_d3d11_render_targets_clear(NV2AState *d, uint32_t parameter,
@@ -1068,13 +1867,14 @@ bool pgraph_d3d11_render_targets_clear(NV2AState *d, uint32_t parameter,
     bool zeta =
         parameter & (NV097_CLEAR_SURFACE_Z | NV097_CLEAR_SURFACE_STENCIL);
     pg->clearing = true;
+    pg->surface_shape.z_format =
+        GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
+                 NV_PGRAPH_SETUPRASTER_Z_FORMAT);
     if (!pgraph_d3d11_render_targets_update(d, color, zeta, errp)) {
         pg->clearing = false;
         return false;
     }
     if (color && r->render_targets.color.rtv) {
-        float clear_color[4];
-        pgraph_get_clear_color(pg, clear_color);
         unsigned int xmin = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CLEARRECTX),
                                      NV_PGRAPH_CLEARRECTX_XMIN);
         unsigned int xmax = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CLEARRECTX),
@@ -1091,27 +1891,58 @@ bool pgraph_d3d11_render_targets_clear(NV2AState *d, uint32_t parameter,
         pgraph_apply_scaling_factor(pg, &clear_width, &clear_height);
 
         PGRAPHD3D11RenderTarget *target = &r->render_targets.color;
-        D3D11_RECT rect = {
-            .left = MIN(xmin, target->width),
-            .top = MIN(ymin, target->height),
-            .right = MIN((uint64_t)xmin + clear_width, target->width),
-            .bottom = MIN((uint64_t)ymin + clear_height, target->height),
-        };
-        bool full_clear = rect.left == 0 && rect.top == 0 &&
-                          rect.right >= target->width &&
-                          rect.bottom >= target->height;
-        ID3D11DeviceContext1 *context1 = NULL;
-        if (!full_clear && rect.right > rect.left && rect.bottom > rect.top &&
-            SUCCEEDED(ID3D11DeviceContext_QueryInterface(
-                r->context, &IID_ID3D11DeviceContext1, (void **)&context1))) {
-            ID3D11DeviceContext1_ClearView(context1, (ID3D11View *)target->rtv,
-                                           clear_color, &rect, 1);
-            ID3D11DeviceContext1_Release(context1);
-        } else if (full_clear) {
-            ID3D11DeviceContext_ClearRenderTargetView(r->context, target->rtv,
-                                                      clear_color);
+        D3D11_RECT rect = pgraph_d3d11_gl_scissor_rect(
+            target->height, xmin, ymin, clear_width, clear_height);
+        rect.left = CLAMP(rect.left, 0, (LONG)target->width);
+        rect.top = CLAMP(rect.top, 0, (LONG)target->height);
+        rect.right = CLAMP(rect.right, 0, (LONG)target->width);
+        rect.bottom = CLAMP(rect.bottom, 0, (LONG)target->height);
+        uint32_t channel_mask = d3d11_surface_color_clear_mask(
+            parameter, target->nv2a_format);
+        uint32_t all_channels =
+            NV097_CLEAR_SURFACE_R | NV097_CLEAR_SURFACE_G |
+            NV097_CLEAR_SURFACE_B | NV097_CLEAR_SURFACE_A;
+        if (channel_mask && rect.right > rect.left &&
+            rect.bottom > rect.top) {
+            if (!d3d11_surface_color_clear_supported(target->nv2a_format)) {
+                error_setg(errp,
+                           "D3D11: color clear is unsupported for surface "
+                           "format 0x%x",
+                           target->nv2a_format);
+                pg->clearing = false;
+                return false;
+            }
+            float clear_color[4];
+            pgraph_get_clear_color(pg, clear_color);
+            bool full_clear = rect.left == 0 && rect.top == 0 &&
+                              rect.right >= target->width &&
+                              rect.bottom >= target->height;
+            if (channel_mask == all_channels && full_clear) {
+                ID3D11DeviceContext_ClearRenderTargetView(r->context,
+                                                          target->rtv,
+                                                          clear_color);
+            } else if (channel_mask == all_channels) {
+                ID3D11DeviceContext1 *context1 = NULL;
+                if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(
+                        r->context, &IID_ID3D11DeviceContext1,
+                        (void **)&context1))) {
+                    ID3D11DeviceContext1_ClearView(
+                        context1, (ID3D11View *)target->rtv, clear_color,
+                        &rect, 1);
+                    ID3D11DeviceContext1_Release(context1);
+                } else if (!d3d11_clear_color_region_cpu(
+                               r, target, rect, channel_mask, clear_color,
+                               errp)) {
+                    pg->clearing = false;
+                    return false;
+                }
+            } else if (!d3d11_clear_color_region_cpu(
+                           r, target, rect, channel_mask, clear_color, errp)) {
+                pg->clearing = false;
+                return false;
+            }
+            pg->surface_color.draw_dirty = true;
         }
-        pg->surface_color.draw_dirty = true;
     }
     if (zeta && r->render_targets.depth_stencil.dsv) {
         UINT flags = 0;
@@ -1126,10 +1957,44 @@ bool pgraph_d3d11_render_targets_clear(NV2AState *d, uint32_t parameter,
         int stencil;
         pgraph_get_clear_depth_stencil_value(pg, &depth, &stencil);
         if (flags) {
-            ID3D11DeviceContext_ClearDepthStencilView(
-                r->context, r->render_targets.depth_stencil.dsv, flags, depth,
-                stencil);
-            pg->surface_zeta.draw_dirty = true;
+            unsigned int xmin = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CLEARRECTX),
+                                         NV_PGRAPH_CLEARRECTX_XMIN);
+            unsigned int xmax = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CLEARRECTX),
+                                         NV_PGRAPH_CLEARRECTX_XMAX);
+            unsigned int ymin = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CLEARRECTY),
+                                         NV_PGRAPH_CLEARRECTY_YMIN);
+            unsigned int ymax = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CLEARRECTY),
+                                         NV_PGRAPH_CLEARRECTY_YMAX);
+            unsigned int clear_width = xmax >= xmin ? xmax - xmin + 1 : 0;
+            unsigned int clear_height = ymax >= ymin ? ymax - ymin + 1 : 0;
+            pgraph_apply_anti_aliasing_factor(pg, &xmin, &ymin);
+            pgraph_apply_anti_aliasing_factor(pg, &clear_width, &clear_height);
+            pgraph_apply_scaling_factor(pg, &xmin, &ymin);
+            pgraph_apply_scaling_factor(pg, &clear_width, &clear_height);
+
+            PGRAPHD3D11RenderTarget *target =
+                &r->render_targets.depth_stencil;
+            D3D11_RECT rect = pgraph_d3d11_gl_scissor_rect(
+                target->height, xmin, ymin, clear_width, clear_height);
+            rect.left = CLAMP(rect.left, 0, (LONG)target->width);
+            rect.top = CLAMP(rect.top, 0, (LONG)target->height);
+            rect.right = CLAMP(rect.right, 0, (LONG)target->width);
+            rect.bottom = CLAMP(rect.bottom, 0, (LONG)target->height);
+            bool full_clear = rect.left == 0 && rect.top == 0 &&
+                              rect.right == (LONG)target->width &&
+                              rect.bottom == (LONG)target->height;
+            if (rect.right > rect.left && rect.bottom > rect.top) {
+                if (full_clear) {
+                    ID3D11DeviceContext_ClearDepthStencilView(
+                        r->context, target->dsv, flags, depth, stencil);
+                } else if (!d3d11_clear_depth_stencil_region_cpu(
+                               r, target, rect, parameter, depth, stencil,
+                               errp)) {
+                    pg->clearing = false;
+                    return false;
+                }
+                pg->surface_zeta.draw_dirty = true;
+            }
         }
     }
     pg->clearing = false;

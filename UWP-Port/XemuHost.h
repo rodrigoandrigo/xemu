@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -41,6 +42,8 @@ namespace UWP_Port
         bool GetVideoMetrics(uint32_t& fps, uint32_t& mspf) const;
         bool IsRunning() const { return m_running.load(); }
         std::string LastError() const;
+        bool RetrySwapChainAttach();
+        bool IsSwapChainAttachPending() const;
         bool AttachRenderPanel(Windows::UI::Xaml::Controls::SwapChainPanel^ panel);
         bool UpdateRenderPanelSize(Windows::UI::Xaml::Controls::SwapChainPanel^ panel);
 
@@ -51,6 +54,17 @@ namespace UWP_Port
                          Windows::Storage::StorageFolder^ folder);
 
     private:
+        struct SwapChainAttachState {
+            std::mutex mutex;
+            Microsoft::WRL::ComPtr<IDXGISwapChain2> swapChain;
+            Microsoft::WRL::ComPtr<IDXGISwapChain> requestedSwapChain;
+            uint64_t requestGeneration = 0;
+            bool requestedDetach = false;
+            std::atomic<bool> active{true};
+            std::atomic<bool> pending{false};
+            std::atomic<long> lastResult{0};
+        };
+
         template<typename T> bool Resolve(T& target, const char* name);
         bool Load();
         bool RegisterNativePresentTarget();
@@ -145,7 +159,7 @@ namespace UWP_Port
         uint64_t m_lastGamepadTimestamp;
         unsigned int m_gamepadChangeLogs;
         Windows::UI::Xaml::Controls::SwapChainPanel^ m_renderPanel;
-        Microsoft::WRL::ComPtr<IDXGISwapChain2> m_swapChain;
+        std::shared_ptr<SwapChainAttachState> m_swapChainAttachState;
         uint32_t m_renderWidth;
         uint32_t m_renderHeight;
 

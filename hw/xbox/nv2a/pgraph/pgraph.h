@@ -136,6 +136,12 @@ typedef struct PGRAPHRenderer {
         void (*suspend)(NV2AState *d);
         bool (*resume)(NV2AState *d);
         void (*memory_pressure)(NV2AState *d, unsigned int level);
+        /* Dispatcher order when set: renderer_lock, then PGRAPH lock. */
+        bool suspend_requires_pgraph_lock;
+        bool resume_requires_pgraph_lock;
+        bool memory_pressure_requires_pgraph_lock;
+        /* PFIFO reports are processed with PFIFO lock already held. */
+        bool process_pending_reports_requires_pgraph_lock;
         GPUProperties *(*get_gpu_properties)(void);
     } ops;
 } PGRAPHRenderer;

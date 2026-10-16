@@ -28,7 +28,7 @@
 #include <d3dcompiler.h>
 #include "shaders.h"
 
-#define D3D11_SHADER_CACHE_VERSION 9
+#define D3D11_SHADER_CACHE_VERSION 23
 #define D3D11_SHADER_CACHE_MAGIC 0x31485358U /* XSH1 */
 #define D3D11_SHADER_CACHE_MAX_BYTECODE (16 * MiB)
 #define D3D11_SHADER_MEMORY_CACHE_LIMIT 2048
@@ -36,7 +36,7 @@
 #define D3D11_PIXEL_CONSTANT_BUFFER_SIZE 720
 #define D3D11_VERTEX_CONSTANT_BUFFER_SIZE                            \
     ((NV2A_VERTEXSHADER_CONSTANTS + 2 + 4 * NV2A_MAX_LIGHTS +        \
-      NV2A_LTC1_COUNT + NV2A_LTCTXA_COUNT + NV2A_LTCTXB_COUNT + 3) * \
+      NV2A_LTC1_COUNT + NV2A_LTCTXA_COUNT + NV2A_LTCTXB_COUNT + 4) * \
      4 * sizeof(float))
 
 typedef enum D3D11ShaderStage {
@@ -153,6 +153,10 @@ static void d3d11_shader_cache_store(PGRAPHD3D11ShaderState *shaders,
     g_free(path);
 }
 
+static void d3d11_append_programmable_point_size(
+    GString *s, bool point_params_enable, float point_size,
+    unsigned int surface_scale_factor);
+
 static const char d3d11_vsh_preamble[] =
     "#define NV2A_COLOR_INTERPOLATION\n"
     "cbuffer Nv2aVertexConstants : register(b0) {\n"
@@ -187,10 +191,21 @@ static const char d3d11_vsh_preamble[] =
     "  NV2A_COLOR_INTERPOLATION float4 specular : COLOR1;\n"
     "  NV2A_COLOR_INTERPOLATION float4 backDiffuse : TEXCOORD4;\n"
     "  NV2A_COLOR_INTERPOLATION float4 backSpecular : TEXCOORD5;\n"
-    "  float fog : FOG; float pointSize : PSIZE;\n"
+    "  float fog : FOG; float pointSize : TEXCOORD12;\n"
     "  float4 tex0 : TEXCOORD0; float4 tex1 : TEXCOORD1;\n"
     "  float4 tex2 : TEXCOORD2; float4 tex3 : TEXCOORD3;\n"
+    "  nointerpolation float4 depthPos0 : TEXCOORD6;\n"
+    "  nointerpolation float4 depthPos1 : TEXCOORD7;\n"
+    "  nointerpolation float4 depthPos2 : TEXCOORD8;\n"
+    "  nointerpolation float triMzPerspective : TEXCOORD9;\n"
+    "  nointerpolation float triMzAffine : TEXCOORD10;\n"
     "};\n"
+    "float4 nv_vsh_color(float4 c) {\n"
+    "  float4 n=float4(c.x == c.x ? c.x : 1.0,"
+    "c.y == c.y ? c.y : 1.0,c.z == c.z ? c.z : 1.0,"
+    "c.w == c.w ? c.w : 1.0);\n"
+    "  return saturate(n);\n"
+    "}\n"
     "float4 nv_mov(float4 a) { return a; }\n"
     "float4 nv_mul(float4 a, float4 b) {\n"
     "  float4 r = a * b;\n"
@@ -212,7 +227,8 @@ static const char d3d11_vsh_preamble[] =
     "float4 nv_slt(float4 a, float4 b) { return float4(a < b); }\n"
     "float4 nv_sge(float4 a, float4 b) { return float4(a >= b); }\n"
     "float nv_clamp_away(float x) {\n"
-    "  return x >= 0 ? clamp(x, asfloat(0x1f800000), asfloat(0x5f800000))\n"
+    "  return (x > 0 || asuint(x) == 0) ?\n"
+    "         clamp(x, asfloat(0x1f800000), asfloat(0x5f800000))\n"
     "                : clamp(x, asfloat(0xdf800000), asfloat(0x9f800000));\n"
     "}\n"
     "float4 nv_rcp(float4 a) { return (1.0/a.x).xxxx; }\n"
@@ -326,6 +342,12 @@ void pgraph_d3d11_shaders_finalize(PGRAPHD3D11State *r)
     if (r->shaders->pixel_constants) {
         ID3D11Buffer_Release(r->shaders->pixel_constants);
     }
+    for (unsigned int i = 0; i < PGRAPHD3D11_GEOMETRY_SHADER_VARIANTS; i++) {
+        if (r->shaders->depth_geometry_shaders[i]) {
+            ID3D11GeometryShader_Release(
+                r->shaders->depth_geometry_shaders[i]);
+        }
+    }
     g_hash_table_unref(r->shaders->vertex_cache);
     g_hash_table_unref(r->shaders->pixel_cache);
     g_hash_table_unref(r->shaders->failed_vertex_cache);
@@ -342,8 +364,19 @@ void pgraph_d3d11_shaders_trim(PGRAPHD3D11State *r)
     }
     ID3D11DeviceContext_VSSetShader(r->context, NULL, NULL, 0);
     ID3D11DeviceContext_PSSetShader(r->context, NULL, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(r->context, NULL, NULL, 0);
     r->shaders->vertex = NULL;
     r->shaders->pixel = NULL;
+    r->shaders->quad_adjacency_geometry = false;
+    r->shaders->polygon_line_geometry = false;
+    for (unsigned int i = 0; i < PGRAPHD3D11_GEOMETRY_SHADER_VARIANTS; i++) {
+        if (r->shaders->depth_geometry_shaders[i]) {
+            ID3D11GeometryShader_Release(
+                r->shaders->depth_geometry_shaders[i]);
+            r->shaders->depth_geometry_shaders[i] = NULL;
+        }
+        r->shaders->depth_geometry_shader_failed[i] = false;
+    }
     g_hash_table_remove_all(r->shaders->vertex_cache);
     g_hash_table_remove_all(r->shaders->pixel_cache);
     g_hash_table_remove_all(r->shaders->failed_vertex_cache);
@@ -561,9 +594,127 @@ static bool d3d11_append_outputs(GString *s, const Nv2aVshOperation *op,
     return true;
 }
 
-static char *d3d11_translate_vertex_program(const ProgrammableVshState *program,
+static bool d3d11_append_vsh_fog_factor(GString *s, bool fog_enable,
+                                        enum VshFogMode fog_mode,
+                                        enum VshFoggen foggen,
+                                        bool fixed_function)
+{
+    if (!fog_enable) {
+        g_string_append(s, "  float fogFactor=1.0;\n");
+        return true;
+    }
+
+    if (!fixed_function) {
+        g_string_append(s, "  float fogDistance=oFog.x;\n");
+    } else {
+        switch (foggen) {
+        case FOGGEN_SPEC_ALPHA:
+            g_string_append(s,
+                            "  float fogDistance=clamp(specular.a,0.0,1.0);\n");
+            break;
+        case FOGGEN_RADIAL:
+            g_string_append(s, "  float fogDistance=length(tPosition.xyz);\n");
+            break;
+        case FOGGEN_PLANAR:
+        case FOGGEN_ABS_PLANAR:
+            g_string_append_printf(
+                s,
+                "  float fogDistance=dot(C[%u].xyz,tPosition.xyz)+C[%u].w;\n",
+                NV_IGRAPH_XF_XFCTX_FOG, NV_IGRAPH_XF_XFCTX_FOG);
+            if (foggen == FOGGEN_ABS_PLANAR) {
+                g_string_append(s, "  fogDistance=abs(fogDistance);\n");
+            }
+            break;
+        case FOGGEN_FOG_X:
+            g_string_append(s, "  float fogDistance=input.v5.x;\n");
+            break;
+        default:
+            return false;
+        }
+    }
+
+    float infinite_fogdistance_result = 0.0f;
+    float nan_fogfactor_result = 0.0f;
+    switch (fog_mode) {
+    case FOG_MODE_LINEAR:
+    case FOG_MODE_LINEAR_ABS:
+        infinite_fogdistance_result = 1.0f;
+        nan_fogfactor_result = 1.0f;
+        g_string_append(s, "  float fogFactor=fogParam.x+fogDistance*fogParam.y;\n"
+                           "  fogFactor-=1.0;\n");
+        break;
+    case FOG_MODE_EXP:
+        infinite_fogdistance_result = 1.0f;
+        nan_fogfactor_result = 1.0f;
+        g_string_append(s,
+                        "  float fogFactor=fogParam.x+"
+                        "exp2(fogDistance*fogParam.y*16.0);\n"
+                        "  fogFactor-=1.5;\n");
+        break;
+    case FOG_MODE_EXP_ABS:
+        g_string_append(s,
+                        "  float fogFactor=fogParam.x+"
+                        "exp2(fogDistance*fogParam.y*16.0);\n"
+                        "  fogFactor-=1.5;\n");
+        break;
+    case FOG_MODE_EXP2:
+    case FOG_MODE_EXP2_ABS:
+        g_string_append(s,
+                        "  float fogFactor=fogParam.x+exp2(-fogDistance*"
+                        "fogDistance*fogParam.y*fogParam.y*32.0);\n"
+                        "  fogFactor-=1.5;\n");
+        break;
+    default:
+        return false;
+    }
+    if (fog_mode == FOG_MODE_LINEAR_ABS || fog_mode == FOG_MODE_EXP_ABS ||
+        fog_mode == FOG_MODE_EXP2_ABS) {
+        g_string_append(s, "  fogFactor=abs(fogFactor);\n");
+    }
+    g_string_append_printf(
+        s,
+        "  if (isinf(fogDistance)) { fogFactor=%0.1f; } else {\n"
+        "    fogFactor=clamp(isnan(fogFactor) ? %0.1f : fogFactor,"
+        "-asfloat(0x7f7fffff),asfloat(0x7f7fffff));\n"
+        "  }\n",
+        infinite_fogdistance_result, nan_fogfactor_result);
+    return true;
+}
+
+static void d3d11_append_vsh_color_outputs(GString *s, const char *diffuse,
+                                           const char *specular,
+                                           const char *back_diffuse,
+                                           const char *back_specular,
+                                           bool specular_enable,
+                                           bool ignore_specular_alpha)
+{
+    g_string_append_printf(
+        s,
+        "  output.diffuse=nv_vsh_color(%s); "
+        "output.backDiffuse=nv_vsh_color(%s);\n",
+        diffuse, back_diffuse);
+    if (specular_enable) {
+        g_string_append_printf(
+            s,
+            "  output.specular=nv_vsh_color(%s); "
+            "output.backSpecular=nv_vsh_color(%s);\n",
+            specular, back_specular);
+        if (ignore_specular_alpha) {
+            g_string_append(s,
+                            "  output.specular.w=1.0; "
+                            "output.backSpecular.w=1.0;\n");
+        }
+    } else {
+        g_string_append(s,
+                        "  output.specular=float4(0,0,0,1); "
+                        "output.backSpecular=float4(0,0,0,1);\n");
+    }
+}
+
+static char *d3d11_translate_vertex_program(const VshState *state,
                                             Error **errp)
 {
+    const ProgrammableVshState *program = &state->programmable;
     if (!program->program_length ||
         program->program_length > NV2A_MAX_TRANSFORM_PROGRAM_LENGTH) {
         error_setg(errp, "D3D11: invalid NV2A vertex program length %d",
@@ -616,19 +767,153 @@ static char *d3d11_translate_vertex_program(const ProgrammableVshState *program,
         g_string_free(s, TRUE);
         return NULL;
     }
+    if (!d3d11_append_vsh_fog_factor(s, state->fog_enable, state->fog_mode,
+                                     state->fixed_function.foggen, false)) {
+        error_setg(errp, "D3D11: unsupported vertex fog mode");
+        g_string_free(s, TRUE);
+        return NULL;
+    }
     g_string_append(
-        s, "  oPos.xy = round(oPos.xy * 16.0) / 16.0;\n"
+        s, "  oPos.xy = trunc(oPos.xy * 16.0) / 16.0;\n"
            "  oPos.w = nv_clamp_away(oPos.w);\n"
+           "  float4 depthPosition=float4(oPos.xy,oPos.z,oPos.w);\n"
            "  oPos.xy = (2.0 * oPos.xy - surfaceSize) / surfaceSize; "
            "oPos.y=-oPos.y;\n"
            "  oPos.z = oPos.z / clipRange.y; oPos.xyz *= oPos.w;\n"
-           "  VSOut output; output.position=oPos; output.diffuse=oD0;\n"
-           "  output.specular=oD1; output.backDiffuse=oB0;\n"
-           "  output.backSpecular=oB1; output.fog=oFog.x;\n"
-           "  output.pointSize=oPts.x; output.tex0=oT0;\n"
+           "  VSOut output; output.position=oPos;\n"
+           "  output.depthPos0=depthPosition; output.depthPos1=depthPosition;\n"
+           "  output.depthPos2=depthPosition; output.triMzPerspective=0;\n"
+           "  output.triMzAffine=0;\n");
+    d3d11_append_vsh_color_outputs(s, "oD0", "oD1", "oB0", "oB1",
+                                   state->specular_enable,
+                                   state->ignore_specular_alpha);
+    g_string_append(s, "  output.fog=fogFactor;\n");
+    d3d11_append_programmable_point_size(
+        s, state->point_params_enable, state->point_size,
+        state->surface_scale_factor);
+    g_string_append(s,
+           "  output.tex0=oT0;\n"
            "  output.tex1=oT1; output.tex2=oT2; output.tex3=oT3;\n"
            "  return output;\n}\n");
     return g_string_free(s, FALSE);
+}
+
+typedef enum D3D11TexgenComponentKind {
+    D3D11_TEXGEN_INPUT,
+    D3D11_TEXGEN_EYE_LINEAR,
+    D3D11_TEXGEN_OBJECT_LINEAR,
+    D3D11_TEXGEN_NORMAL,
+    D3D11_TEXGEN_SPHERE,
+    D3D11_TEXGEN_REFLECTION,
+    D3D11_TEXGEN_INVALID,
+} D3D11TexgenComponentKind;
+
+static D3D11TexgenComponentKind d3d11_texgen_component_kind(
+    unsigned int mode, unsigned int component)
+{
+    switch (mode) {
+    case TEXGEN_DISABLE:
+        return D3D11_TEXGEN_INPUT;
+    case TEXGEN_EYE_LINEAR:
+        return D3D11_TEXGEN_EYE_LINEAR;
+    case TEXGEN_OBJECT_LINEAR:
+        return D3D11_TEXGEN_OBJECT_LINEAR;
+    case TEXGEN_NORMAL_MAP:
+        return component < 3 ? D3D11_TEXGEN_NORMAL : D3D11_TEXGEN_INVALID;
+    case TEXGEN_SPHERE_MAP:
+        return component < 2 ? D3D11_TEXGEN_SPHERE : D3D11_TEXGEN_INVALID;
+    case TEXGEN_REFLECTION_MAP:
+        return component < 3 ? D3D11_TEXGEN_REFLECTION :
+                               D3D11_TEXGEN_INVALID;
+    default:
+        return D3D11_TEXGEN_INVALID;
+    }
+}
+
+static void d3d11_append_fixed_function_texgen_vectors(
+    GString *s, const char *tex, const enum VshTexgen modes[4])
+{
+    bool sphere = false;
+    bool reflection = false;
+    for (unsigned int component = 0; component < 4; component++) {
+        D3D11TexgenComponentKind kind =
+            d3d11_texgen_component_kind(modes[component], component);
+        sphere |= kind == D3D11_TEXGEN_SPHERE;
+        reflection |= kind == D3D11_TEXGEN_REFLECTION;
+    }
+    if (!sphere && !reflection) {
+        return;
+    }
+
+    g_string_append(s,
+                    "  { float3 n=tNormal;"
+                    " float3 u=normalize(tPosition.xyz); float3 r=reflect(u,n);\n");
+    if (sphere) {
+        g_string_append(s,
+                        "    float invM=1.0/(2.0*length(r+"
+                        "float3(0,0,1)));\n");
+    }
+    for (unsigned int component = 0; component < 4; component++) {
+        char channel = "xyzw"[component];
+        D3D11TexgenComponentKind kind =
+            d3d11_texgen_component_kind(modes[component], component);
+        if (kind == D3D11_TEXGEN_SPHERE) {
+            g_string_append_printf(s, "    %s.%c=r.%c*invM+0.5;\n", tex,
+                                   channel, channel);
+        } else if (kind == D3D11_TEXGEN_REFLECTION) {
+            g_string_append_printf(s, "    %s.%c=r.%c;\n", tex, channel,
+                                   channel);
+        }
+    }
+    g_string_append(s, "  }\n");
+}
+
+static void d3d11_append_vsh_point_size(GString *s, bool point_params_enable,
+                                        float point_size,
+                                        unsigned int surface_scale_factor,
+                                        unsigned int model_view_matrix)
+{
+    if (point_params_enable) {
+        g_string_append_printf(
+            s,
+            "  float d_e=length(xf_mul4(position,%u));\n"
+            "  float ptMinSize=min(pointParams1.w,63.875);\n"
+            "  float ptMaxSize=min(pointParams0.w+ptMinSize,63.875);\n"
+            "  float pointSizeAttenuated=1.0/sqrt(pointParams0.x+"
+            "pointParams0.y*d_e+pointParams0.z*d_e*d_e)+pointParams1.z;\n"
+            "  output.pointSize=clamp(pointSizeAttenuated*pointParams0.w+"
+            "pointParams1.w,ptMinSize,ptMaxSize)*%u.0;\n",
+            model_view_matrix, surface_scale_factor);
+    } else {
+        g_string_append_printf(s, "  output.pointSize=%ff;\n",
+                               MAX(1.0f, point_size) *
+                                   surface_scale_factor);
+    }
+}
+
+static void d3d11_append_programmable_point_size(
+    GString *s, bool point_params_enable, float point_size,
+    unsigned int surface_scale_factor)
+{
+    if (point_params_enable) {
+        g_string_append(s, "  output.pointSize=oPts.x;\n");
+    } else {
+        if (point_size <= 0.0f) {
+            point_size = 1.0f;
+        }
+        g_string_append_printf(s, "  output.pointSize=%ff;\n",
+                               point_size * surface_scale_factor);
+    }
+}
+
+static void d3d11_append_fixed_function_specular_mix(GString *s,
+                                                      bool specular_enable,
+                                                      bool separate_specular)
+{
+    if (specular_enable && !separate_specular) {
+        g_string_append(s, "  litDiffuse.rgb+=litSpecular.rgb;"
+                           " litSpecular=specular;\n");
+    }
 }
 
 static char *d3d11_translate_fixed_function_vertex(const VshState *state,
@@ -738,57 +1023,38 @@ static char *d3d11_translate_fixed_function_vertex(const VshState *state,
         unsigned int plane = NV_IGRAPH_XF_XFCTX_TG0MAT + stage * 8;
         for (unsigned int component = 0; component < 4; component++) {
             char channel = "xyzw"[component];
-            switch (ff->texgen[stage][component]) {
-            case TEXGEN_DISABLE:
+            unsigned int mode = ff->texgen[stage][component];
+            D3D11TexgenComponentKind kind =
+                d3d11_texgen_component_kind(mode, component);
+            switch (kind) {
+            case D3D11_TEXGEN_INPUT:
                 break;
-            case TEXGEN_EYE_LINEAR:
+            case D3D11_TEXGEN_EYE_LINEAR:
                 g_string_append_printf(s, "  %s.%c=dot(tPosition,C[%u]);\n",
                                        tex, channel, plane + component);
                 break;
-            case TEXGEN_OBJECT_LINEAR:
+            case D3D11_TEXGEN_OBJECT_LINEAR:
                 g_string_append_printf(s, "  %s.%c=dot(position,C[%u]);\n", tex,
                                        channel, plane + component);
                 break;
-            case TEXGEN_NORMAL_MAP:
-                if (component < 3) {
-                    g_string_append_printf(s, "  %s.%c=input.v2.%c;\n", tex,
-                                           channel, channel);
-                }
+            case D3D11_TEXGEN_NORMAL:
+                g_string_append_printf(s, "  %s.%c=tNormal.%c;\n", tex,
+                                       channel, channel);
                 break;
-            case TEXGEN_SPHERE_MAP:
-            case TEXGEN_REFLECTION_MAP:
-                /* Filled below as a vector so the reflection is shared. */
+            case D3D11_TEXGEN_SPHERE:
+            case D3D11_TEXGEN_REFLECTION:
                 break;
             default:
-                error_setg(errp, "D3D11: unsupported fixed-function texgen %u",
-                           ff->texgen[stage][component]);
+                error_setg(errp,
+                           "D3D11: unsupported fixed-function texgen %u "
+                           "on channel %u",
+                           mode, component);
                 g_string_free(s, TRUE);
                 return NULL;
             }
         }
-        bool sphere = ff->texgen[stage][0] == TEXGEN_SPHERE_MAP ||
-                      ff->texgen[stage][1] == TEXGEN_SPHERE_MAP;
-        bool reflection = sphere;
-        for (unsigned int component = 0; component < 3; component++) {
-            reflection |= ff->texgen[stage][component] == TEXGEN_REFLECTION_MAP;
-        }
-        if (reflection) {
-            g_string_append_printf(
-                s,
-                "  { float3 n=normalize(input.v2.xyz);"
-                " float3 u=normalize(tPosition.xyz); float3 r=reflect(u,n);\n");
-            if (sphere) {
-                g_string_append_printf(
-                    s,
-                    "    float invM=1.0/(2.0*length(r+float3(0,0,1)));"
-                    " %s.xy=r.xy*invM+0.5;\n",
-                    tex);
-            }
-            if (!sphere) {
-                g_string_append_printf(s, "    %s.xyz=r;\n", tex);
-            }
-            g_string_append(s, "  }\n");
-        }
+        d3d11_append_fixed_function_texgen_vectors(s, tex,
+                                                   ff->texgen[stage]);
         if (ff->texture_matrix_enable[stage]) {
             unsigned int matrix = NV_IGRAPH_XF_XFCTX_T0MAT + stage * 8;
             g_string_append_printf(s,
@@ -903,15 +1169,19 @@ static char *d3d11_translate_fixed_function_vertex(const VshState *state,
                 NV_IGRAPH_XF_LTCTXB_L0_DIF + i * 6, specular_factor,
                 NV_IGRAPH_XF_LTCTXB_L0_SPC + i * 6);
         }
-        if (!state->separate_specular) {
-            g_string_append(s, "  litDiffuse.rgb+=litSpecular.rgb;"
-                               " litSpecular=specular;\n");
-        }
+        d3d11_append_fixed_function_specular_mix(
+            s, state->specular_enable, state->separate_specular);
         g_string_append(s, "  diffuse=litDiffuse; specular=litSpecular;\n");
     }
 
     if (!skin_count) {
         g_string_append(s, "  tPosition=position;\n");
+    }
+    if (!d3d11_append_vsh_fog_factor(
+            s, state->fog_enable, state->fog_mode, ff->foggen, true)) {
+        error_setg(errp, "D3D11: unsupported fixed-function fog mode");
+        g_string_free(s, TRUE);
+        return NULL;
     }
     g_string_append_printf(s, "  float4 oPos=xf_mul4(tPosition,%u);\n",
                            NV_IGRAPH_XF_XFCTX_CMAT0);
@@ -922,19 +1192,40 @@ static char *d3d11_translate_fixed_function_vertex(const VshState *state,
         "  oPos.xy/=oPos.w;\n"
         "  oPos.xy+=C[%u].xy;\n"
         "  oPos.xy=trunc(oPos.xy*16.0)/16.0;\n"
+        "  float4 depthPosition=float4(oPos.xy,oPos.z/oPos.w,oPos.w);\n"
         "  oPos.xy=(2.0*oPos.xy-surfaceSize)/surfaceSize; oPos.y=-oPos.y;\n"
         "  oPos.z=oPos.z/clipRange.y; oPos.xy*=oPos.w;\n"
-        "  VSOut output; output.position=oPos; output.diffuse=diffuse;\n"
-        "  output.specular=%s; output.backDiffuse=backDiffuse;\n"
-        "  output.backSpecular=%s; output.fog=%s;\n"
-        "  output.pointSize=%ff; output.tex0=oT0; output.tex1=oT1;\n"
-        "  output.tex2=oT2; output.tex3=oT3; return output;\n}\n",
-        NV_IGRAPH_XF_XFCTX_VPOFF,
-        state->specular_enable ? "specular" : "float4(0,0,0,1)",
-        state->specular_enable ? "backSpecular" : "float4(0,0,0,1)",
-        state->fog_enable ? "input.v5.x" : "1.0",
-        MAX(1.0f, state->point_size) * state->surface_scale_factor);
+        "  VSOut output; output.position=oPos;\n"
+        "  output.depthPos0=depthPosition; output.depthPos1=depthPosition;\n"
+        "  output.depthPos2=depthPosition; output.triMzPerspective=0;\n"
+        "  output.triMzAffine=0;\n",
+        NV_IGRAPH_XF_XFCTX_VPOFF);
+    d3d11_append_vsh_color_outputs(s, "diffuse", "specular", "backDiffuse",
+                                   "backSpecular", state->specular_enable,
+                                   state->ignore_specular_alpha);
+    g_string_append(s, "  output.fog=fogFactor;\n");
+    d3d11_append_vsh_point_size(
+        s, state->point_params_enable, state->point_size,
+        state->surface_scale_factor, NV_IGRAPH_XF_XFCTX_MMAT0);
+    g_string_append(s,
+                    "  output.tex0=oT0; output.tex1=oT1;\n"
+                    "  output.tex2=oT2; output.tex3=oT3; return output;\n}\n");
     return g_string_free(s, FALSE);
+}
+
+static const char *d3d11_shader_profile(const PGRAPHD3D11State *r,
+                                        bool vertex)
+{
+    if (r->feature_level >= D3D_FEATURE_LEVEL_11_0) {
+        return vertex ? "vs_5_0" : "ps_5_0";
+    }
+    if (r->feature_level >= D3D_FEATURE_LEVEL_10_1) {
+        return vertex ? "vs_4_1" : "ps_4_1";
+    }
+    if (r->feature_level >= D3D_FEATURE_LEVEL_10_0) {
+        return vertex ? "vs_4_0" : "ps_4_0";
+    }
+    return NULL;
 }
 
 static PGRAPHD3D11VertexShader *d3d11_compile_vertex_shader(PGRAPHD3D11State *r,
@@ -942,10 +1233,16 @@ static PGRAPHD3D11VertexShader *d3d11_compile_vertex_shader(PGRAPHD3D11State *r,
                                                             Error **errp)
 {
     ID3DBlob *bytecode = NULL, *errors = NULL;
-    HRESULT hr = D3DCompile(
+    const char *profile = d3d11_shader_profile(r, true);
+    if (!profile) {
+        error_setg(errp, "D3D11: unsupported shader feature level 0x%x",
+                   r->feature_level);
+        return NULL;
+    }
+    HRESULT hr = D3DCompile2(
         source, strlen(source), "nv2a_vertex.hlsl", NULL, NULL, "main",
-        "vs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
-        0, &bytecode, &errors);
+        profile, D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        0, 0, NULL, 0, &bytecode, &errors);
     if (FAILED(hr)) {
         const char *message = errors ? ID3D10Blob_GetBufferPointer(errors) :
                                        "no compiler diagnostics";
@@ -1037,6 +1334,7 @@ typedef struct PGRAPHD3D11VertexConstants {
     float material_alpha;
     float specular_power;
     float padding[2];
+    float line_params[4];
 } PGRAPHD3D11VertexConstants;
 
 static bool d3d11_update_vertex_constants(PGRAPHState *pg,
@@ -1090,6 +1388,12 @@ static bool d3d11_update_vertex_constants(PGRAPHState *pg,
            sizeof(constants.point_params));
     constants.material_alpha = values.material_alpha[0];
     constants.specular_power = values.specularPower[0];
+    unsigned int viewport_width = pg->surface_binding_dim.width;
+    unsigned int viewport_height = pg->surface_binding_dim.height;
+    pgraph_apply_scaling_factor(pg, &viewport_width, &viewport_height);
+    constants.line_params[0] = MAX(1U, viewport_width);
+    constants.line_params[1] = MAX(1U, viewport_height);
+    constants.line_params[2] = MAX(1U, pg->surface_scale_factor);
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr = ID3D11DeviceContext_Map(
@@ -1107,7 +1411,42 @@ static bool d3d11_update_vertex_constants(PGRAPHState *pg,
         r->context, (ID3D11Resource *)r->shaders->vertex_constants, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(r->context, 0, 1,
                                              &r->shaders->vertex_constants);
+    ID3D11DeviceContext_GSSetConstantBuffers(
+        r->context, 0, 1, &r->shaders->vertex_constants);
     return true;
+}
+
+static void d3d11_append_programmable_fog_key(GByteArray *key_data,
+                                               bool fog_enable,
+                                               enum VshFogMode fog_mode)
+{
+    const uint8_t fog_enabled_key = fog_enable ? 1 : 0;
+    const uint32_t fog_mode_key = (uint32_t)fog_mode;
+    g_byte_array_append(key_data, &fog_enabled_key, sizeof(fog_enabled_key));
+    g_byte_array_append(key_data, (const uint8_t *)&fog_mode_key,
+                        sizeof(fog_mode_key));
+}
+
+static void d3d11_append_programmable_vsh_key(
+    GByteArray *key_data, bool fog_enable, enum VshFogMode fog_mode,
+    enum VshFoggen foggen, bool specular_enable, bool ignore_specular_alpha,
+    bool point_params_enable, float point_size,
+    unsigned int surface_scale_factor)
+{
+    const uint32_t foggen_key = (uint32_t)foggen;
+    const uint8_t codegen_flags[] = {
+        specular_enable ? 1 : 0,
+        ignore_specular_alpha ? 1 : 0,
+        point_params_enable ? 1 : 0,
+    };
+    d3d11_append_programmable_fog_key(key_data, fog_enable, fog_mode);
+    g_byte_array_append(key_data, (const uint8_t *)&foggen_key,
+                        sizeof(foggen_key));
+    g_byte_array_append(key_data, codegen_flags, sizeof(codegen_flags));
+    g_byte_array_append(key_data, (const uint8_t *)&point_size,
+                        sizeof(point_size));
+    g_byte_array_append(key_data, (const uint8_t *)&surface_scale_factor,
+                        sizeof(surface_scale_factor));
 }
 
 bool pgraph_d3d11_bind_vertex_shader(PGRAPHState *pg, Error **errp)
@@ -1123,12 +1462,21 @@ bool pgraph_d3d11_bind_vertex_shader(PGRAPHState *pg, Error **errp)
     } else {
         key_data = g_byte_array_sized_new(sizeof(program->program_length) +
                                           program->program_length *
-                                              sizeof(program->program_data[0]));
+                                              sizeof(program->program_data[0]) +
+                                          sizeof(uint8_t) + sizeof(uint32_t) +
+                                          sizeof(uint32_t) +
+                                          3 * sizeof(uint8_t) + sizeof(float) +
+                                          sizeof(state.surface_scale_factor));
         g_byte_array_append(key_data, (const uint8_t *)&program->program_length,
                             sizeof(program->program_length));
         g_byte_array_append(key_data, (const uint8_t *)program->program_data,
                             program->program_length *
                                 sizeof(program->program_data[0]));
+        d3d11_append_programmable_vsh_key(
+            key_data, state.fog_enable, state.fog_mode,
+            state.fixed_function.foggen, state.specular_enable,
+            state.ignore_specular_alpha, state.point_params_enable,
+            state.point_size, state.surface_scale_factor);
     }
     GBytes *key = g_byte_array_free_to_bytes(key_data);
     PGRAPHD3D11VertexShader *shader =
@@ -1144,7 +1492,7 @@ bool pgraph_d3d11_bind_vertex_shader(PGRAPHState *pg, Error **errp)
     if (!shader) {
         char *source = state.is_fixed_function ?
                            d3d11_translate_fixed_function_vertex(&state, errp) :
-                           d3d11_translate_vertex_program(program, errp);
+                           d3d11_translate_vertex_program(&state, errp);
         if (!source) {
             if (g_hash_table_size(r->shaders->failed_vertex_cache) >=
                 D3D11_SHADER_FAILURE_CACHE_LIMIT) {
@@ -1188,7 +1536,7 @@ bool pgraph_d3d11_bind_vertex_shader(PGRAPHState *pg, Error **errp)
 
 static const char d3d11_psh_preamble[] =
     "cbuffer Nv2aPixelConstants : register(b0) {\n"
-    "  float4 K[18]; float4 fogColor; int alphaRef; float3 _psPad;\n"
+    "  float4 K[18]; float4 fogColor; int alphaRef; float3 eyeVector;\n"
     "  float4 bumpMat[4]; float4 bumpParams[4]; float4 clipRange;\n"
     "  uint4 colorKey; uint4 colorKeyMask; int4 clipRegion[8];\n"
     "  float4 texScale; float4 texCoordScale[4]; float2 surfaceScale; float "
@@ -1199,16 +1547,612 @@ static const char d3d11_psh_preamble[] =
     "  float4 position : SV_Position;\n"
     "  float4 diffuse : COLOR0; float4 specular : COLOR1;\n"
     "  float4 backDiffuse : TEXCOORD4; float4 backSpecular : TEXCOORD5;\n"
-    "  float fog : FOG; float pointSize : PSIZE;\n"
+    "  float fog : FOG; float pointSize : TEXCOORD12;\n"
     "  float4 tex0 : TEXCOORD0; float4 tex1 : TEXCOORD1;\n"
     "  float4 tex2 : TEXCOORD2; float4 tex3 : TEXCOORD3;\n"
+    "  nointerpolation float4 depthPos0 : TEXCOORD6;\n"
+    "  nointerpolation float4 depthPos1 : TEXCOORD7;\n"
+    "  nointerpolation float4 depthPos2 : TEXCOORD8;\n"
+    "  nointerpolation float triMzPerspective : TEXCOORD9;\n"
+    "  nointerpolation float triMzAffine : TEXCOORD10;\n"
+    "  float2 pointCoord : TEXCOORD11;\n"
     "  bool frontFace : SV_IsFrontFace;\n"
     "};\n"
     "float nv_mul1(float a,float b) { return (a==0||b==0)?0:a*b; }\n"
     "float3 nv_mul3(float3 a,float3 b) {\n"
     "  float3 r=a*b; if(a.x==0||b.x==0)r.x=0;\n"
     "  if(a.y==0||b.y==0)r.y=0; if(a.z==0||b.z==0)r.z=0; return r;\n"
+    "}\n"
+    "bool nv_color_key_match(float4 texel,uint key,uint mask) {\n"
+    "  uint4 c=(uint4)(texel*255.0+0.5);\n"
+    "  uint value=(c.a<<24)|(c.r<<16)|(c.g<<8)|c.b;\n"
+    "  return (value&mask)==(key&mask);\n"
     "}\n";
+
+static void d3d11_append_quad_depth_line(GString *source,
+                                         bool wide_lines,
+                                         unsigned int edge,
+                                         unsigned int p0,
+                                         unsigned int p1,
+                                         unsigned int p2,
+                                         unsigned int v0,
+                                         unsigned int v1)
+{
+    if (wide_lines) {
+        g_string_append_printf(
+            source,
+            "  float4 p%u0=input[%u].depthPos0; "
+            "float4 p%u1=input[%u].depthPos0; "
+            "float4 p%u2=input[%u].depthPos0;\n"
+            "  float mzP%u=nv2a_tri_mz_perspective(p%u0,p%u1,p%u2);\n"
+            "  float mzA%u=nv2a_tri_mz_affine(p%u0,p%u1,p%u2);\n"
+            "  float4 lineOffset%u=nv2a_line_offset(input[%u].position,"
+            "input[%u].position);\n"
+            "  stream.Append(nv2a_make_wide_line_vertex(input[%u],input[3],"
+            "p%u0,p%u1,p%u2,mzP%u,mzA%u,lineOffset%u,1.0,-1.0));\n"
+            "  stream.Append(nv2a_make_wide_line_vertex(input[%u],input[3],"
+            "p%u0,p%u1,p%u2,mzP%u,mzA%u,lineOffset%u,-1.0,-1.0));\n"
+            "  stream.Append(nv2a_make_wide_line_vertex(input[%u],input[3],"
+            "p%u0,p%u1,p%u2,mzP%u,mzA%u,lineOffset%u,1.0,1.0));\n"
+            "  stream.Append(nv2a_make_wide_line_vertex(input[%u],input[3],"
+            "p%u0,p%u1,p%u2,mzP%u,mzA%u,lineOffset%u,-1.0,1.0));\n"
+            "  stream.RestartStrip();\n",
+            edge, p0, edge, p1, edge, p2,
+            edge, edge, edge, edge,
+            edge, edge, edge, edge,
+            edge, v0, v1,
+            v0, edge, edge, edge, edge, edge, edge,
+            v0, edge, edge, edge, edge, edge, edge,
+            v1, edge, edge, edge, edge, edge, edge,
+            v1, edge, edge, edge, edge, edge, edge);
+        return;
+    }
+    g_string_append_printf(
+        source,
+        "  float4 p%u0=input[%u].depthPos0; "
+        "float4 p%u1=input[%u].depthPos0; "
+        "float4 p%u2=input[%u].depthPos0;\n"
+        "  float mzP%u=nv2a_tri_mz_perspective(p%u0,p%u1,p%u2);\n"
+        "  float mzA%u=nv2a_tri_mz_affine(p%u0,p%u1,p%u2);\n"
+        "  stream.Append(nv2a_make_quad_vertex(input[%u],input[3],"
+        "p%u0,p%u1,p%u2,mzP%u,mzA%u));\n"
+        "  stream.Append(nv2a_make_quad_vertex(input[%u],input[3],"
+        "p%u0,p%u1,p%u2,mzP%u,mzA%u));\n"
+        "  stream.RestartStrip();\n",
+        edge, p0, edge, p1, edge, p2,
+        edge, edge, edge, edge,
+        edge, edge, edge, edge,
+        v0, edge, edge, edge, edge, edge,
+        v1, edge, edge, edge, edge, edge);
+}
+
+static void d3d11_append_quad_depth_point(GString *source,
+                                          unsigned int point,
+                                          unsigned int p0,
+                                          unsigned int p1,
+                                          unsigned int p2,
+                                          unsigned int vertex)
+{
+    g_string_append_printf(
+        source,
+        "  float4 p%u0=input[%u].depthPos0; "
+        "float4 p%u1=input[%u].depthPos0; "
+        "float4 p%u2=input[%u].depthPos0;\n"
+        "  float mzP%u=nv2a_tri_mz_perspective(p%u0,p%u1,p%u2);\n"
+        "  float mzA%u=nv2a_tri_mz_affine(p%u0,p%u1,p%u2);\n"
+        "  GSOut pointVertex%u=nv2a_make_quad_vertex(input[%u],input[3],"
+        "input[%u].depthPos0,input[%u].depthPos0,input[%u].depthPos0,"
+        "mzP%u,mzA%u);\n"
+        "  stream.Append(nv2a_make_point_vertex(pointVertex%u,"
+        "float2(-1.0,1.0),float2(0.0,0.0)));\n"
+        "  stream.Append(nv2a_make_point_vertex(pointVertex%u,"
+        "float2(1.0,1.0),float2(1.0,0.0)));\n"
+        "  stream.Append(nv2a_make_point_vertex(pointVertex%u,"
+        "float2(-1.0,-1.0),float2(0.0,1.0)));\n"
+        "  stream.Append(nv2a_make_point_vertex(pointVertex%u,"
+        "float2(1.0,-1.0),float2(1.0,1.0)));\n"
+        "  stream.RestartStrip();\n",
+        point, p0, point, p1, point, p2,
+        point, point, point, point,
+        point, point, point, point,
+        point, point, vertex, vertex, vertex, point, point, point,
+        point, point, point);
+}
+
+static void d3d11_append_quad_depth_triangle(GString *source,
+                                              unsigned int triangle,
+                                              unsigned int p0,
+                                              unsigned int p1,
+                                              unsigned int p2,
+                                              unsigned int v0,
+                                              unsigned int v1,
+                                              unsigned int v2)
+{
+    g_string_append_printf(
+        source,
+        "  float4 p%u0=input[%u].depthPos0; "
+        "float4 p%u1=input[%u].depthPos0; "
+        "float4 p%u2=input[%u].depthPos0;\n"
+        "  float mzP%u=nv2a_tri_mz_perspective(p%u0,p%u1,p%u2);\n"
+        "  float mzA%u=nv2a_tri_mz_affine(p%u0,p%u1,p%u2);\n"
+        "  stream.Append(nv2a_make_quad_vertex(input[%u],input[3],"
+        "p%u0,p%u1,p%u2,mzP%u,mzA%u));\n"
+        "  stream.Append(nv2a_make_quad_vertex(input[%u],input[3],"
+        "p%u0,p%u1,p%u2,mzP%u,mzA%u));\n"
+        "  stream.Append(nv2a_make_quad_vertex(input[%u],input[3],"
+        "p%u0,p%u1,p%u2,mzP%u,mzA%u));\n"
+        "  stream.RestartStrip();\n",
+        triangle, p0, triangle, p1, triangle, p2,
+        triangle, triangle, triangle, triangle,
+        triangle, triangle, triangle, triangle,
+        v0, triangle, triangle, triangle, triangle, triangle,
+        v1, triangle, triangle, triangle, triangle, triangle,
+        v2, triangle, triangle, triangle, triangle, triangle);
+}
+
+static void d3d11_append_depth_geometry_vertex_helper(GString *source,
+                                                      bool smooth_shading,
+                                                      bool wide_lines)
+{
+    g_string_append(
+        source,
+        "GSOut nv2a_make_quad_vertex(GSIn vertex,GSIn flatVertex,"
+        "float4 p0,float4 p1,float4 p2,float mzP,float mzA){\n"
+        "  GSOut o; o.position=vertex.position;\n");
+    if (smooth_shading) {
+        g_string_append(
+            source,
+            "  o.diffuse=vertex.diffuse; o.specular=vertex.specular;\n"
+            "  o.backDiffuse=vertex.backDiffuse; "
+            "o.backSpecular=vertex.backSpecular;\n");
+    } else {
+        g_string_append(
+            source,
+            "  o.diffuse=flatVertex.diffuse; "
+            "o.specular=flatVertex.specular;\n"
+            "  o.backDiffuse=flatVertex.backDiffuse; "
+            "o.backSpecular=flatVertex.backSpecular;\n");
+    }
+    g_string_append(
+        source,
+        "  o.fog=vertex.fog; o.pointSize=vertex.pointSize;\n"
+        "  o.tex0=vertex.tex0; o.tex1=vertex.tex1;\n"
+        "  o.tex2=vertex.tex2; o.tex3=vertex.tex3;\n"
+        "  o.pointCoord=float2(0.0,0.0);\n"
+        "  o.depthPos0=p0; o.depthPos1=p1; o.depthPos2=p2;\n"
+        "  o.triMzPerspective=mzP; o.triMzAffine=mzA; return o;\n"
+        "}\n");
+    if (wide_lines) {
+        g_string_append_printf(
+            source,
+            "cbuffer Nv2aGeometryConstants : register(b0) {\n"
+            "  float4 nv2aLineParams : packoffset(c%u);\n"
+            "};\n",
+            (unsigned int)(D3D11_VERTEX_CONSTANT_BUFFER_SIZE /
+                               (4 * sizeof(float)) -
+                           1));
+        g_string_append(
+            source,
+            "float4 nv2a_line_offset(float4 a,float4 b){\n"
+            "  float2 viewport=max(nv2aLineParams.xy,float2(1.0,1.0));\n"
+            "  float2 delta=(b.xy/b.w-a.xy/a.w)*viewport;\n"
+            "  float length2=dot(delta,delta);\n"
+            "  float2 fallback=nv2aLineParams.z/viewport;\n"
+            "  if(abs(a.w)<=1e-20||abs(b.w)<=1e-20||"
+            "isnan(length2)||isinf(length2)||length2<=1e-12)\n"
+            "    return float4(0.0,fallback.y,fallback.x,0.0);\n"
+            "  float2 normal=float2(-delta.y,delta.x)*rsqrt(length2);\n"
+            "  return float4(normal*nv2aLineParams.z/viewport,0.0,0.0);\n"
+            "}\n"
+            "GSOut nv2a_make_wide_line_vertex(GSIn vertex,GSIn flatVertex,"
+            "float4 p0,float4 p1,float4 p2,float mzP,float mzA,"
+            "float4 offset,float side,float endSide){\n"
+            "  GSOut o=nv2a_make_quad_vertex(vertex,flatVertex,"
+            "p0,p1,p2,mzP,mzA);\n"
+            "  o.position.xy+=(offset.xy*side+offset.zw*endSide)*"
+            "o.position.w; return o;\n"
+            "}\n");
+    }
+}
+
+static void d3d11_append_point_geometry_vertex_helper(GString *source)
+{
+    g_string_append_printf(
+        source,
+        "cbuffer Nv2aPointGeometryConstants : register(b0) {\n"
+        "  float4 nv2aPointViewport : packoffset(c%u);\n"
+        "};\n"
+        "GSOut nv2a_make_point_vertex(GSOut vertex,float2 corner,float2 coord){\n"
+        "  float2 viewport=max(nv2aPointViewport.xy,float2(1.0,1.0));\n"
+        "  float pointSize=max(vertex.pointSize,1.0);\n"
+        "  vertex.position.xy+=corner*(pointSize/viewport)*vertex.position.w;\n"
+        "  vertex.pointCoord=coord; return vertex;\n"
+        "}\n",
+        (unsigned int)(D3D11_VERTEX_CONSTANT_BUFFER_SIZE /
+                           (4 * sizeof(float)) -
+                       1));
+}
+
+static char *d3d11_depth_geometry_shader_source(
+    bool smooth_shading, unsigned int provoking_mode,
+    enum ShaderPrimitiveMode primitive, enum ShaderPolygonMode polygon_mode,
+    bool wide_lines)
+{
+    const char *provoking = provoking_mode == 0 ? "0u" :
+                            provoking_mode == 1 ? "1u" :
+                            provoking_mode == 2 ? "2u" :
+                                                  "(2u-(primitiveId&1u))";
+    const char *line_provoking =
+        primitive == PRIM_TYPE_POLYGON && polygon_mode == POLY_MODE_LINE ?
+            "0" : provoking_mode == 0 ? "0" : "1";
+    GString *source = g_string_new("");
+    g_string_append(
+        source,
+        "struct GSIn {\n"
+        "  float4 position:SV_Position; float4 diffuse:COLOR0;\n"
+        "  float4 specular:COLOR1; float4 backDiffuse:TEXCOORD4;\n"
+        "  float4 backSpecular:TEXCOORD5; float fog:FOG; float pointSize:TEXCOORD12;\n"
+        "  float4 tex0:TEXCOORD0; float4 tex1:TEXCOORD1;\n"
+        "  float4 tex2:TEXCOORD2; float4 tex3:TEXCOORD3;\n"
+        "  nointerpolation float4 depthPos0:TEXCOORD6;\n"
+        "  nointerpolation float4 depthPos1:TEXCOORD7;\n"
+        "  nointerpolation float4 depthPos2:TEXCOORD8;\n"
+        "  nointerpolation float triMzPerspective:TEXCOORD9;\n"
+        "  nointerpolation float triMzAffine:TEXCOORD10;\n"
+        "};\n"
+        "struct GSOut {\n"
+        "  float4 position:SV_Position;\n"
+        "  float4 diffuse:COLOR0; float4 specular:COLOR1;\n"
+        "  float4 backDiffuse:TEXCOORD4; float4 backSpecular:TEXCOORD5;\n"
+        "  float fog:FOG; float pointSize:TEXCOORD12;\n"
+        "  float4 tex0:TEXCOORD0; float4 tex1:TEXCOORD1;\n"
+        "  float4 tex2:TEXCOORD2; float4 tex3:TEXCOORD3;\n"
+        "  nointerpolation float4 depthPos0:TEXCOORD6;\n"
+        "  nointerpolation float4 depthPos1:TEXCOORD7;\n"
+        "  nointerpolation float4 depthPos2:TEXCOORD8;\n"
+        "  nointerpolation float triMzPerspective:TEXCOORD9;\n"
+        "  nointerpolation float triMzAffine:TEXCOORD10;\n"
+        "  float2 pointCoord:TEXCOORD11;\n"
+        "};\n"
+        "float nv2a_kahan_det(float a,float b,float c,float d){\n"
+        "  precise float cd=c*d; precise float err=mad(-c,d,cd);\n"
+        "  precise float value=mad(a,b,-cd)+err; return value;\n"
+        "}\n"
+        "float nv2a_tri_mz_perspective(float4 p0,float4 p1,float4 p2){\n"
+        "  precise float2 m0=p1.xy-p0.xy; precise float2 m1=p2.xy-p0.xy;\n"
+        "  precise float2 b=float2(p0.w-p1.w,p0.w-p2.w);\n"
+        "  b/=float2(p1.w,p2.w)*p0.w;\n"
+        "  float det=nv2a_kahan_det(m0.x,m1.y,m1.x,m0.y);\n"
+        "  float dx=nv2a_kahan_det(b.x,m1.y,b.y,m0.y)/det;\n"
+        "  float dy=nv2a_kahan_det(b.y,m0.x,b.x,m1.x)/det;\n"
+        "  float slope=max(abs(dx),abs(dy));\n"
+        "  return (isnan(slope)||isinf(slope))?0.0:slope;\n"
+        "}\n"
+        "float nv2a_tri_mz_affine(float4 p0,float4 p1,float4 p2){\n"
+        "  precise float2 m0=p1.xy-p0.xy; precise float2 m1=p2.xy-p0.xy;\n"
+        "  precise float2 b=float2(p1.z-p0.z,p2.z-p0.z);\n"
+        "  float det=nv2a_kahan_det(m0.x,m1.y,m1.x,m0.y);\n"
+        "  float dx=nv2a_kahan_det(b.x,m1.y,b.y,m0.y)/det;\n"
+        "  float dy=nv2a_kahan_det(b.y,m0.x,b.x,m1.x)/det;\n"
+        "  float slope=max(abs(dx),abs(dy));\n"
+        "  return (isnan(slope)||isinf(slope))?0.0:slope;\n"
+        "}\n");
+    if (primitive == PRIM_TYPE_POINTS) {
+        d3d11_append_depth_geometry_vertex_helper(source, true, false);
+        d3d11_append_point_geometry_vertex_helper(source);
+        g_string_append(
+            source,
+            "[maxvertexcount(4)]\n"
+            "void main(point GSIn input[1],inout TriangleStream<GSOut> stream){\n"
+            "  float4 p=input[0].depthPos0;\n"
+            "  GSOut pointVertex=nv2a_make_quad_vertex(input[0],input[0],p,p,p,"
+            "0.0,0.0);\n"
+            "  pointVertex.backDiffuse=pointVertex.diffuse;"
+            " pointVertex.backSpecular=pointVertex.specular;\n"
+            "  stream.Append(nv2a_make_point_vertex(pointVertex,float2(-1.0,1.0),"
+            "float2(0.0,0.0)));\n"
+            "  stream.Append(nv2a_make_point_vertex(pointVertex,float2(1.0,1.0),"
+            "float2(1.0,0.0)));\n"
+            "  stream.Append(nv2a_make_point_vertex(pointVertex,float2(-1.0,-1.0),"
+            "float2(0.0,1.0)));\n"
+            "  stream.Append(nv2a_make_point_vertex(pointVertex,float2(1.0,-1.0),"
+            "float2(1.0,1.0)));\n"
+            "  stream.RestartStrip();\n"
+            "}\n");
+        return g_string_free(source, FALSE);
+    }
+    if (primitive == PRIM_TYPE_POLYGON && polygon_mode == POLY_MODE_LINE) {
+        d3d11_append_depth_geometry_vertex_helper(source, smooth_shading,
+                                                  wide_lines);
+        g_string_append_printf(
+            source,
+            "[maxvertexcount(%u)]\n"
+            "void main(line GSIn input[2],"
+            "inout %s<GSOut> stream){\n"
+            "  float4 p0=input[0].depthPos0; "
+            "float4 p1=input[1].depthPos0;\n"
+            "  float2 delta=p1.xy-p0.xy;\n"
+            "  float4 p2=float4(p0.xy+float2(-delta.y,delta.x),p0.zw);\n",
+            wide_lines ? 4 : 2,
+            wide_lines ? "TriangleStream" : "LineStream");
+        if (wide_lines) {
+            g_string_append(
+                source,
+                "  float4 lineOffset=nv2a_line_offset(input[0].position,"
+                "input[1].position);\n"
+                "  stream.Append(nv2a_make_wide_line_vertex(input[0],input[0],"
+                "p0,p1,p2,0.0,0.0,lineOffset,1.0,-1.0));\n"
+                "  stream.Append(nv2a_make_wide_line_vertex(input[0],input[0],"
+                "p0,p1,p2,0.0,0.0,lineOffset,-1.0,-1.0));\n"
+                "  stream.Append(nv2a_make_wide_line_vertex(input[1],input[0],"
+                "p0,p1,p2,0.0,0.0,lineOffset,1.0,1.0));\n"
+                "  stream.Append(nv2a_make_wide_line_vertex(input[1],input[0],"
+                "p0,p1,p2,0.0,0.0,lineOffset,-1.0,1.0));\n"
+                "  stream.RestartStrip();\n");
+        } else {
+            g_string_append(
+                source,
+                "  stream.Append(nv2a_make_quad_vertex(input[0],input[0],"
+                "p0,p1,p2,0.0,0.0));\n"
+                "  stream.Append(nv2a_make_quad_vertex(input[1],input[0],"
+                "p0,p1,p2,0.0,0.0));\n"
+                "  stream.RestartStrip();\n");
+        }
+        g_string_append(source, "}\n");
+        return g_string_free(source, FALSE);
+    }
+    if (primitive == PRIM_TYPE_LINES ||
+        primitive == PRIM_TYPE_LINE_LOOP ||
+        primitive == PRIM_TYPE_LINE_STRIP) {
+        d3d11_append_depth_geometry_vertex_helper(source, smooth_shading,
+                                                  wide_lines);
+        g_string_append_printf(
+            source,
+            "[maxvertexcount(%u)]\n"
+            "void main(line GSIn input[2],"
+            "inout %s<GSOut> stream){\n"
+            "  float4 p0=input[0].depthPos0; "
+            "float4 p1=input[1].depthPos0;\n"
+            "  float2 delta=p1.xy-p0.xy;\n"
+            "  float4 p2=float4(p0.xy+float2(-delta.y,delta.x),p0.zw);\n"
+            "  float mzP=nv2a_tri_mz_perspective(p0,p1,p2);\n"
+            "  float mzA=nv2a_tri_mz_affine(p0,p1,p2);\n",
+            wide_lines ? 4 : 2,
+            wide_lines ? "TriangleStream" : "LineStream");
+        if (wide_lines) {
+            g_string_append_printf(
+                source,
+                "  float4 lineOffset=nv2a_line_offset(input[0].position,"
+                "input[1].position);\n"
+                "  stream.Append(nv2a_make_wide_line_vertex(input[0],"
+                "input[%s],p0,p1,p2,mzP,mzA,lineOffset,1.0,-1.0));\n"
+                "  stream.Append(nv2a_make_wide_line_vertex(input[0],"
+                "input[%s],p0,p1,p2,mzP,mzA,lineOffset,-1.0,-1.0));\n"
+                "  stream.Append(nv2a_make_wide_line_vertex(input[1],"
+                "input[%s],p0,p1,p2,mzP,mzA,lineOffset,1.0,1.0));\n"
+                "  stream.Append(nv2a_make_wide_line_vertex(input[1],"
+                "input[%s],p0,p1,p2,mzP,mzA,lineOffset,-1.0,1.0));\n"
+                "  stream.RestartStrip();\n",
+                line_provoking, line_provoking,
+                line_provoking, line_provoking);
+        } else {
+            g_string_append_printf(
+                source,
+                "  stream.Append(nv2a_make_quad_vertex(input[0],input[%s],"
+                "p0,p1,p2,mzP,mzA));\n"
+                "  stream.Append(nv2a_make_quad_vertex(input[1],input[%s],"
+                "p0,p1,p2,mzP,mzA));\n"
+                "  stream.RestartStrip();\n",
+                line_provoking, line_provoking);
+        }
+        g_string_append(source, "}\n");
+        return g_string_free(source, FALSE);
+    }
+    if (polygon_mode == POLY_MODE_LINE &&
+        (primitive == PRIM_TYPE_TRIANGLES ||
+         primitive == PRIM_TYPE_TRIANGLE_STRIP ||
+         primitive == PRIM_TYPE_TRIANGLE_FAN)) {
+        d3d11_append_depth_geometry_vertex_helper(source, smooth_shading,
+                                                  wide_lines);
+        g_string_append_printf(
+            source,
+            "[maxvertexcount(%u)]\n"
+            "void main(triangle GSIn input[3],uint primitiveId:SV_PrimitiveID,"
+            "inout %s<GSOut> stream){\n"
+            "  uint p=%s;\n"
+            "  float4 p0=input[0].depthPos0; float4 p1=input[1].depthPos0;\n"
+            "  float4 p2=input[2].depthPos0;\n"
+            "  float mzP=nv2a_tri_mz_perspective(p0,p1,p2);\n"
+            "  float mzA=nv2a_tri_mz_affine(p0,p1,p2);\n"
+            "  for(uint i=0;i<3;i++){ uint j=(i+1)%%3;\n"
+            "    float4 lp0=input[i].depthPos0;\n"
+            "    float4 lp1=input[j].depthPos0;\n"
+            "    float2 delta=lp1.xy-lp0.xy;\n"
+            "    float4 lp2=float4(lp0.xy+float2(-delta.y,delta.x),lp0.zw);\n",
+            wide_lines ? 12 : 6,
+            wide_lines ? "TriangleStream" : "LineStream",
+            provoking);
+        if (wide_lines) {
+            g_string_append(
+                source,
+                "    float4 lineOffset=nv2a_line_offset(input[i].position,"
+                "input[j].position);\n"
+                "    stream.Append(nv2a_make_wide_line_vertex(input[i],input[p],"
+                "lp0,lp1,lp2,mzP,mzA,lineOffset,1.0,-1.0));\n"
+                "    stream.Append(nv2a_make_wide_line_vertex(input[i],input[p],"
+                "lp0,lp1,lp2,mzP,mzA,lineOffset,-1.0,-1.0));\n"
+                "    stream.Append(nv2a_make_wide_line_vertex(input[j],input[p],"
+                "lp0,lp1,lp2,mzP,mzA,lineOffset,1.0,1.0));\n"
+                "    stream.Append(nv2a_make_wide_line_vertex(input[j],input[p],"
+                "lp0,lp1,lp2,mzP,mzA,lineOffset,-1.0,1.0));\n"
+                "    stream.RestartStrip();\n"
+                "  }\n"
+                "}\n");
+        } else {
+            g_string_append(
+                source,
+                "    stream.Append(nv2a_make_quad_vertex(input[i],input[p],"
+                "lp0,lp1,lp2,mzP,mzA));\n"
+                "    stream.Append(nv2a_make_quad_vertex(input[j],input[p],"
+                "lp0,lp1,lp2,mzP,mzA));\n"
+                "    stream.RestartStrip();\n"
+                "  }\n"
+                "}\n");
+        }
+        return g_string_free(source, FALSE);
+    }
+    if (primitive == PRIM_TYPE_QUADS ||
+        primitive == PRIM_TYPE_QUAD_STRIP) {
+        d3d11_append_depth_geometry_vertex_helper(source, smooth_shading,
+                                                  wide_lines);
+        bool polygon_line = polygon_mode == POLY_MODE_LINE;
+        bool polygon_point = polygon_mode == POLY_MODE_POINT;
+        if (polygon_point) {
+            d3d11_append_point_geometry_vertex_helper(source);
+        }
+        unsigned int max_vertices = polygon_line ? (wide_lines ? 16 : 8) :
+                                    polygon_point ? 16 : 6;
+        const char *stream_type = polygon_line ?
+                                      (wide_lines ? "TriangleStream" :
+                                                    "LineStream") :
+                                  "TriangleStream";
+        g_string_append_printf(source, "[maxvertexcount(%u)]\n", max_vertices);
+        if (primitive == PRIM_TYPE_QUAD_STRIP) {
+            g_string_append_printf(
+                source,
+                "void main(lineadj GSIn input[4],"
+                "uint primitiveId:SV_PrimitiveID,"
+                "inout %s<GSOut> stream){\n"
+                "  if((primitiveId&1u)!=0u)return;\n",
+                stream_type);
+        } else {
+            g_string_append_printf(
+                source,
+                "void main(lineadj GSIn input[4],"
+                "inout %s<GSOut> stream){\n",
+                stream_type);
+        }
+        if (polygon_line && primitive == PRIM_TYPE_QUADS) {
+            /* GL emits only the four perimeter edges; do not expose the 0-2
+             * triangulation diagonal as D3D11 wireframe rasterization would. */
+            d3d11_append_quad_depth_line(source, wide_lines, 0, 0, 1, 2, 0, 1);
+            d3d11_append_quad_depth_line(source, wide_lines, 1, 0, 1, 2, 1, 2);
+            d3d11_append_quad_depth_line(source, wide_lines, 2, 0, 2, 3, 2, 3);
+            d3d11_append_quad_depth_line(source, wide_lines, 3, 0, 2, 3, 3, 0);
+        } else if (polygon_line) {
+            /* Match geom.c's quad-strip perimeter and split-depth planes. */
+            d3d11_append_quad_depth_line(source, wide_lines, 0, 2, 0, 1, 0, 1);
+            d3d11_append_quad_depth_line(source, wide_lines, 1, 2, 1, 3, 1, 3);
+            d3d11_append_quad_depth_line(source, wide_lines, 2, 2, 1, 3, 3, 2);
+            d3d11_append_quad_depth_line(source, wide_lines, 3, 2, 0, 1, 2, 0);
+        } else if (polygon_point && primitive == PRIM_TYPE_QUADS) {
+            /* The first triangle owns points 0-2; the second owns point 3. */
+            d3d11_append_quad_depth_point(source, 0, 0, 1, 2, 0);
+            d3d11_append_quad_depth_point(source, 1, 0, 1, 2, 1);
+            d3d11_append_quad_depth_point(source, 2, 0, 1, 2, 2);
+            d3d11_append_quad_depth_point(source, 3, 0, 2, 3, 3);
+        } else if (polygon_point) {
+            /* Match geom.c's quad-strip triangle split and point ordering. */
+            d3d11_append_quad_depth_point(source, 0, 2, 0, 1, 0);
+            d3d11_append_quad_depth_point(source, 1, 2, 0, 1, 1);
+            d3d11_append_quad_depth_point(source, 2, 2, 0, 1, 2);
+            d3d11_append_quad_depth_point(source, 3, 2, 1, 3, 3);
+        } else if (primitive == PRIM_TYPE_QUADS) {
+            /* Match geom.c: the quad is split along 0-2 and uses vertex 3
+             * for flat-shaded attributes on both output triangles. */
+            d3d11_append_quad_depth_triangle(source, 0, 0, 1, 2, 1, 2, 0);
+            g_string_append(source, "\n");
+            d3d11_append_quad_depth_triangle(source, 1, 0, 2, 3, 2, 3, 0);
+        } else {
+            /* Match geom.c's even-primitive handling of GL_LINE_STRIP_ADJACENCY. */
+            d3d11_append_quad_depth_triangle(source, 0, 2, 0, 1, 0, 1, 2);
+            g_string_append(source, "\n");
+            d3d11_append_quad_depth_triangle(source, 1, 2, 1, 3, 2, 1, 3);
+        }
+        g_string_append(source, "}\n");
+        return g_string_free(source, FALSE);
+    }
+    bool polygon_point = polygon_mode == POLY_MODE_POINT;
+    if (polygon_point) {
+        d3d11_append_point_geometry_vertex_helper(source);
+    }
+    g_string_append_printf(
+        source,
+        "[maxvertexcount(%u)]\n"
+        "void main(triangle GSIn input[3],uint primitiveId:SV_PrimitiveID,"
+        "inout TriangleStream<GSOut> stream){\n"
+        "  uint p=%s;\n"
+        "  float4 p0=input[0].depthPos0; float4 p1=input[1].depthPos0;\n"
+        "  float4 p2=input[2].depthPos0;\n"
+        "  float mzP=nv2a_tri_mz_perspective(p0,p1,p2);\n"
+        "  float mzA=nv2a_tri_mz_affine(p0,p1,p2);\n",
+        polygon_point ? 12 : 3, provoking);
+    if (!smooth_shading) {
+        g_string_append(
+            source,
+            "  float4 flatDiffuse=p==0?input[0].diffuse:"
+            "(p==1?input[1].diffuse:input[2].diffuse);\n"
+            "  float4 flatSpecular=p==0?input[0].specular:"
+            "(p==1?input[1].specular:input[2].specular);\n"
+            "  float4 flatBackDiffuse=p==0?input[0].backDiffuse:"
+            "(p==1?input[1].backDiffuse:input[2].backDiffuse);\n"
+            "  float4 flatBackSpecular=p==0?input[0].backSpecular:"
+            "(p==1?input[1].backSpecular:input[2].backSpecular);\n");
+    }
+    g_string_append(
+        source,
+        "  for(uint i=0;i<3;i++){ GSOut v=(GSOut)0;\n"
+        "    v.position=input[i].position;\n");
+    if (smooth_shading) {
+        g_string_append(source,
+                        "    v.diffuse=input[i].diffuse; v.specular=input[i].specular;\n"
+                        "    v.backDiffuse=input[i].backDiffuse;\n"
+                        "    v.backSpecular=input[i].backSpecular;\n");
+    } else {
+        g_string_append(source,
+                        "    v.diffuse=flatDiffuse; v.specular=flatSpecular;\n"
+                        "    v.backDiffuse=flatBackDiffuse;\n"
+                        "    v.backSpecular=flatBackSpecular;\n");
+    }
+    g_string_append(
+        source,
+        "    v.fog=input[i].fog; v.pointSize=input[i].pointSize;\n"
+        "    v.tex0=input[i].tex0; v.tex1=input[i].tex1;\n"
+        "    v.tex2=input[i].tex2; v.tex3=input[i].tex3;\n");
+    if (polygon_point) {
+        g_string_append(
+            source,
+            "    v.depthPos0=input[i].depthPos0; "
+            "v.depthPos1=input[i].depthPos0; "
+            "v.depthPos2=input[i].depthPos0;\n");
+    } else {
+        g_string_append(
+            source,
+            "    v.depthPos0=p0; v.depthPos1=p1; v.depthPos2=p2;\n");
+    }
+    g_string_append(
+        source,
+        "    v.triMzPerspective=mzP; v.triMzAffine=mzA;\n"
+        );
+    if (polygon_point) {
+        g_string_append(
+            source,
+            "    stream.Append(nv2a_make_point_vertex(v,float2(-1.0,1.0),"
+            "float2(0.0,0.0)));\n"
+            "    stream.Append(nv2a_make_point_vertex(v,float2(1.0,1.0),"
+            "float2(1.0,0.0)));\n"
+            "    stream.Append(nv2a_make_point_vertex(v,float2(-1.0,-1.0),"
+            "float2(0.0,1.0)));\n"
+            "    stream.Append(nv2a_make_point_vertex(v,float2(1.0,-1.0),"
+            "float2(1.0,1.0)));\n"
+            "    stream.RestartStrip(); }\n");
+    } else {
+        g_string_append(source, "    stream.Append(v); }\n"
+                        "  stream.RestartStrip();\n");
+    }
+    g_string_append(source, "}\n");
+    return g_string_free(source, FALSE);
+}
 
 #define D3D11_PS_REGISTER_MASK 0x0f
 #define D3D11_PS_INPUT_MAPPING_MASK 0xe0
@@ -1252,15 +2196,11 @@ static const char *d3d11_ps_register_name(uint32_t index)
     }
 }
 
-static void d3d11_ps_append_input(GString *s, uint32_t input, bool alpha,
-                                  bool final_abcd)
+static void d3d11_ps_append_input(GString *s, uint32_t input, bool alpha)
 {
     uint32_t index = input & D3D11_PS_REGISTER_MASK;
     uint32_t mapping = input & D3D11_PS_INPUT_MAPPING_MASK;
     bool alpha_channel = input & PS_CHANNEL_ALPHA;
-    if (final_abcd && mapping >= PS_INPUTMAPPING_EXPAND_NORMAL) {
-        mapping &= PS_INPUTMAPPING_UNSIGNED_INVERT;
-    }
     const char *name = d3d11_ps_register_name(index);
     GString *value = g_string_new(NULL);
     if (!name || index == PS_REGISTER_ZERO) {
@@ -1374,15 +2314,13 @@ static bool d3d11_ps_append_stage(GString *s, const PshState *state,
     const char *prefixes[] = { "rgbA", "rgbB", "rgbC", "rgbD" };
     for (unsigned int i = 0; i < 4; i++) {
         g_string_append_printf(s, "  float3 %s_%u=", prefixes[i], stage);
-        d3d11_ps_append_input(s, d3d11_ps_input_byte(rgb_input, i), false,
-                              false);
+        d3d11_ps_append_input(s, d3d11_ps_input_byte(rgb_input, i), false);
         g_string_append(s, ";\n");
     }
     const char *alpha_prefixes[] = { "aA", "aB", "aC", "aD" };
     for (unsigned int i = 0; i < 4; i++) {
         g_string_append_printf(s, "  float %s_%u=", alpha_prefixes[i], stage);
-        d3d11_ps_append_input(s, d3d11_ps_input_byte(alpha_input, i), true,
-                              false);
+        d3d11_ps_append_input(s, d3d11_ps_input_byte(alpha_input, i), true);
         g_string_append(s, ";\n");
     }
     if (rgb_flags & PS_COMBINEROUTPUT_AB_DOT_PRODUCT) {
@@ -1411,7 +2349,7 @@ static bool d3d11_ps_append_stage(GString *s, const PshState *state,
     g_string_append_printf(
         s,
         mux_msb ? "  bool mux_%u=(R0.a>=0.5);\n" :
-                  "  bool mux_%u=(((uint)(saturate(R0.a)*255+0.5)&1)!=0);\n",
+                  "  bool mux_%u=(((uint)(saturate(R0.a)*255)&1)!=0);\n",
         stage);
     if (!(rgb_flags & (PS_COMBINEROUTPUT_AB_DOT_PRODUCT |
                        PS_COMBINEROUTPUT_CD_DOT_PRODUCT))) {
@@ -1456,34 +2394,14 @@ static bool d3d11_ps_append_stage(GString *s, const PshState *state,
     return true;
 }
 
-static void d3d11_ps_append_final_input(GString *s, uint32_t input, bool abcd)
+static void d3d11_ps_append_final_input(GString *s, uint32_t input,
+                                       bool alpha, bool allow_ef_prod)
 {
-    uint32_t index = input & D3D11_PS_REGISTER_MASK;
-    uint32_t mapping = input & D3D11_PS_INPUT_MAPPING_MASK;
-    bool alpha = input & PS_CHANNEL_ALPHA;
-    if (mapping >= PS_INPUTMAPPING_EXPAND_NORMAL) {
-        mapping &= PS_INPUTMAPPING_UNSIGNED_INVERT;
+    if (!allow_ef_prod &&
+        (input & D3D11_PS_REGISTER_MASK) == PS_REGISTER_EF_PROD) {
+        input &= ~D3D11_PS_REGISTER_MASK;
     }
-    const char *name = d3d11_ps_register_name(index);
-    GString *value = g_string_new(NULL);
-    if (!name || index == PS_REGISTER_ZERO) {
-        g_string_append(value, "float4(0,0,0,0)");
-    } else if (index == PS_REGISTER_FOG) {
-        g_string_append(value, "float4(0,0,0,FOG.a)");
-    } else if (!abcd && (index == PS_REGISTER_V1R0_SUM ||
-                         index == PS_REGISTER_EF_PROD)) {
-        g_string_append(value, "float4(0,0,0,0)");
-    } else if (alpha) {
-        g_string_append_printf(value, "%s.aaaa", name);
-    } else {
-        g_string_append(value, name);
-    }
-    if (mapping == PS_INPUTMAPPING_UNSIGNED_INVERT) {
-        g_string_append_printf(s, "(1-saturate(%s))", value->str);
-    } else {
-        g_string_append_printf(s, "max(float4(0,0,0,0),%s)", value->str);
-    }
-    g_string_free(value, TRUE);
+    d3d11_ps_append_input(s, input, alpha);
 }
 
 static bool d3d11_ps_append_alpha_test(GString *s, const PshState *state,
@@ -1498,34 +2416,383 @@ static bool d3d11_ps_append_alpha_test(GString *s, const PshState *state,
         condition = "true";
         break;
     case ALPHA_FUNC_LESS:
-        condition = "result.a>=alphaRef/255.0";
+        condition = "resultAlpha>=alphaRef";
         break;
     case ALPHA_FUNC_EQUAL:
-        condition = "result.a!=alphaRef/255.0";
+        condition = "resultAlpha!=alphaRef";
         break;
     case ALPHA_FUNC_LEQUAL:
-        condition = "result.a>alphaRef/255.0";
+        condition = "resultAlpha>alphaRef";
         break;
     case ALPHA_FUNC_GREATER:
-        condition = "result.a<=alphaRef/255.0";
+        condition = "resultAlpha<=alphaRef";
         break;
     case ALPHA_FUNC_NOTEQUAL:
-        condition = "result.a==alphaRef/255.0";
+        condition = "resultAlpha==alphaRef";
         break;
     case ALPHA_FUNC_GEQUAL:
-        condition = "result.a<alphaRef/255.0";
+        condition = "resultAlpha<alphaRef";
         break;
     default:
         error_setg(errp, "D3D11: invalid NV2A alpha function %u",
                    state->alpha_func);
         return false;
     }
+    g_string_append(s, "  int resultAlpha=(int)round(result.a*255.0);\n");
     g_string_append_printf(s, "  if(%s) discard;\n", condition);
     return true;
 }
 
-static char *d3d11_translate_pixel_combiners(const PshState *state,
-                                             Error **errp)
+static void d3d11_ps_append_border_adjustment(GString *s, const PshState *state,
+                                              unsigned int stage,
+                                              const char *coordinate)
+{
+    if (state->border_logical_size[stage][0] == 0.0f) {
+        return;
+    }
+    if (state->dim_tex[stage] == 1) {
+        g_string_append_printf(
+            s, "  %s.x=(%s.x*%.9g+4)*%.9g;\n", coordinate, coordinate,
+            state->border_logical_size[stage][0],
+            state->border_inv_real_size[stage][0]);
+        return;
+    }
+    g_string_append_printf(
+        s,
+        "  %s=(%s*float3(%.9g,%.9g,%.9g)+float3(4,4,4))*"
+        "float3(%.9g,%.9g,%.9g);\n",
+        coordinate, coordinate, state->border_logical_size[stage][0],
+        state->border_logical_size[stage][1],
+        state->border_logical_size[stage][2],
+        state->border_inv_real_size[stage][0],
+        state->border_inv_real_size[stage][1],
+        state->border_inv_real_size[stage][2]);
+}
+
+static bool d3d11_ps_append_convolution_filter(GString *s,
+                                               const PshState *state,
+                                               unsigned int stage,
+                                               Error **errp)
+{
+    if (state->conv_tex[stage] != CONVOLUTION_FILTER_GAUSSIAN &&
+        state->conv_tex[stage] != CONVOLUTION_FILTER_QUINCUNX) {
+        error_setg(errp, "D3D11: unsupported NV2A convolution kernel %u",
+                   state->conv_tex[stage]);
+        return false;
+    }
+    if (state->dim_tex[stage] != 2 || state->tex_cubemap[stage]) {
+        error_setg(errp,
+                   "D3D11: PROJECT2D convolution requires a non-cubemap 2D "
+                   "texture");
+        return false;
+    }
+
+    char border_coord[32];
+    g_snprintf(border_coord, sizeof(border_coord), "pT%u.xyz", stage);
+    d3d11_ps_append_border_adjustment(s, state, stage, border_coord);
+
+    g_string_append_printf(
+        s,
+        "  uint convolutionWidth%u,convolutionHeight%u;\n"
+        "  tex%u.GetDimensions(convolutionWidth%u,convolutionHeight%u);\n"
+        "  float2 convolutionTexel%u=1.0/float2(convolutionWidth%u,"
+        "convolutionHeight%u);\n"
+        "  float2 convolutionBase%u=pT%u.xy*texCoordScale[%u].xy;\n"
+        "  T%u=float4(0,0,0,0);\n",
+        stage, stage, stage, stage, stage, stage, stage, stage, stage, stage,
+        stage, stage);
+
+    static const unsigned int weights[3][3] = {
+        { 1, 2, 1 }, { 2, 4, 2 }, { 1, 2, 1 },
+    };
+    for (unsigned int y = 0; y < 3; y++) {
+        for (unsigned int x = 0; x < 3; x++) {
+            g_string_append_printf(
+                s,
+                "  T%u+=NV2A_SAMPLE2(tex%u,samp%u,%u,(convolutionBase%u+"
+                "float2(%.1f,%.1f)*convolutionTexel%u)/pT%u.w)*(%u.0/16.0);\n",
+                stage, stage, stage, stage, stage, (double)x - 1.0,
+                (double)y - 1.0, stage, stage, weights[y][x]);
+        }
+    }
+    return true;
+}
+
+static void d3d11_ps_append_window_clip(GString *s, const PshState *state)
+{
+    g_string_append(s, "  float2 windowCoord=input.position.xy-0.5;\n");
+    if (state->window_clip_exclusive) {
+        for (unsigned int i = 0; i < 8; i++) {
+            g_string_append_printf(
+                s,
+                "  if(all(windowCoord>=float2(clipRegion[%u].xy)) && "
+                "all(windowCoord<float2(clipRegion[%u].zw))) discard;\n",
+                i, i);
+        }
+    } else {
+        g_string_append(s, "  bool windowClipContained=false;\n");
+        for (unsigned int i = 0; i < 8; i++) {
+            g_string_append_printf(
+                s,
+                "  windowClipContained=windowClipContained || "
+                "(all(windowCoord>=float2(clipRegion[%u].xy)) && "
+                "all(windowCoord<float2(clipRegion[%u].zw)));\n",
+                i, i);
+        }
+        g_string_append(s, "  if(!windowClipContained) discard;\n");
+    }
+}
+
+static void d3d11_ps_append_custom_depth(GString *s, const PshState *state)
+{
+    g_string_append(
+        s,
+        "  float2 unscaledXY=input.position.xy/surfaceScale;\n"
+        "  precise float bc0=nv2a_area(unscaledXY,input.depthPos1.xy,"
+        "input.depthPos2.xy);\n"
+        "  precise float bc1=nv2a_area(unscaledXY,input.depthPos2.xy,"
+        "input.depthPos0.xy);\n"
+        "  precise float bc2=nv2a_area(unscaledXY,input.depthPos0.xy,"
+        "input.depthPos1.xy);\n");
+    if (state->z_perspective) {
+        g_string_append(
+            s,
+            "  bc0/=input.depthPos0.w; bc1/=input.depthPos1.w;\n"
+            "  bc2/=input.depthPos2.w;\n"
+            "  float invBcSum=1.0/(bc0+bc1+bc2);\n"
+            "  if(isinf(invBcSum)) invBcSum=0.0;\n"
+            "  bc1*=invBcSum; bc2*=invBcSum;\n"
+            "  precise float zvalue=input.depthPos0.w+"
+            "(bc1*(input.depthPos1.w-input.depthPos0.w)+"
+            "bc2*(input.depthPos2.w-input.depthPos0.w));\n"
+            "  if(zvalue>0.0){\n"
+            "    float zslopeofs=depthFactor*input.triMzPerspective*"
+            "zvalue*zvalue;\n"
+            "    zvalue+=depthOffset; zvalue+=zslopeofs;\n"
+            "  }else{ zvalue=asfloat(0x7f7fffff); }\n"
+            "  if(isnan(zvalue)) zvalue=asfloat(0x7f7fffff);\n");
+    } else {
+        g_string_append(
+            s,
+            "  float invBcSum=1.0/(bc0+bc1+bc2);\n"
+            "  if(isinf(invBcSum)) invBcSum=0.0;\n"
+            "  bc1*=invBcSum; bc2*=invBcSum;\n"
+            "  precise float zvalue=input.depthPos0.z+"
+            "(bc1*(input.depthPos1.z-input.depthPos0.z)+"
+            "bc2*(input.depthPos2.z-input.depthPos0.z));\n"
+            "  zvalue+=depthOffset; zvalue+=depthFactor*input.triMzAffine;\n");
+    }
+    if (state->depth_clipping) {
+        g_string_append(s,
+                        "  if(zvalue<clipRange.z||clipRange.w<zvalue) discard;\n");
+    } else {
+        g_string_append(s, "  zvalue=clamp(zvalue,clipRange.z,clipRange.w);\n");
+    }
+    if (state->depth_format == DEPTH_FORMAT_D16) {
+        g_string_append(s, "  float depthResult=floor(zvalue)/65535.0;\n");
+    } else if (state->depth_format == DEPTH_FORMAT_D24) {
+        g_string_append(
+            s,
+            "  float depthResult=asfloat(asuint(floor(zvalue)/16777216.0)+1u);\n");
+    } else {
+        g_string_append(s, "  float depthResult=zvalue/clipRange.y;\n");
+    }
+    g_string_append(s,
+                    "  PSOut output; output.color=result; "
+                    "output.depth=depthResult; return output;\n");
+}
+
+static bool d3d11_ps_append_shadow_stage(GString *s, const PshState *state,
+                                         unsigned int stage, unsigned int mode,
+                                         Error **errp)
+{
+    /* Match the GLSL path: filter the sampled depth, then compare once. This
+     * is not compare-before-filter PCF; do not claim hardware PCF parity here.
+     */
+    bool project2d = mode == PS_TEXTUREMODES_PROJECT2D;
+    bool supported_dimension =
+        project2d ? (state->dim_tex[stage] == 2 || state->dim_tex[stage] == 3) :
+                    (mode == PS_TEXTUREMODES_PROJECT3D &&
+                     state->dim_tex[stage] == 2);
+    if (!supported_dimension || state->tex_cubemap[stage] ||
+        state->shadow_depth_func > SHADOW_DEPTH_FUNC_ALWAYS) {
+        error_setg(errp,
+                   "D3D11: unsupported shadow-map mode/dimension/function "
+                   "at stage %u",
+                   stage);
+        return false;
+    }
+
+    if (state->shadow_depth_func == SHADOW_DEPTH_FUNC_NEVER ||
+        state->shadow_depth_func == SHADOW_DEPTH_FUNC_ALWAYS) {
+        unsigned int value = state->shadow_depth_func == SHADOW_DEPTH_FUNC_ALWAYS;
+        g_string_append_printf(s, "  T%u=float4(%u,%u,%u,%u);\n", stage,
+                               value, value, value, value);
+        return true;
+    }
+
+    const char *comparison;
+    switch (state->shadow_depth_func) {
+    case SHADOW_DEPTH_FUNC_LESS: comparison = "<"; break;
+    case SHADOW_DEPTH_FUNC_EQUAL: comparison = "=="; break;
+    case SHADOW_DEPTH_FUNC_LEQUAL: comparison = "<="; break;
+    case SHADOW_DEPTH_FUNC_GREATER: comparison = ">"; break;
+    case SHADOW_DEPTH_FUNC_NOTEQUAL: comparison = "!="; break;
+    case SHADOW_DEPTH_FUNC_GEQUAL: comparison = ">="; break;
+    default:
+        error_setg(errp, "D3D11: invalid shadow-map comparison at stage %u",
+                   stage);
+        return false;
+    }
+
+    if (project2d) {
+        char sample[24], depth[24], result[24];
+        snprintf(sample, sizeof(sample), "shadowSample%u", stage);
+        snprintf(depth, sizeof(depth), "shadowDepth%u", stage);
+        snprintf(result, sizeof(result), "shadowResult%u", stage);
+        if (state->dim_tex[stage] == 3) {
+            g_string_append_printf(
+                s,
+                "  float4 %s=NV2A_SAMPLE3(tex%u,samp%u,%u,float3(pT%u.xy/pT%u.w*"
+                "texCoordScale[%u].xy,0));\n"
+                "  float %s=%s.r+%s.g+%s.b;\n",
+                sample, stage, stage, stage, stage, stage, stage, depth, sample,
+                sample, sample);
+        } else {
+            g_string_append_printf(
+                s,
+                "  float4 %s=NV2A_SAMPLE2(tex%u,samp%u,%u,pT%u.xy/pT%u.w*"
+                "texCoordScale[%u].xy);\n"
+                "  float %s=%s.r+%s.g+%s.b;\n",
+                sample, stage, stage, stage, stage, stage, stage, depth, sample,
+                sample, sample);
+        }
+        g_string_append_printf(s, "  float %s=%s %s 0.0 ? 1.0 : 0.0;\n",
+                               result, depth, comparison);
+        g_string_append_printf(
+            s, "  T%u=float4(%s,%s,%s,%s);\n", stage, result, result,
+            result, result);
+        return true;
+    }
+
+    char sample[24], max_depth[24], map_depth[24], reference[24], result[24];
+    snprintf(sample, sizeof(sample), "shadowSample%u", stage);
+    snprintf(max_depth, sizeof(max_depth), "shadowMaxDepth%u", stage);
+    snprintf(map_depth, sizeof(map_depth), "shadowMapDepth%u", stage);
+    snprintf(reference, sizeof(reference), "shadowReference%u", stage);
+    snprintf(result, sizeof(result), "shadowResult%u", stage);
+    const char *max_depth_value =
+        state->tex_x8y24[stage] ? "16777215.0" :
+        state->tex_depth_float[stage] ? "511.9375" : "65535.0";
+    /* UNORM filtering is component-wise linear, so decoding after Sample
+     * reconstructs the same weighted normalized depth (up to float rounding). */
+    char depth_decode[160];
+    if (state->tex_x8y24[stage]) {
+        g_snprintf(depth_decode, sizeof(depth_decode),
+                   "((%s.r*16711680.0+%s.g*65280.0+%s.b*255.0)"
+                   "/16777215.0)",
+                   sample, sample, sample);
+    } else {
+        g_snprintf(depth_decode, sizeof(depth_decode),
+                   "((%s.r*65280.0+%s.g*255.0)/65535.0)", sample, sample);
+    }
+    g_string_append_printf(
+        s,
+        "  float4 %s=NV2A_SAMPLE2(tex%u,samp%u,%u,pT%u.xy/pT%u.w*"
+        "texCoordScale[%u].xy);\n"
+        "  float %s=%s;\n"
+        "  float %s=%s*%s;\n"
+        "  float %s=clamp(pT%u.z/pT%u.w,0.0,%s);\n"
+        "  float %s=%s %s %s ? 1.0 : 0.0;\n"
+        "  T%u=float4(%s,%s,%s,%s);\n",
+        sample, stage, stage, stage, stage, stage, stage, max_depth, max_depth_value,
+        map_depth, depth_decode, max_depth, reference, stage, stage, max_depth,
+        result, map_depth, comparison, reference, stage, result, result, result,
+        result);
+    return true;
+}
+
+static bool d3d11_ps_append_texture_postprocess(GString *s,
+                                                const PshState *state,
+                                                unsigned int stage,
+                                                bool samples_texture,
+                                                Error **errp)
+{
+    if (!samples_texture) {
+        return true;
+    }
+    if (state->alphakill[stage]) {
+        g_string_append_printf(s, "  if(T%u.a==0) discard;\n", stage);
+    }
+    switch (state->colorkey_mode[stage]) {
+    case COLOR_KEY_NONE:
+        break;
+    case COLOR_KEY_DISCARD:
+        g_string_append_printf(
+            s, "  if(nv_color_key_match(T%u,colorKey[%u],colorKeyMask[%u])) "
+               "discard;\n",
+            stage, stage, stage);
+        break;
+    case COLOR_KEY_KILL_ALPHA:
+        g_string_append_printf(
+            s, "  if(nv_color_key_match(T%u,colorKey[%u],colorKeyMask[%u])) "
+               "T%u.a=0;\n",
+            stage, stage, stage, stage);
+        break;
+    case COLOR_KEY_KILL_COLOR_AND_ALPHA:
+        g_string_append_printf(
+            s, "  if(nv_color_key_match(T%u,colorKey[%u],colorKeyMask[%u])) "
+               "T%u=float4(0,0,0,0);\n",
+            stage, stage, stage, stage);
+        break;
+    default:
+        error_setg(errp, "D3D11: invalid color-key mode %d at stage %u",
+                   state->colorkey_mode[stage], stage);
+        return false;
+    }
+    return true;
+}
+
+static void d3d11_ps_append_clamp_ogl_helpers(GString *s,
+                                             const PshState *state)
+{
+    static const char axes[] = "xyz";
+    for (unsigned int dimensions = 2; dimensions <= 3; dimensions++) {
+        g_string_append_printf(
+            s, "float%u nv2a_clamp_ogl%u(float%u coord,uint stage){\n",
+            dimensions, dimensions, dimensions);
+        for (unsigned int stage = 0; stage < NV2A_MAX_TEXTURES; stage++) {
+            bool has_clamp = false;
+            for (unsigned int axis = 0; axis < dimensions; axis++) {
+                has_clamp |= state->clamp_ogl[stage][axis];
+            }
+            if (!has_clamp) {
+                continue;
+            }
+            g_string_append_printf(s, "  if(stage==%u){", stage);
+            for (unsigned int axis = 0; axis < dimensions; axis++) {
+                if (state->clamp_ogl[stage][axis]) {
+                    g_string_append_printf(
+                        s, "coord.%c=clamp(coord.%c,0.0,1.0);", axes[axis],
+                        axes[axis]);
+                }
+            }
+            g_string_append(s, "}\n");
+        }
+        g_string_append(s, "  return coord;}\n");
+    }
+    g_string_append(
+        s,
+        "#define NV2A_SAMPLE2(TEX,SAMP,STAGE,COORD) "
+        "TEX.SampleGrad(SAMP,nv2a_clamp_ogl2(COORD,STAGE),"
+        "ddx(COORD),ddy(COORD))\n"
+        "#define NV2A_SAMPLE3(TEX,SAMP,STAGE,COORD) "
+        "TEX.SampleGrad(SAMP,nv2a_clamp_ogl3(COORD,STAGE),"
+        "ddx(COORD),ddy(COORD))\n");
+}
+
+static char *d3d11_translate_pixel_combiners_with_depth(
+    const PshState *state, bool custom_depth, Error **errp)
 {
     unsigned int stages = state->combiner_control & 0xff;
     if (stages > 8) {
@@ -1537,6 +2804,18 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
                          "#define NV2A_COLOR_INTERPOLATION\n" :
                          "#define NV2A_COLOR_INTERPOLATION nointerpolation\n");
     g_string_append(s, d3d11_psh_preamble);
+    d3d11_ps_append_clamp_ogl_helpers(s, state);
+    if (custom_depth) {
+        g_string_append(
+            s,
+            "float nv2a_area(float2 p,float2 a,float2 b){\n"
+            "  precise float2 d0=a-p; precise float2 d1=b-p;\n"
+            "  precise float cd=d0.y*d1.x;\n"
+            "  precise float err=mad(-d0.y,d1.x,cd);\n"
+            "  precise float value=mad(d0.x,d1.y,-cd)+err; return value;\n"
+            "}\n"
+            "struct PSOut{float4 color:SV_Target0;float depth:SV_Depth;};\n");
+    }
     g_string_append(
         s,
         "float3 nv_dotmap(float4 c,uint mode){float3 x=c.rgb*255.0;"
@@ -1548,9 +2827,31 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
         "x.y>=128?x.y-256:x.y,x.z>=128?x.z-256:x.z)/127.0;"
         "if(mode==4){uint4 b=(uint4)(c*255.0);"
         "return float3((b.a*256+b.r)/65535.0,(b.g*256+b.b)/65535.0,1);}"
+        "/* modes 5-7 match the current GLSL fallback, not hardware HILO */"
         "return c.rgb;}\n");
+    g_string_append(
+        s,
+        "float2 nv_remap_cube_to_2d(float3 c){float3 a=abs(c);float2 uv;"
+        "if(a.x>a.y&&a.x>a.z){uv=c.x>0?float2(-c.z,c.y):float2(c.z,c.y);"
+        "uv/=a.x;}else if(a.y>a.x&&a.y>a.z){"
+        "uv=c.y>0?float2(c.x,-c.z):float2(c.x,c.z);uv/=a.y;}"
+        "else{uv=c.z>0?float2(c.x,c.y):float2(-c.x,c.y);uv/=a.z;}"
+        "return uv;}\n");
+    g_string_append(
+        s,
+        "float3 nv_remap_2d_to_cube(float3 c){float2 st=c.xy/c.z;"
+        "return normalize(float3(1,st.y,-st.x));}\n");
     for (unsigned int i = 0; i < NV2A_MAX_TEXTURES; i++) {
-        if (state->tex_cubemap[i]) {
+        unsigned int mode = (state->shader_stage_program >> (i * 5)) & 0x1f;
+        bool cube_sampler = state->tex_cubemap[i] &&
+                            ((mode == PS_TEXTUREMODES_PROJECT2D &&
+                              state->dim_tex[i] == 2) ||
+                             mode == PS_TEXTUREMODES_CUBEMAP ||
+                             mode == PS_TEXTUREMODES_DOT_RFLCT_DIFF ||
+                             mode == PS_TEXTUREMODES_DOT_RFLCT_SPEC ||
+                             mode == PS_TEXTUREMODES_DOT_RFLCT_SPEC_CONST ||
+                             mode == PS_TEXTUREMODES_DOT_STR_CUBE);
+        if (cube_sampler) {
             g_string_append_printf(s, "TextureCube tex%u:register(t%u);\n", i,
                                    i);
         } else if (state->dim_tex[i] == 3) {
@@ -1560,13 +2861,21 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
         }
         g_string_append_printf(s, "SamplerState samp%u:register(s%u);\n", i, i);
     }
-    g_string_append(s, "float4 main(PSIn input):SV_Target {\n");
+    g_string_append(s, custom_depth ? "PSOut main(PSIn input){\n" :
+                                      "float4 main(PSIn input):SV_Target {\n");
+    d3d11_ps_append_window_clip(s, state);
     g_string_append(
         s, "  float4 V0=input.frontFace?input.diffuse:input.backDiffuse;\n"
            "  float4 V1=input.frontFace?input.specular:input.backSpecular;\n"
-           "  float4 "
-           "pT0=input.tex0,pT1=input.tex1,pT2=input.tex2,pT3=input.tex3;\n"
-           "  float4 T0=pT0,T1=pT1,T2=pT2,T3=pT3;\n"
+           "  float4 pT0=input.tex0,pT1=input.tex1,pT2=input.tex2;\n");
+    if (state->point_sprite) {
+        g_string_append(s,
+                        "  float4 pT3=float4(input.pointCoord,1.0,1.0);\n");
+    } else {
+        g_string_append(s, "  float4 pT3=input.tex3;\n");
+    }
+    g_string_append(
+        s, "  float4 T0=pT0,T1=pT1,T2=pT2,T3=pT3;\n"
            "  float4 R0=0,R1=0;\n"
            "  float dots[4]={0,0,0,0};\n"
            "  float4 C0=K[0],C1=K[1];\n"
@@ -1581,21 +2890,48 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
         if (mode == PS_TEXTUREMODES_PASSTHRU) {
             continue;
         }
+        if (state->shadow_map[i]) {
+            if (!d3d11_ps_append_shadow_stage(s, state, i, mode, errp)) {
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            if (!d3d11_ps_append_texture_postprocess(s, state, i, true,
+                                                    errp)) {
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            continue;
+        }
+        bool samples_texture = mode != PS_TEXTUREMODES_CLIPPLANE &&
+                               mode != PS_TEXTUREMODES_DOTPRODUCT &&
+                               mode != PS_TEXTUREMODES_DOT_ZW &&
+                               mode != PS_TEXTUREMODES_BRDF;
         unsigned int input =
             i < 2 ? 0 : (state->other_stage_input >> (i == 2 ? 16 : 20)) & 0xf;
         unsigned int mapping =
             i ? (state->other_stage_input >> ((i - 1) * 4)) & 0xf : 0;
         bool uses_dot = mode == PS_TEXTUREMODES_DOTPRODUCT ||
                         mode == PS_TEXTUREMODES_DOT_ST ||
-                        mode == PS_TEXTUREMODES_DOT_ZW;
+                        mode == PS_TEXTUREMODES_DOT_ZW ||
+                        mode == PS_TEXTUREMODES_DOT_STR_3D ||
+                        mode == PS_TEXTUREMODES_DOT_STR_CUBE ||
+                        mode == PS_TEXTUREMODES_DOT_RFLCT_DIFF ||
+                        mode == PS_TEXTUREMODES_DOT_RFLCT_SPEC ||
+                        mode == PS_TEXTUREMODES_DOT_RFLCT_SPEC_CONST;
         if (mode >= PS_TEXTUREMODES_BUMPENVMAP &&
-            (!i || input >= i || (uses_dot && mapping > 4))) {
+            (!i || input >= i || (uses_dot && mapping > 7))) {
             error_setg(errp, "D3D11: invalid/unsupported dependent texture "
                              "input or dot mapping");
             g_string_free(s, TRUE);
             return NULL;
         }
-        if (mode == PS_TEXTUREMODES_CLIPPLANE) {
+        if (mode == PS_TEXTUREMODES_PROJECT2D &&
+            state->conv_tex[i] != CONVOLUTION_FILTER_DISABLED) {
+            if (!d3d11_ps_append_convolution_filter(s, state, i, errp)) {
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+        } else if (mode == PS_TEXTUREMODES_CLIPPLANE) {
             for (unsigned int c = 0; c < 4; c++) {
                 g_string_append_printf(
                     s, "  if(pT%u.%c%s0)discard;\n", i, "xyzw"[c],
@@ -1612,9 +2948,9 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
                 return NULL;
             }
             g_string_append_printf(
-                s, "  T%u=tex%u.Sample(samp%u,T%u.%s*texCoordScale[%u].xy);\n",
-                i, i, i, input, mode == PS_TEXTUREMODES_DPNDNT_AR ? "ar" : "gb",
-                i);
+                s, "  T%u=NV2A_SAMPLE2(tex%u,samp%u,%u,T%u.%s*texCoordScale[%u].xy);\n",
+                i, i, i, i, input,
+                mode == PS_TEXTUREMODES_DPNDNT_AR ? "ar" : "gb", i);
         } else if (mode == PS_TEXTUREMODES_BUMPENVMAP ||
                    mode == PS_TEXTUREMODES_BUMPENVMAP_LUM) {
             g_string_append_printf(s, "  float2 bump%u=", i);
@@ -1631,15 +2967,15 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
             if (state->dim_tex[i] == 3 && !state->tex_cubemap[i]) {
                 g_string_append_printf(s,
                                        "  "
-                                       "T%u=tex%u.Sample(samp%u,float3(pT%u.xy+"
+                                       "T%u=NV2A_SAMPLE3(tex%u,samp%u,%u,float3(pT%u.xy+"
                                        "delta%u,pT%u.z));\n",
-                                       i, i, i, i, i, i);
+                                       i, i, i, i, i, i, i);
             } else if (state->dim_tex[i] == 2 && !state->tex_cubemap[i]) {
                 g_string_append_printf(s,
                                        "  "
-                                       "T%u=tex%u.Sample(samp%u,(pT%u.xy+delta%"
+                                       "T%u=NV2A_SAMPLE2(tex%u,samp%u,%u,(pT%u.xy+delta%"
                                        "u)*texCoordScale[%u].xy);\n",
-                                       i, i, i, i, i, i);
+                                       i, i, i, i, i, i, i);
             } else {
                 error_setg(
                     errp,
@@ -1667,44 +3003,253 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
                 state->dim_tex[i] == 2) {
                 g_string_append_printf(s,
                                        "  "
-                                       "T%u=tex%u.Sample(samp%u,float2(dots[%u]"
+                                       "T%u=NV2A_SAMPLE2(tex%u,samp%u,%u,float2(dots[%u]"
                                        ",dots[%u])*texCoordScale[%u].xy);\n",
-                                       i, i, i, i - 1, i, i);
+                                       i, i, i, i, i - 1, i, i);
             } else {
                 g_string_append_printf(s, "  T%u=0;\n", i);
+            }
+        } else if (mode == PS_TEXTUREMODES_DOT_RFLCT_DIFF) {
+            unsigned int next_input =
+                (state->other_stage_input >> 20) & 0xf;
+            unsigned int next_mapping =
+                (state->other_stage_input >> 8) & 0xf;
+            unsigned int previous_mode =
+                (state->shader_stage_program >> 5) & 0x1f;
+            if (i != 2 || state->dim_tex[i] != 2 || next_input >= 3 ||
+                previous_mode != PS_TEXTUREMODES_DOTPRODUCT ||
+                next_mapping > 7) {
+                error_setg(errp,
+                           "D3D11: DOT_RFLCT_DIFF requires stage 2, a 2D/cube "
+                           "texture, and valid dot inputs");
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            g_string_append_printf(
+                s,
+                "  dots[2]=dot(pT2.xyz,nv_dotmap(T%u,%u));\n"
+                "  float dot_diffuse_z=dot(pT3.xyz,nv_dotmap(T%u,%u));\n"
+                "  float3 diffuse_vec_2=float3(dots[1],dots[2],dot_diffuse_z);\n",
+                input, mapping, next_input, next_mapping);
+            d3d11_ps_append_border_adjustment(s, state, i, "diffuse_vec_2");
+            if (state->tex_cubemap[i]) {
+                g_string_append(s,
+                                "  T2=NV2A_SAMPLE3(tex2,samp2,2,diffuse_vec_2);\n");
+            } else {
+                g_string_append(s,
+                                "  T2=NV2A_SAMPLE2(tex2,samp2,2,"
+                                "nv_remap_cube_to_2d(diffuse_vec_2));\n");
+            }
+        } else if (mode == PS_TEXTUREMODES_BRDF) {
+            g_string_append_printf(
+                s, "  T%u=float4(0,0,0,0); /* xemu GLSL fallback stub */\n", i);
+        } else if (mode == PS_TEXTUREMODES_DOT_RFLCT_SPEC_CONST) {
+            unsigned int previous_mode_1 =
+                (state->shader_stage_program >> 5) & 0x1f;
+            unsigned int previous_mode_2 =
+                (state->shader_stage_program >> 10) & 0x1f;
+            if (i != 3 || state->dim_tex[i] != 2 ||
+                previous_mode_1 != PS_TEXTUREMODES_DOTPRODUCT ||
+                previous_mode_2 != PS_TEXTUREMODES_DOTPRODUCT) {
+                error_setg(errp,
+                           "D3D11: DOT_RFLCT_SPEC_CONST requires stage 3, "
+                           "DOTPRODUCT stages 1/2, and a 2D/cube texture");
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            g_string_append_printf(
+                s,
+                "  dots[3]=dot(pT3.xyz,nv_dotmap(T%u,%u));\n"
+                "  float3 reflect_n_3=float3(dots[1],dots[2],dots[3]);\n",
+                input, mapping);
+            g_string_append(s, "  float3 reflect_e_3=eyeVector;\n");
+            g_string_append(
+                s, "  float3 reflect_vec_3=2*reflect_n_3*"
+                   "dot(reflect_n_3,reflect_e_3)/dot(reflect_n_3,reflect_n_3)-"
+                   "reflect_e_3;\n");
+            d3d11_ps_append_border_adjustment(s, state, i, "reflect_vec_3");
+            if (state->tex_cubemap[i]) {
+                g_string_append(s,
+                                "  T3=NV2A_SAMPLE3(tex3,samp3,3,reflect_vec_3);\n");
+            } else {
+                g_string_append(s,
+                                "  T3=NV2A_SAMPLE2(tex3,samp3,3,"
+                                "nv_remap_cube_to_2d(reflect_vec_3));\n");
+            }
+        } else if (mode == PS_TEXTUREMODES_DOT_RFLCT_SPEC) {
+            unsigned int previous_mode_1 =
+                (state->shader_stage_program >> 5) & 0x1f;
+            unsigned int previous_mode_2 =
+                (state->shader_stage_program >> 10) & 0x1f;
+            if (i != 3 || state->dim_tex[i] != 2 ||
+                previous_mode_1 != PS_TEXTUREMODES_DOTPRODUCT ||
+                previous_mode_2 != PS_TEXTUREMODES_DOTPRODUCT) {
+                error_setg(errp,
+                           "D3D11: DOT_RFLCT_SPEC requires stage 3, "
+                           "DOTPRODUCT stages 1/2, and a 2D/cube texture");
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            g_string_append_printf(
+                s,
+                "  dots[3]=dot(pT3.xyz,nv_dotmap(T%u,%u));\n"
+                "  float3 reflect_n_3=float3(dots[1],dots[2],dots[3]);\n",
+                input, mapping);
+            g_string_append(
+                s, "  float3 reflect_e_3=float3(pT1.w,pT2.w,pT3.w);\n");
+            g_string_append(
+                s, "  float3 reflect_vec_3=2*reflect_n_3*"
+                   "dot(reflect_n_3,reflect_e_3)/dot(reflect_n_3,reflect_n_3)-"
+                   "reflect_e_3;\n");
+            d3d11_ps_append_border_adjustment(s, state, i, "reflect_vec_3");
+            if (state->tex_cubemap[i]) {
+                g_string_append(s,
+                                "  T3=NV2A_SAMPLE3(tex3,samp3,3,reflect_vec_3);\n");
+            } else {
+                g_string_append(s,
+                                "  T3=NV2A_SAMPLE2(tex3,samp3,3,"
+                                "nv_remap_cube_to_2d(reflect_vec_3));\n");
+            }
+        } else if (mode == PS_TEXTUREMODES_DOT_STR_3D ||
+                   mode == PS_TEXTUREMODES_DOT_STR_CUBE) {
+            unsigned int previous_mode_1 =
+                (state->shader_stage_program >> 5) & 0x1f;
+            unsigned int previous_mode_2 =
+                (state->shader_stage_program >> 10) & 0x1f;
+            if (i != 3 ||
+                (mode == PS_TEXTUREMODES_DOT_STR_3D &&
+                 state->tex_cubemap[i]) ||
+                (mode == PS_TEXTUREMODES_DOT_STR_3D &&
+                 state->dim_tex[i] != 2 && state->dim_tex[i] != 3) ||
+                (mode == PS_TEXTUREMODES_DOT_STR_CUBE &&
+                 state->dim_tex[i] != 2) ||
+                previous_mode_1 != PS_TEXTUREMODES_DOTPRODUCT ||
+                previous_mode_2 != PS_TEXTUREMODES_DOTPRODUCT) {
+                error_setg(errp,
+                           "D3D11: DOT_STR texture mode requires stage 3 and "
+                           "a compatible 2D/3D or cube texture");
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            g_string_append_printf(
+                s, "  dots[%u]=dot(pT%u.xyz,nv_dotmap(T%u,%u));\n", i, i,
+                input, mapping);
+            g_string_append_printf(
+                s, "  float3 dotSTR_%u=float3(dots[%u],dots[%u],dots[%u]);\n",
+                i, i - 2, i - 1, i);
+            d3d11_ps_append_border_adjustment(s, state, i, "dotSTR_3");
+            if (mode == PS_TEXTUREMODES_DOT_STR_CUBE) {
+                if (state->tex_cubemap[i]) {
+                    g_string_append_printf(
+                        s, "  T%u=NV2A_SAMPLE3(tex%u,samp%u,%u,dotSTR_%u);\n",
+                        i, i, i, i, i);
+                } else {
+                    g_string_append_printf(
+                        s,
+                        "  T%u=NV2A_SAMPLE2(tex%u,samp%u,%u,"
+                        "nv_remap_cube_to_2d(dotSTR_%u));\n",
+                        i, i, i, i, i);
+                }
+            } else if (state->dim_tex[i] == 3) {
+                g_string_append_printf(
+                    s, "  T%u=NV2A_SAMPLE3(tex%u,samp%u,%u,dotSTR_%u);\n",
+                    i, i, i, i, i);
+            } else {
+                g_string_append_printf(
+                    s,
+                    "  T%u=NV2A_SAMPLE2(tex%u,samp%u,%u,dotSTR_%u.xy*"
+                    "texCoordScale[%u].xy);\n",
+                    i, i, i, i, i, i);
             }
         } else if (mode != PS_TEXTUREMODES_PROJECT2D &&
                    mode != PS_TEXTUREMODES_PROJECT3D &&
                    mode != PS_TEXTUREMODES_CUBEMAP) {
-            error_setg(errp, "D3D11: texture mode 0x%x is not implemented",
-                       mode);
+            error_setg(errp, "D3D11: texture mode 0x%x at stage %u (program 0x%x) is not implemented",
+                       mode, i, state->shader_stage_program);
             g_string_free(s, TRUE);
             return NULL;
-        } else if (state->tex_cubemap[i]) {
-            g_string_append_printf(s, "  T%u=tex%u.Sample(samp%u,pT%u.xyz);\n",
-                                   i, i, i, i);
+        } else if (mode == PS_TEXTUREMODES_CUBEMAP &&
+                   !state->tex_cubemap[i]) {
+            if (state->dim_tex[i] != 2) {
+                error_setg(errp, "D3D11: CUBEMAP requires a 2D texture");
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            g_string_append_printf(
+                s,
+                "  T%u=NV2A_SAMPLE2(tex%u,samp%u,%u,nv_remap_cube_to_2d(pT%u.xyz));\n",
+                i, i, i, i, i);
+        } else if (mode == PS_TEXTUREMODES_PROJECT2D &&
+                   state->tex_cubemap[i]) {
+            if (state->dim_tex[i] != 2) {
+                error_setg(errp,
+                           "D3D11: projected cubemap requires a 2D texture");
+                g_string_free(s, TRUE);
+                return NULL;
+            }
+            char border_coord[32];
+            g_snprintf(border_coord, sizeof(border_coord), "pT%u.xyz", i);
+            d3d11_ps_append_border_adjustment(s, state, i, border_coord);
+            g_string_append_printf(
+                s,
+                "  T%u=NV2A_SAMPLE3(tex%u,samp%u,%u,nv_remap_2d_to_cube("
+                "float3(pT%u.xy,pT%u.w)));\n",
+                i, i, i, i, i, i);
+        } else if (mode == PS_TEXTUREMODES_CUBEMAP &&
+                   state->tex_cubemap[i]) {
+            g_string_append_printf(
+                s, "  T%u=NV2A_SAMPLE3(tex%u,samp%u,%u,pT%u.xyz);\n", i, i,
+                i, i, i);
+        } else if (mode == PS_TEXTUREMODES_PROJECT2D &&
+                   state->dim_tex[i] == 3) {
+            char border_coord[32];
+            g_snprintf(border_coord, sizeof(border_coord), "pT%u.xyz", i);
+            d3d11_ps_append_border_adjustment(s, state, i, border_coord);
+            g_string_append_printf(
+                s,
+                "  T%u=NV2A_SAMPLE3(tex%u,samp%u,%u,float3(pT%u.xy/pT%u.w*"
+                "texCoordScale[%u].xy,0));\n",
+                i, i, i, i, i, i, i);
         } else if (state->dim_tex[i] == 3) {
+            if (mode == PS_TEXTUREMODES_PROJECT3D) {
+                char border_coord[32];
+                g_snprintf(border_coord, sizeof(border_coord), "pT%u.xyz", i);
+                d3d11_ps_append_border_adjustment(s, state, i, border_coord);
+            }
             g_string_append_printf(s,
                                    "  "
-                                   "T%u=tex%u.Sample(samp%u,pT%u.xyz/"
+                                   "T%u=NV2A_SAMPLE3(tex%u,samp%u,%u,pT%u.xyz/"
                                    "pT%u.w*texCoordScale[%u].xyz);\n",
-                                   i, i, i, i, i, i);
+                                   i, i, i, i, i, i, i);
+        } else if (state->dim_tex[i] == 1 &&
+                   (mode == PS_TEXTUREMODES_PROJECT2D ||
+                    mode == PS_TEXTUREMODES_PROJECT3D)) {
+            char border_coord[24];
+            g_snprintf(border_coord, sizeof(border_coord), "pT%u", i);
+            d3d11_ps_append_border_adjustment(s, state, i, border_coord);
+            g_string_append_printf(
+                s, "  T%u=NV2A_SAMPLE2(tex%u,samp%u,%u,float2(pT%u.x/pT%u.w*"
+                   "texCoordScale[%u].x,0.5));\n",
+                i, i, i, i, i, i, i);
         } else if (mode == PS_TEXTUREMODES_PROJECT2D ||
                    mode == PS_TEXTUREMODES_PROJECT3D) {
+            char border_coord[32];
+            g_snprintf(border_coord, sizeof(border_coord), "pT%u.xyz", i);
+            d3d11_ps_append_border_adjustment(s, state, i, border_coord);
             g_string_append_printf(s,
                                    "  "
-                                   "T%u=tex%u.Sample(samp%u,pT%u.xy/"
+                                   "T%u=NV2A_SAMPLE2(tex%u,samp%u,%u,pT%u.xy/"
                                    "pT%u.w*texCoordScale[%u].xy);\n",
-                                   i, i, i, i, i, i);
+                                   i, i, i, i, i, i, i);
         } else {
-            g_string_append_printf(s, "  T%u=tex%u.Sample(samp%u,pT%u.xy);\n",
-                                   i, i, i, i);
+            g_string_append_printf(
+                s, "  T%u=NV2A_SAMPLE2(tex%u,samp%u,%u,pT%u.xy);\n", i, i,
+                i, i, i);
         }
-        if (state->alphakill[i]) {
-            g_string_append_printf(s, "  if(T%u.a==0) discard;\n", i);
-        }
-        if (state->snorm_tex[i]) {
-            g_string_append_printf(s, "  T%u=T%u*2.0-1.0;\n", i, i);
+        if (!d3d11_ps_append_texture_postprocess(s, state, i,
+                                                samples_texture, errp)) {
+            g_string_free(s, TRUE);
+            return NULL;
         }
     }
     g_string_append(s, "  R0.a=T0.a;\n");
@@ -1721,41 +3266,192 @@ static char *d3d11_translate_pixel_combiners(const PshState *state,
         uint32_t e = d3d11_ps_input_byte(state->final_inputs_1, 0);
         uint32_t f = d3d11_ps_input_byte(state->final_inputs_1, 1);
         uint32_t g = d3d11_ps_input_byte(state->final_inputs_1, 2);
-        g_string_append(s, "  C0=K[16]; C1=K[17];\n  EF_PROD.rgb=");
-        d3d11_ps_append_final_input(s, e, false);
-        g_string_append(s, ".rgb*");
-        d3d11_ps_append_final_input(s, f, false);
-        g_string_append(s, ".rgb; EF_PROD.a=1;\n  float3 v1sum=V1.rgb; float3 "
-                           "r0sum=R0.rgb;\n");
+        g_string_append(s,
+                        "  C0=K[16]; C1=K[17];\n"
+                        "  float3 v1sum=V1.rgb; float3 r0sum=R0.rgb;\n");
         if (settings & PS_FINALCOMBINERSETTING_COMPLEMENT_V1) {
             g_string_append(s, "  v1sum=1-v1sum;\n");
         }
         if (settings & PS_FINALCOMBINERSETTING_COMPLEMENT_R0) {
             g_string_append(s, "  r0sum=1-r0sum;\n");
         }
-        g_string_append(s, "  V1R0_SUM=float4(v1sum+r0sum,1);\n");
+        g_string_append(s, "  V1R0_SUM=float4(v1sum+r0sum,0);\n");
         if (settings & PS_FINALCOMBINERSETTING_CLAMP_SUM) {
             g_string_append(s, "  V1R0_SUM.rgb=saturate(V1R0_SUM.rgb);\n");
         }
+        g_string_append(s, "  float3 efE=");
+        d3d11_ps_append_final_input(s, e, false, false);
+        g_string_append(s, "; float3 efF=");
+        d3d11_ps_append_final_input(s, f, false, false);
+        g_string_append(s, "; EF_PROD=float4(efE*efF,0);\n");
         const char names[] = { 'A', 'B', 'C', 'D' };
         for (unsigned int i = 0; i < 4; i++) {
             g_string_append_printf(s, "  float3 fc%c=", names[i]);
             d3d11_ps_append_final_input(
-                s, d3d11_ps_input_byte(state->final_inputs_0, i), true);
-            g_string_append(s, ".rgb;\n");
+                s, d3d11_ps_input_byte(state->final_inputs_0, i), false, true);
+            g_string_append(s, ";\n");
         }
         g_string_append(s, "  float fcG=");
-        d3d11_ps_append_final_input(s, g, false);
+        d3d11_ps_append_final_input(s, g, true, true);
         g_string_append(
-            s, ".a;\n  float4 result; "
+            s, ";\n  float4 result; "
                "result.rgb=saturate(lerp(fcC,fcB,fcA)+fcD); result.a=fcG;\n");
     }
     if (!d3d11_ps_append_alpha_test(s, state, errp)) {
         g_string_free(s, TRUE);
         return NULL;
     }
-    g_string_append(s, "  return result;\n}\n");
+    if (custom_depth) {
+        d3d11_ps_append_custom_depth(s, state);
+    } else {
+        g_string_append(s, "  return result;\n");
+    }
+    g_string_append(s, "}\n");
     return g_string_free(s, FALSE);
+}
+
+static char *d3d11_translate_pixel_combiners(const PshState *state,
+                                             Error **errp)
+{
+    return d3d11_translate_pixel_combiners_with_depth(state, false, errp);
+}
+
+static bool d3d11_primitive_supports_custom_depth(
+    enum ShaderPrimitiveMode primitive)
+{
+    switch (primitive) {
+    case PRIM_TYPE_TRIANGLES:
+    case PRIM_TYPE_TRIANGLE_STRIP:
+    case PRIM_TYPE_TRIANGLE_FAN:
+    case PRIM_TYPE_POLYGON:
+        return true;
+    case PRIM_TYPE_POINTS:
+        /* The vertex shader already repeats its position for point depth. */
+        return true;
+    case PRIM_TYPE_LINES:
+    case PRIM_TYPE_LINE_LOOP:
+    case PRIM_TYPE_LINE_STRIP:
+        return true;
+    case PRIM_TYPE_QUADS:
+    case PRIM_TYPE_QUAD_STRIP:
+        /* The adjacency GS preserves the GL split, flat provoking vertex and
+         * custom depth. QUADS/QUAD_STRIP LINE and POINT emit their perimeter
+         * edges or vertices; triangle POINT emits source vertices, triangle
+         * list/strip/fan LINE emits source edges, and polygon LINE keeps its
+         * wireframe fallback. */
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool d3d11_triangle_line_primitive(enum ShaderPrimitiveMode primitive)
+{
+    return primitive == PRIM_TYPE_TRIANGLES ||
+           primitive == PRIM_TYPE_TRIANGLE_STRIP ||
+           primitive == PRIM_TYPE_TRIANGLE_FAN;
+}
+
+bool pgraph_d3d11_needs_wide_lines(unsigned int primitive,
+                                  unsigned int polygon_mode,
+                                  unsigned int surface_scale_factor)
+{
+    if (surface_scale_factor <= 1) {
+        return false;
+    }
+    switch (primitive) {
+    case PRIM_TYPE_LINES:
+    case PRIM_TYPE_LINE_LOOP:
+    case PRIM_TYPE_LINE_STRIP:
+        return true;
+    case PRIM_TYPE_TRIANGLES:
+    case PRIM_TYPE_TRIANGLE_STRIP:
+    case PRIM_TYPE_TRIANGLE_FAN:
+    case PRIM_TYPE_QUADS:
+    case PRIM_TYPE_QUAD_STRIP:
+    case PRIM_TYPE_POLYGON:
+        return polygon_mode == POLY_MODE_LINE;
+    default:
+        return false;
+    }
+}
+
+static unsigned int d3d11_depth_geometry_variant_for(
+    enum ShaderPrimitiveMode primitive, bool smooth_shading,
+    bool first_vertex, enum ShaderPolygonMode polygon_mode)
+{
+    if (primitive == PRIM_TYPE_POINTS) {
+        return PGRAPHD3D11_POINT_GS_VARIANT;
+    }
+    if (primitive == PRIM_TYPE_POLYGON && polygon_mode == POLY_MODE_LINE) {
+        return 40 + (smooth_shading ? 1 : 0);
+    }
+    if (primitive == PRIM_TYPE_QUADS) {
+        unsigned int base = polygon_mode == POLY_MODE_LINE ? 16 :
+                            polygon_mode == POLY_MODE_POINT ? 20 : 8;
+        return base + (smooth_shading ? 1 : 0);
+    }
+    if (primitive == PRIM_TYPE_QUAD_STRIP) {
+        unsigned int base = polygon_mode == POLY_MODE_LINE ? 18 :
+                            polygon_mode == POLY_MODE_POINT ? 22 : 10;
+        return base + (smooth_shading ? 1 : 0);
+    }
+    if (primitive == PRIM_TYPE_LINES ||
+        primitive == PRIM_TYPE_LINE_LOOP ||
+        primitive == PRIM_TYPE_LINE_STRIP) {
+        return 12 + (smooth_shading ? 2 : 0) + (first_vertex ? 0 : 1);
+    }
+    unsigned int provoking_mode = 2;
+    if (first_vertex) {
+        provoking_mode = 0;
+    } else if (primitive == PRIM_TYPE_TRIANGLE_FAN) {
+        provoking_mode = 1;
+    } else if (primitive == PRIM_TYPE_TRIANGLE_STRIP) {
+        provoking_mode = 3;
+    }
+    unsigned int base = polygon_mode == POLY_MODE_POINT ? 24 :
+                        polygon_mode == POLY_MODE_LINE &&
+                                d3d11_triangle_line_primitive(primitive) ? 32 :
+                                                                          0;
+    return base + (smooth_shading ? 4 : 0) + provoking_mode;
+}
+
+static bool d3d11_custom_depth_needs_geometry_shader(
+    enum ShaderPrimitiveMode primitive)
+{
+    return primitive != PRIM_TYPE_POINTS;
+}
+
+static bool d3d11_triangle_primitive(enum ShaderPrimitiveMode primitive)
+{
+    switch (primitive) {
+    case PRIM_TYPE_TRIANGLES:
+    case PRIM_TYPE_TRIANGLE_STRIP:
+    case PRIM_TYPE_TRIANGLE_FAN:
+    case PRIM_TYPE_POLYGON:
+        return true;
+    default:
+        return false;
+    }
+}
+static bool d3d11_polygon_modes_match(unsigned int front_mode,
+                                      unsigned int back_mode)
+{
+    return front_mode == back_mode;
+}
+
+static bool d3d11_polygon_mode_supported(unsigned int primitive,
+                                         unsigned int polygon_mode)
+{
+    return primitive != PRIM_TYPE_POLYGON || polygon_mode != POLY_MODE_POINT;
+}
+
+static enum ShaderPolygonMode d3d11_polygon_mode(PGRAPHState *pg)
+{
+    uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+    enum ShaderPolygonMode front = GET_MASK(
+        raster, NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+    return front;
 }
 
 static PGRAPHD3D11PixelShader *d3d11_compile_pixel_shader(PGRAPHD3D11State *r,
@@ -1763,10 +3459,16 @@ static PGRAPHD3D11PixelShader *d3d11_compile_pixel_shader(PGRAPHD3D11State *r,
                                                           Error **errp)
 {
     ID3DBlob *bytecode = NULL, *errors = NULL;
-    HRESULT hr = D3DCompile(
-        source, strlen(source), "nv2a_pixel.hlsl", NULL, NULL, "main", "ps_5_0",
+    const char *profile = d3d11_shader_profile(r, false);
+    if (!profile) {
+        error_setg(errp, "D3D11: unsupported shader feature level 0x%x",
+                   r->feature_level);
+        return NULL;
+    }
+    HRESULT hr = D3DCompile2(
+        source, strlen(source), "nv2a_pixel.hlsl", NULL, NULL, "main", profile,
         D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-        &bytecode, &errors);
+        0, NULL, 0, &bytecode, &errors);
     if (FAILED(hr)) {
         const char *message = errors ? ID3D10Blob_GetBufferPointer(errors) :
                                        "no compiler diagnostics";
@@ -1793,6 +3495,109 @@ static PGRAPHD3D11PixelShader *d3d11_compile_pixel_shader(PGRAPHD3D11State *r,
         d3d11_pixel_shader_destroy(shader);
         return NULL;
     }
+    return shader;
+}
+
+static const char *d3d11_geometry_shader_profile(const PGRAPHD3D11State *r)
+{
+    if (r->feature_level >= D3D_FEATURE_LEVEL_11_0) {
+        return "gs_5_0";
+    }
+    if (r->feature_level >= D3D_FEATURE_LEVEL_10_1) {
+        return "gs_4_1";
+    }
+    if (r->feature_level >= D3D_FEATURE_LEVEL_10_0) {
+        return "gs_4_0";
+    }
+    return NULL;
+}
+
+static unsigned int d3d11_depth_geometry_variant(PGRAPHState *pg,
+                                                 const PshState *state)
+{
+    uint32_t control3 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3);
+    bool first_vertex =
+        GET_MASK(control3, NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX) ==
+        NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX_FIRST;
+    enum ShaderPolygonMode polygon_mode = d3d11_polygon_mode(pg);
+    return d3d11_depth_geometry_variant_for(
+        pg->primitive_mode, state->smooth_shading, first_vertex, polygon_mode);
+}
+
+static ID3D11GeometryShader *d3d11_get_depth_geometry_shader(
+    PGRAPHState *pg, const PshState *state, Error **errp)
+{
+    PGRAPHD3D11State *r = pg->d3d11_renderer_state;
+    unsigned int base_variant = d3d11_depth_geometry_variant(pg, state);
+    bool wide_lines = pgraph_d3d11_needs_wide_lines(
+        pg->primitive_mode, d3d11_polygon_mode(pg), pg->surface_scale_factor);
+    unsigned int variant = base_variant +
+                           (wide_lines ?
+                                PGRAPHD3D11_DEPTH_GS_VARIANTS_PER_WIDTH : 0);
+    ID3D11GeometryShader *shader =
+        r->shaders->depth_geometry_shaders[variant];
+    if (shader) {
+        return shader;
+    }
+    if (r->shaders->depth_geometry_shader_failed[variant]) {
+        error_setg(errp, "D3D11: cached depth geometry shader failure");
+        return NULL;
+    }
+    const char *profile = d3d11_geometry_shader_profile(r);
+    if (!profile) {
+        error_setg(errp, "D3D11: geometry shaders require feature level 10.0+");
+        return NULL;
+    }
+    enum ShaderPolygonMode polygon_mode = d3d11_polygon_mode(pg);
+    unsigned int provoking_mode = base_variant >= 40 ? 0 :
+                                  base_variant < 8 ? base_variant % 4 :
+                                  base_variant < 12 ? 2 :
+                                  base_variant < 24 ?
+                                      (base_variant - 12) % 2 :
+                                  base_variant < 32 ?
+                                      (base_variant - 24) % 4 :
+                                      (base_variant - 32) % 4;
+    char *source = d3d11_depth_geometry_shader_source(
+        state->smooth_shading, provoking_mode, pg->primitive_mode,
+        polygon_mode, wide_lines);
+    ID3DBlob *bytecode = NULL, *errors = NULL;
+    HRESULT hr = D3DCompile2(
+        source, strlen(source), "nv2a_depth_geometry.hlsl", NULL, NULL, "main",
+        profile, D3DCOMPILE_ENABLE_STRICTNESS |
+                     D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        0, 0, NULL, 0, &bytecode, &errors);
+    g_free(source);
+    if (FAILED(hr)) {
+        const char *message = errors ? ID3D10Blob_GetBufferPointer(errors) :
+                                       "no compiler diagnostics";
+        error_setg(errp,
+                   "D3D11: NV2A depth geometry shader compilation failed "
+                   "(HRESULT 0x%08lx): %s",
+                   (unsigned long)hr, message);
+        if (errors) {
+            ID3D10Blob_Release(errors);
+        }
+        if (bytecode) {
+            ID3D10Blob_Release(bytecode);
+        }
+        r->shaders->depth_geometry_shader_failed[variant] = true;
+        return NULL;
+    }
+    if (errors) {
+        ID3D10Blob_Release(errors);
+    }
+    hr = ID3D11Device_CreateGeometryShader(
+        r->device, ID3D10Blob_GetBufferPointer(bytecode),
+        ID3D10Blob_GetBufferSize(bytecode), NULL, &shader);
+    ID3D10Blob_Release(bytecode);
+    if (FAILED(hr)) {
+        error_setg(errp,
+                   "D3D11: CreateGeometryShader failed (HRESULT 0x%08lx)",
+                   (unsigned long)hr);
+        r->shaders->depth_geometry_shader_failed[variant] = true;
+        return NULL;
+    }
+    r->shaders->depth_geometry_shaders[variant] = shader;
     return shader;
 }
 
@@ -1846,7 +3651,7 @@ typedef struct PGRAPHD3D11PixelConstants {
     float constants[18][4];
     float fog_color[4];
     int32_t alpha_ref;
-    float padding[3];
+    float eye_vector[3];
     float bump_mat[4][4];
     float bump_params[4][4];
     float clip_range[4];
@@ -1877,6 +3682,18 @@ static void d3d11_texture_coordinate_scale(PGRAPHState *pg, unsigned int stage,
     if (kelvin_color_format_info_map[shape.color_format].linear) {
         scale[0] = 1.0f / MAX(1, shape.width);
         scale[1] = 1.0f / MAX(1, shape.height);
+    }
+}
+
+static void d3d11_ps_set_snorm_textures(PGRAPHState *pg, PshState *state)
+{
+    for (unsigned int i = 0; i < ARRAY_SIZE(state->snorm_tex); i++) {
+        if (!pgraph_is_texture_enabled(pg, i)) {
+            continue;
+        }
+        TextureShape shape = pgraph_get_texture_shape(pg, i);
+        state->snorm_tex[i] |=
+            shape.color_format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5;
     }
 }
 
@@ -1926,6 +3743,12 @@ static bool d3d11_update_pixel_constants(PGRAPHState *pg, Error **errp)
            sizeof(constants.surface_scale));
     constants.depth_offset = values.depthOffset[0];
     constants.depth_factor = values.depthFactor[0];
+    /* SET_EYE_VECTOR stores three float bit patterns in consecutive PGRAPH registers. */
+    for (unsigned int i = 0; i < 3; i++) {
+        uint32_t eye_vector_bits = pgraph_reg_r(pg, NV_PGRAPH_EYEVEC0 + i * 4);
+        memcpy(&constants.eye_vector[i], &eye_vector_bits,
+               sizeof(eye_vector_bits));
+    }
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr = ID3D11DeviceContext_Map(
         r->context, (ID3D11Resource *)r->shaders->pixel_constants, 0,
@@ -1948,9 +3771,51 @@ static bool d3d11_update_pixel_constants(PGRAPHState *pg, Error **errp)
 bool pgraph_d3d11_bind_pixel_shader(PGRAPHState *pg, Error **errp)
 {
     PGRAPHD3D11State *r = pg->d3d11_renderer_state;
+    if (!pgraph_d3d11_validate_texture_registers(pg, errp)) {
+        return false;
+    }
+    uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+    unsigned int front_mode = GET_MASK(
+        raster, NV_PGRAPH_SETUPRASTER_FRONTFACEMODE);
+    unsigned int back_mode = GET_MASK(
+        raster, NV_PGRAPH_SETUPRASTER_BACKFACEMODE);
+    if (!d3d11_polygon_modes_match(front_mode, back_mode)) {
+        error_setg(errp,
+                   "D3D11: independent front/back polygon modes are "
+                   "unsupported (front %u, back %u)",
+                   front_mode, back_mode);
+        return false;
+    }
+    if (!d3d11_polygon_mode_supported(pg->primitive_mode, front_mode)) {
+        error_setg(errp,
+                   "D3D11: PRIM_TYPE_POLYGON with POLY_MODE_POINT is "
+                   "unsupported, matching the OpenGL backend");
+        return false;
+    }
     PshState state = { 0 };
     pgraph_glsl_set_psh_state(pg, &state);
-    GBytes *key = g_bytes_new(&state, sizeof(state));
+    d3d11_ps_set_snorm_textures(pg, &state);
+    state.point_sprite = state.point_sprite &&
+                         pg->primitive_mode == PRIM_TYPE_POINTS;
+    if (state.point_sprite && state.rect_tex[3]) {
+        error_setg(errp,
+                   "D3D11: point sprites with a rectangle T3 texture are "
+                   "unsupported, matching the OpenGL backend");
+        return false;
+    }
+    bool custom_depth_format =
+        state.surface_zeta_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ||
+        state.surface_zeta_format == NV097_SET_SURFACE_FORMAT_ZETA_Z24S8;
+    bool custom_depth =
+        custom_depth_format &&
+        d3d11_primitive_supports_custom_depth(pg->primitive_mode);
+    r->shaders->quad_adjacency_geometry = false;
+    r->shaders->polygon_line_geometry = false;
+    GByteArray *key_data = g_byte_array_sized_new(sizeof(state) + 1);
+    g_byte_array_append(key_data, (const uint8_t *)&state, sizeof(state));
+    uint8_t custom_depth_key = custom_depth;
+    g_byte_array_append(key_data, &custom_depth_key, sizeof(custom_depth_key));
+    GBytes *key = g_byte_array_free_to_bytes(key_data);
     PGRAPHD3D11PixelShader *shader =
         g_hash_table_lookup(r->shaders->pixel_cache, key);
     if (!shader) {
@@ -1962,7 +3827,10 @@ bool pgraph_d3d11_bind_pixel_shader(PGRAPHState *pg, Error **errp)
         shader = d3d11_create_cached_pixel_shader(r, key);
     }
     if (!shader) {
-        char *source = d3d11_translate_pixel_combiners(&state, errp);
+        char *source = custom_depth ?
+                           d3d11_translate_pixel_combiners_with_depth(
+                               &state, true, errp) :
+                           d3d11_translate_pixel_combiners(&state, errp);
         if (!source) {
             if (g_hash_table_size(r->shaders->failed_pixel_cache) >=
                 D3D11_SHADER_FAILURE_CACHE_LIMIT) {
@@ -1997,9 +3865,44 @@ bool pgraph_d3d11_bind_pixel_shader(PGRAPHState *pg, Error **errp)
     }
     shader->last_used = ++r->shaders->use_serial;
     r->shaders->pixel = shader;
+    bool custom_depth_uses_geometry_shader =
+        custom_depth &&
+        d3d11_custom_depth_needs_geometry_shader(pg->primitive_mode);
+    bool quad_nonfill_mode =
+        d3d11_polygon_mode(pg) != POLY_MODE_FILL &&
+        (pg->primitive_mode == PRIM_TYPE_QUADS ||
+         pg->primitive_mode == PRIM_TYPE_QUAD_STRIP);
+    bool triangle_point_mode =
+        d3d11_polygon_mode(pg) == POLY_MODE_POINT &&
+        d3d11_triangle_primitive(pg->primitive_mode);
+    bool triangle_line_mode =
+        d3d11_polygon_mode(pg) == POLY_MODE_LINE &&
+        d3d11_triangle_line_primitive(pg->primitive_mode);
+    bool polygon_line_mode =
+        pg->primitive_mode == PRIM_TYPE_POLYGON &&
+        d3d11_polygon_mode(pg) == POLY_MODE_LINE;
+    bool wide_line_mode = pgraph_d3d11_needs_wide_lines(
+        pg->primitive_mode, d3d11_polygon_mode(pg), pg->surface_scale_factor);
+    bool geometry_shader_needed =
+        pg->primitive_mode == PRIM_TYPE_POINTS ||
+        custom_depth_uses_geometry_shader || quad_nonfill_mode ||
+        triangle_point_mode || triangle_line_mode || polygon_line_mode ||
+        wide_line_mode;
+    ID3D11GeometryShader *depth_geometry_shader =
+        geometry_shader_needed ?
+            d3d11_get_depth_geometry_shader(pg, &state, errp) : NULL;
+    if (geometry_shader_needed && !depth_geometry_shader) {
+        return false;
+    }
+    r->shaders->quad_adjacency_geometry =
+        geometry_shader_needed &&
+        (pg->primitive_mode == PRIM_TYPE_QUADS ||
+         pg->primitive_mode == PRIM_TYPE_QUAD_STRIP);
+    r->shaders->polygon_line_geometry = polygon_line_mode;
     if (!d3d11_update_pixel_constants(pg, errp)) {
         return false;
     }
     ID3D11DeviceContext_PSSetShader(r->context, shader->shader, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(r->context, depth_geometry_shader, NULL, 0);
     return true;
 }

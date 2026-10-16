@@ -77,7 +77,20 @@ static int qemu_mprotect__osdep(void *addr, size_t size, int prot)
 #ifdef _WIN32
     DWORD old_protect;
 
+#ifdef CONFIG_UWP
+    typedef BOOL (WINAPI *ProtectFromApp)(PVOID, SIZE_T, ULONG, PULONG);
+    ProtectFromApp protect;
+    HMODULE kernel = GetModuleHandleW(L"kernelbase.dll");
+    FARPROC proc = kernel ? GetProcAddress(kernel, "VirtualProtectFromApp") : NULL;
+    memcpy(&protect, &proc, sizeof(protect));
+    if (!protect) {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (!protect(addr, size, prot, &old_protect)) {
+#else
     if (!VirtualProtect(addr, size, prot, &old_protect)) {
+#endif
         g_autofree gchar *emsg = g_win32_error_message(GetLastError());
         error_report("%s: VirtualProtect failed: %s", __func__, emsg);
         return -1;

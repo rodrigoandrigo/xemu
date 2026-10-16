@@ -373,6 +373,8 @@ void pgraph_destroy(PGRAPHState *pg)
        pg->renderer->ops.finalize(d);
     }
 
+    /* D3D11 retires memory callbacks asynchronously on CPU 0. */
+    nv2a_d3d11_callbacks_shutdown(d);
     qemu_mutex_destroy(&pg->lock);
 }
 
@@ -437,7 +439,14 @@ void nv2a_renderer_suspend(void)
     PGRAPHState *pg = &d->pgraph;
     qemu_mutex_lock(&pg->renderer_lock);
     if (pg->renderer && pg->renderer->ops.suspend) {
+        bool lock_pgraph = pg->renderer->ops.suspend_requires_pgraph_lock;
+        if (lock_pgraph) {
+            qemu_mutex_lock(&pg->lock);
+        }
         pg->renderer->ops.suspend(d);
+        if (lock_pgraph) {
+            qemu_mutex_unlock(&pg->lock);
+        }
     }
     qemu_mutex_unlock(&pg->renderer_lock);
 }
@@ -452,7 +461,14 @@ bool nv2a_renderer_resume(void)
     bool resumed = true;
     qemu_mutex_lock(&pg->renderer_lock);
     if (pg->renderer && pg->renderer->ops.resume) {
+        bool lock_pgraph = pg->renderer->ops.resume_requires_pgraph_lock;
+        if (lock_pgraph) {
+            qemu_mutex_lock(&pg->lock);
+        }
         resumed = pg->renderer->ops.resume(d);
+        if (lock_pgraph) {
+            qemu_mutex_unlock(&pg->lock);
+        }
     }
     qemu_mutex_unlock(&pg->renderer_lock);
     return resumed;
@@ -467,7 +483,15 @@ void nv2a_renderer_memory_pressure(unsigned int level)
     PGRAPHState *pg = &d->pgraph;
     qemu_mutex_lock(&pg->renderer_lock);
     if (pg->renderer && pg->renderer->ops.memory_pressure) {
+        bool lock_pgraph =
+            pg->renderer->ops.memory_pressure_requires_pgraph_lock;
+        if (lock_pgraph) {
+            qemu_mutex_lock(&pg->lock);
+        }
         pg->renderer->ops.memory_pressure(d, level);
+        if (lock_pgraph) {
+            qemu_mutex_unlock(&pg->lock);
+        }
     }
     qemu_mutex_unlock(&pg->renderer_lock);
 }
@@ -3316,7 +3340,15 @@ void pgraph_process_pending(NV2AState *d)
 void pgraph_process_pending_reports(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
+    bool lock_pgraph =
+        pg->renderer->ops.process_pending_reports_requires_pgraph_lock;
+    if (lock_pgraph) {
+        qemu_mutex_lock(&pg->lock);
+    }
     pg->renderer->ops.process_pending_reports(d);
+    if (lock_pgraph) {
+        qemu_mutex_unlock(&pg->lock);
+    }
 }
 
 void pgraph_pre_savevm_trigger(NV2AState *d)

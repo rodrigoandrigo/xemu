@@ -83,6 +83,15 @@ static void d3d11_release_device_resources(PGRAPHD3D11State *r)
         r->idle_query = NULL;
     }
     if (r->swapchain) {
+        QemuHostD3D12PresentTarget target;
+        if (!qemu_host_get_d3d12_present_target(&target) && target.attach) {
+            long result = target.attach(target.opaque, NULL);
+            if (result < 0) {
+                qemu_host_emit_log(
+                    QEMU_HOST_LOG_WARNING,
+                    "D3D11: presentation target detach failed during resource release");
+            }
+        }
         IDXGISwapChain3_Release(r->swapchain);
         r->swapchain = NULL;
     }
@@ -121,6 +130,43 @@ static void d3d11_release_state(PGRAPHD3D11State *r)
     g_free(r);
 }
 
+static HRESULT d3d11_create_hardware_device(
+    IDXGIAdapter *adapter, D3D_DRIVER_TYPE driver_type,
+    ID3D11Device **device, D3D_FEATURE_LEVEL *feature_level,
+    ID3D11DeviceContext **context)
+{
+    static const D3D_FEATURE_LEVEL levels_with_11_1[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
+    static const D3D_FEATURE_LEVEL levels_legacy_runtime[] = {
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
+    HRESULT hr = D3D11CreateDevice(
+        adapter, driver_type, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        levels_with_11_1, ARRAY_SIZE(levels_with_11_1), D3D11_SDK_VERSION,
+        device, feature_level, context);
+    if (hr == E_INVALIDARG) {
+        if (*context) {
+            ID3D11DeviceContext_Release(*context);
+            *context = NULL;
+        }
+        if (*device) {
+            ID3D11Device_Release(*device);
+            *device = NULL;
+        }
+        hr = D3D11CreateDevice(
+            adapter, driver_type, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            levels_legacy_runtime, ARRAY_SIZE(levels_legacy_runtime),
+            D3D11_SDK_VERSION, device, feature_level, context);
+    }
+    return hr;
+}
+
 static bool d3d11_create_device(PGRAPHD3D11State *r, Error **errp)
 {
     HRESULT hr =
@@ -130,10 +176,6 @@ static bool d3d11_create_device(PGRAPHD3D11State *r, Error **errp)
         return false;
     }
 
-    static const D3D_FEATURE_LEVEL feature_levels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-    };
     for (UINT index = 0;; index++) {
         IDXGIAdapter1 *adapter = NULL;
         hr = IDXGIFactory4_EnumAdapters1(r->factory, index, &adapter);
@@ -146,10 +188,8 @@ static bool d3d11_create_device(PGRAPHD3D11State *r, Error **errp)
         DXGI_ADAPTER_DESC1 desc;
         hr = IDXGIAdapter1_GetDesc1(adapter, &desc);
         if (SUCCEEDED(hr) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-            hr = D3D11CreateDevice(
-                (IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, feature_levels,
-                ARRAY_SIZE(feature_levels), D3D11_SDK_VERSION, &r->device,
+            hr = d3d11_create_hardware_device(
+                (IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, &r->device,
                 &r->feature_level, &r->context);
             if (SUCCEEDED(hr)) {
                 r->adapter = adapter;
@@ -160,10 +200,9 @@ static bool d3d11_create_device(PGRAPHD3D11State *r, Error **errp)
     }
     if (!r->device) {
         /* Some device families do not expose a desktop adapter enumeration. */
-        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT, feature_levels,
-            ARRAY_SIZE(feature_levels), D3D11_SDK_VERSION, &r->device,
-            &r->feature_level, &r->context);
+        hr = d3d11_create_hardware_device(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, &r->device, &r->feature_level,
+            &r->context);
     }
     if (!r->device) {
         d3d11_set_error(errp, "D3D11CreateDevice", hr);
@@ -800,6 +839,10 @@ static PGRAPHRenderer pgraph_d3d11_renderer = {
         .suspend = pgraph_d3d11_suspend,
         .resume = pgraph_d3d11_resume,
         .memory_pressure = pgraph_d3d11_memory_pressure,
+        .suspend_requires_pgraph_lock = true,
+        .resume_requires_pgraph_lock = true,
+        .memory_pressure_requires_pgraph_lock = true,
+        .process_pending_reports_requires_pgraph_lock = true,
         .get_gpu_properties = pgraph_d3d11_get_gpu_properties,
     },
 };

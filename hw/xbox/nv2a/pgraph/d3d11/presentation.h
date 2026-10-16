@@ -15,6 +15,7 @@ typedef struct PGRAPHD3D11CachedScanout {
     ID3D11Texture2D *texture;
     ID3D11ShaderResourceView *srv;
     uint32_t width, height;
+    uint32_t pitch;
     uint64_t address;
     size_t length;
     uint64_t serial;
@@ -23,8 +24,14 @@ typedef struct PGRAPHD3D11CachedScanout {
 typedef struct PGRAPHD3D11PresentationState {
     ID3D11VertexShader *vertex_shader;
     ID3D11PixelShader *pixel_shader;
+    ID3D11Buffer *constants;
     ID3D11SamplerState *linear_sampler;
     ID3D11SamplerState *nearest_sampler;
+    ID3D11SamplerState *pvideo_sampler;
+    ID3D11Texture2D *pvideo_texture;
+    ID3D11ShaderResourceView *pvideo_srv;
+    uint32_t pvideo_width;
+    uint32_t pvideo_height;
     ID3D11Texture2D *scanout_texture;
     ID3D11ShaderResourceView *scanout_srv;
     uint32_t scanout_width;

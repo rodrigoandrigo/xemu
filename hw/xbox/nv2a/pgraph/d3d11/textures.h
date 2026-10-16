@@ -32,6 +32,7 @@ typedef struct PGRAPHD3D11TextureState {
 bool pgraph_d3d11_textures_init(PGRAPHD3D11State *r, Error **errp);
 void pgraph_d3d11_textures_finalize(PGRAPHD3D11State *r);
 void pgraph_d3d11_textures_trim(PGRAPHD3D11State *r);
+bool pgraph_d3d11_validate_texture_registers(PGRAPHState *pg, Error **errp);
 bool pgraph_d3d11_bind_textures(NV2AState *d, Error **errp);
 
 #endif

@@ -21,7 +21,7 @@ typedef struct PGRAPHD3D11ReportState {
     QSIMPLEQ_HEAD(, PGRAPHD3D11QueryReport) queue;
     GPtrArray *current_queries;
     ID3D11Query *active_query;
-    uint64_t zpass_pixel_count;
+    uint32_t zpass_pixel_count;
 } PGRAPHD3D11ReportState;
 
 bool pgraph_d3d11_reports_init(PGRAPHD3D11State *r);

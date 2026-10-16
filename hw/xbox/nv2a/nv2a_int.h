@@ -74,6 +74,8 @@ typedef struct NV2AState {
 
     qemu_irq irq;
     bool exiting;
+    /* Set before PFIFO shutdown; D3D11 VRAM callbacks then become inert. */
+    bool vram_access_callbacks_disabled;
 
     VGACommonState vga;
     GraphicHwOps hw_ops;
@@ -163,6 +165,7 @@ typedef struct NV2ABlockInfo {
 extern const NV2ABlockInfo blocktable[NV_NUM_BLOCKS];
 
 void nv2a_update_irq(NV2AState *d);
+void nv2a_d3d11_callbacks_shutdown(NV2AState *d);
 
 static inline
 void nv2a_reg_log_read(int block, hwaddr addr, unsigned int size, uint64_t val)
@@ -211,6 +214,13 @@ DEFINE_PROTO(user)
 #undef DEFINE_PROTO
 
 DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address);
+/* Reject a DMA object unless its full three-word descriptor is in RAMIN. */
+bool nv_dma_load_checked(NV2AState *d, hwaddr dma_obj_address,
+                         DMAObject *dma);
+/* Reject non-IN_MEMORY classes and out-of-VRAM bases; convert the inclusive
+ * DMA limit to a byte length and cap len to bytes remaining in VRAM. */
+bool nv_dma_map_checked(NV2AState *d, hwaddr dma_obj_address,
+                        uint8_t **mapping, hwaddr *len);
 void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len);
 
 /**

@@ -24,6 +24,7 @@ typedef struct PGRAPHD3D11RenderTarget {
     uint32_t guest_height;
     uint32_t pitch;
     size_t storage_length;
+    unsigned int surface_type;
     DXGI_FORMAT format;
     unsigned int nv2a_format;
     bool z_format;
@@ -48,6 +49,9 @@ bool pgraph_d3d11_render_targets_update(NV2AState *d, bool color, bool zeta,
                                         Error **errp);
 bool pgraph_d3d11_update_output_merger(NV2AState *d, Error **errp);
 void pgraph_d3d11_bind_render_targets(PGRAPHD3D11State *r);
+D3D11_RECT pgraph_d3d11_gl_scissor_rect(uint32_t viewport_height,
+                                         uint32_t x, uint32_t y,
+                                         uint32_t width, uint32_t height);
 bool pgraph_d3d11_render_targets_clear(NV2AState *d, uint32_t parameter,
                                        Error **errp);
 bool pgraph_d3d11_surface_flush(NV2AState *d, Error **errp);
