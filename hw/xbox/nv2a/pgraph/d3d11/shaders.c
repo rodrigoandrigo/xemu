@@ -28,7 +28,7 @@
 #include <d3dcompiler.h>
 #include "shaders.h"
 
-#define D3D11_SHADER_CACHE_VERSION 26
+#define D3D11_SHADER_CACHE_VERSION 27
 #define D3D11_SHADER_CACHE_MAGIC 0x31485358U /* XSH1 */
 #define D3D11_SHADER_CACHE_MAX_BYTECODE (16 * MiB)
 #define D3D11_SHADER_MEMORY_CACHE_LIMIT 2048
@@ -1235,10 +1235,20 @@ static const char *d3d11_shader_profile(const PGRAPHD3D11State *r,
     if (r->feature_level >= D3D_FEATURE_LEVEL_10_1) {
         return vertex ? "vs_4_1" : "ps_4_1";
     }
-    if (r->feature_level >= D3D_FEATURE_LEVEL_10_0) {
-        return vertex ? "vs_4_0" : "ps_4_0";
-    }
     return NULL;
+}
+
+static bool d3d11_append_shader_profile_key(GByteArray *key_data,
+                                             const PGRAPHD3D11State *r,
+                                             bool vertex)
+{
+    const char *profile = d3d11_shader_profile(r, vertex);
+    if (!profile) {
+        return false;
+    }
+    g_byte_array_append(key_data, (const uint8_t *)profile,
+                        strlen(profile) + 1);
+    return true;
 }
 
 static PGRAPHD3D11VertexShader *d3d11_compile_vertex_shader(PGRAPHD3D11State *r,
@@ -1490,6 +1500,12 @@ bool pgraph_d3d11_bind_vertex_shader(PGRAPHState *pg, Error **errp)
             state.fixed_function.foggen, state.specular_enable,
             state.ignore_specular_alpha, state.point_params_enable,
             state.point_size, state.surface_scale_factor);
+    }
+    if (!d3d11_append_shader_profile_key(key_data, r, true)) {
+        g_byte_array_unref(key_data);
+        error_setg(errp, "D3D11: unsupported shader feature level 0x%x",
+                   r->feature_level);
+        return false;
     }
     GBytes *key = g_byte_array_free_to_bytes(key_data);
     PGRAPHD3D11VertexShader *shader =
@@ -3812,9 +3828,6 @@ static const char *d3d11_geometry_shader_profile(const PGRAPHD3D11State *r)
     if (r->feature_level >= D3D_FEATURE_LEVEL_10_1) {
         return "gs_4_1";
     }
-    if (r->feature_level >= D3D_FEATURE_LEVEL_10_0) {
-        return "gs_4_0";
-    }
     return NULL;
 }
 
@@ -3851,7 +3864,7 @@ static ID3D11GeometryShader *d3d11_get_depth_geometry_shader(
     }
     const char *profile = d3d11_geometry_shader_profile(r);
     if (!profile) {
-        error_setg(errp, "D3D11: geometry shaders require feature level 10.0+");
+        error_setg(errp, "D3D11: geometry shaders require feature level 10.1+");
         return NULL;
     }
     enum ShaderPolygonMode polygon_mode = d3d11_polygon_mode(pg);
@@ -4192,6 +4205,12 @@ bool pgraph_d3d11_bind_pixel_shader(PGRAPHState *pg, Error **errp)
     g_byte_array_append(key_data, &dual_source_key, sizeof(dual_source_key));
     uint8_t raster_key = raster_geometry;
     g_byte_array_append(key_data, &raster_key, sizeof(raster_key));
+    if (!d3d11_append_shader_profile_key(key_data, r, false)) {
+        g_byte_array_unref(key_data);
+        error_setg(errp, "D3D11: unsupported shader feature level 0x%x",
+                   r->feature_level);
+        return false;
+    }
     GBytes *key = g_byte_array_free_to_bytes(key_data);
     PGRAPHD3D11PixelShader *shader =
         g_hash_table_lookup(r->shaders->pixel_cache, key);

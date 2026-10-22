@@ -14,11 +14,64 @@
 
 static bool d3d12_upload_target(NV2AState *d, bool color, Error **errp);
 static unsigned int d3d12_color_bytes_per_pixel(unsigned int format);
+static bool d3d12_flush_color(NV2AState *d, Error **errp);
+static bool d3d12_flush_depth(NV2AState *d, Error **errp);
+
+static UINT d3d12_surface_plane_count(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                   format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ?
+               2 :
+               1;
+}
+
+static uint32_t d3d12_unorm24(float value)
+{
+    if (!(value > 0.0f)) {
+        return 0;
+    }
+    if (value >= 1.0f) {
+        return 0xffffff;
+    }
+    return (uint32_t)((double)value * 16777215.0 + 0.5);
+}
+
+static void
+d3d12_pack_surface_planes(uint8_t *destination,
+                          const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *planes,
+                          const uint8_t *source, size_t source_pitch,
+                          UINT width, UINT height, DXGI_FORMAT format)
+{
+    UINT count = d3d12_surface_plane_count(format);
+    UINT bpp = format == DXGI_FORMAT_D16_UNORM            ? 2 :
+               format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ? 8 :
+                                                            4;
+    for (UINT y = 0; y < height; y++) {
+        uint8_t *depth = destination + planes[0].Offset +
+                         (size_t)y * planes[0].Footprint.RowPitch;
+        const uint8_t *row = source + (size_t)y * source_pitch;
+        if (count == 1) {
+            memcpy(depth, row, (size_t)width * bpp);
+            continue;
+        }
+        uint8_t *stencil = destination + planes[1].Offset +
+                           (size_t)y * planes[1].Footprint.RowPitch;
+        for (UINT x = 0; x < width; x++) {
+            memcpy(depth + x * 4, row + x * bpp, 4);
+            if (format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                depth[x * 4 + 3] = 0;
+            }
+            stencil[x] = row[x * bpp + (bpp == 8 ? 4 : 3)];
+        }
+    }
+}
 
 static void d3d12_release_target(PGRAPHD3D12RenderTarget *target)
 {
     if (target->access_cb && tcg_enabled()) {
-        mem_access_callback_remove_by_ref(qemu_get_cpu(0), target->access_cb);
+        MemAccessCallback *access_cb = target->access_cb;
+        target->access_cb = NULL;
+        mem_access_callback_remove_by_ref_async(qemu_get_cpu(0), access_cb);
     }
     if (target->resource) {
         ID3D12Resource_Release(target->resource);
@@ -29,9 +82,9 @@ static void d3d12_release_target(PGRAPHD3D12RenderTarget *target)
 static bool d3d12_ranges_overlap(hwaddr first, size_t first_length,
                                  hwaddr second, size_t second_length)
 {
-    uint64_t first_end = first + first_length;
-    uint64_t second_end = second + second_length;
-    return first < second_end && second < first_end;
+    return first_length && second_length &&
+           (first <= second ? second - first < first_length :
+                              first - second < second_length);
 }
 
 static void d3d12_surface_access_callback(void *opaque, MemoryRegion *mr,
@@ -39,13 +92,17 @@ static void d3d12_surface_access_callback(void *opaque, MemoryRegion *mr,
                                           bool write)
 {
     NV2AState *d = opaque;
+    if (qatomic_read(&d->vram_access_callbacks_disabled)) {
+        return;
+    }
     (void)mr;
     PGRAPHState *pg = &d->pgraph;
     bool synchronize = false;
 
     qemu_mutex_lock(&pg->lock);
-    PGRAPHD3D12State *r = pg->d3d12_renderer_state;
-    if (r) {
+    if (pg->renderer && pg->renderer->type == CONFIG_DISPLAY_RENDERER_D3D12 &&
+        pg->d3d12_renderer_state) {
+        PGRAPHD3D12State *r = pg->d3d12_renderer_state;
         PGRAPHD3D12RenderTarget *targets[] = {
             &r->render_targets.color,
             &r->render_targets.depth_stencil,
@@ -189,13 +246,22 @@ static bool d3d12_target_address(NV2AState *d, bool color, uint32_t width,
 {
     PGRAPHState *pg = &d->pgraph;
     Surface *surface = color ? &pg->surface_color : &pg->surface_zeta;
-    DMAObject dma = nv_dma_load(d, color ? pg->dma_color : pg->dma_zeta);
+    DMAObject dma;
+    if (!nv_dma_load_checked(d, color ? pg->dma_color : pg->dma_zeta, &dma)) {
+        error_setg(errp, "D3D12: invalid render-target DMA object");
+        return false;
+    }
     uint64_t row_bytes = (uint64_t)width * bpp;
     uint64_t length =
         (uint64_t)height * MAX((uint64_t)surface->pitch, row_bytes);
-    uint64_t end = (uint64_t)surface->offset + length;
+    uint64_t end;
+    if (length > SIZE_MAX ||
+        __builtin_add_overflow((uint64_t)surface->offset, length, &end)) {
+        error_setg(errp, "D3D12: render-target storage range overflows");
+        return false;
+    }
     uint64_t vram_size = memory_region_size(d->vram);
-    if (dma.dma_class != NV_DMA_IN_MEMORY_CLASS || end > dma.limit + 1ULL ||
+    if (dma.dma_class != NV_DMA_IN_MEMORY_CLASS ||
         dma.address > vram_size || end > vram_size - dma.address) {
         error_setg(errp, "D3D12: invalid %s render-target DMA range",
                    color ? "color" : "depth/stencil");
@@ -249,7 +315,8 @@ static bool d3d12_create_target(NV2AState *d, bool color, Error **errp)
     DXGI_FORMAT format = color ?
                              DXGI_FORMAT_B8G8R8A8_UNORM :
                              (nv2a_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ?
-                                  DXGI_FORMAT_D32_FLOAT :
+                                  (pg->surface_shape.z_format ? DXGI_FORMAT_D32_FLOAT :
+                                                               DXGI_FORMAT_D16_UNORM) :
                                   r->z24s8_format);
     surface->buffer_dirty |= memory_region_test_and_clear_dirty(
         d->vram, address, guest_length, DIRTY_MEMORY_NV2A);
@@ -259,6 +326,7 @@ static bool d3d12_create_target(NV2AState *d, bool color, Error **errp)
         target->guest_height == guest_height &&
         target->pitch == surface->pitch &&
         target->storage_length == guest_length && target->format == format &&
+        target->surface_type == pg->surface_type &&
         target->nv2a_format == nv2a_format &&
         (color || target->z_format == pg->surface_shape.z_format)) {
         if (!surface->buffer_dirty) {
@@ -275,6 +343,10 @@ static bool d3d12_create_target(NV2AState *d, bool color, Error **errp)
      * asynchronous draw. D3D12 does not retain application-owned resource or
      * descriptor storage for us, so retire those draws before replacing it. */
     if (target->resource && !pgraph_d3d12_draw_collect(r, true, errp)) {
+        return false;
+    }
+    if (target->resource && surface->draw_dirty &&
+        !(color ? d3d12_flush_color(d, errp) : d3d12_flush_depth(d, errp))) {
         return false;
     }
     d3d12_release_target(target);
@@ -323,6 +395,7 @@ static bool d3d12_create_target(NV2AState *d, bool color, Error **errp)
     target->guest_height = guest_height;
     target->pitch = surface->pitch;
     target->storage_length = guest_length;
+    target->surface_type = pg->surface_type;
     target->format = format;
     target->nv2a_format = nv2a_format;
     target->z_format = !color && pg->surface_shape.z_format;
@@ -462,6 +535,14 @@ bool pgraph_d3d12_surface_update(NV2AState *d, bool color, bool zeta,
     pg->surface_shape.z_format =
         GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER),
                  NV_PGRAPH_SETUPRASTER_Z_FORMAT);
+    uint32_t guest_width, guest_height, width, height;
+    d3d12_surface_dimensions(pg, &guest_width, &guest_height, &width, &height);
+    pg->surface_binding_dim.width = guest_width;
+    pg->surface_binding_dim.height = guest_height;
+    pg->surface_binding_dim.clip_x = pg->surface_shape.clip_x;
+    pg->surface_binding_dim.clip_y = pg->surface_shape.clip_y;
+    pg->surface_binding_dim.clip_width = pg->surface_shape.clip_width;
+    pg->surface_binding_dim.clip_height = pg->surface_shape.clip_height;
     if (color && pg->surface_shape.color_format &&
         !d3d12_create_target(d, true, errp)) {
         return false;
@@ -725,7 +806,7 @@ static bool d3d12_upload_target(NV2AState *d, bool color, Error **errp)
     size_t guest_linear_pitch = (size_t)target->guest_width * guest_bpp;
     uint8_t *guest_linear = g_malloc(guest_linear_pitch * target->guest_height);
     const uint8_t *vram = d->vram_ptr + target->vram_address;
-    if (pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
+    if (target->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
         unswizzle_rect(vram, target->guest_width, target->guest_height,
                        guest_linear, guest_linear_pitch, guest_bpp);
     } else {
@@ -735,7 +816,7 @@ static bool d3d12_upload_target(NV2AState *d, bool color, Error **errp)
         }
     }
 
-    unsigned int host_bpp =
+    unsigned int host_bpp = target->format == DXGI_FORMAT_D16_UNORM ? 2 :
         color || target->format == DXGI_FORMAT_D32_FLOAT ?
             4 :
             (target->format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ? 8 : 4);
@@ -764,6 +845,10 @@ static bool d3d12_upload_target(NV2AState *d, bool color, Error **errp)
                        guest_linear +
                            ((size_t)sy * target->guest_width + sx) * 2,
                        sizeof(packed));
+                if (target->format == DXGI_FORMAT_D16_UNORM) {
+                    memcpy(host + (size_t)y * host_pitch + x * 2, &packed, 2);
+                    continue;
+                }
                 float depth = target->z_format ?
                                   convert_f16_to_float(packed) / f16_max :
                                   packed / 65535.0f;
@@ -781,9 +866,8 @@ static bool d3d12_upload_target(NV2AState *d, bool color, Error **errp)
                     target->z_format ? convert_f24_to_float(depth) / f24_max :
                                        depth / 16777215.0f;
                 if (target->format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
-                    uint32_t native_depth =
-                        CLAMP(normalized_depth, 0.0f, 1.0f) * 16777215.0f +
-                        0.5f;
+                    uint32_t native_depth = target->z_format ?
+                        d3d12_unorm24(normalized_depth) : depth;
                     uint32_t native = native_depth | ((uint32_t)stencil << 24);
                     memcpy(host + (size_t)y * host_pitch + x * 4, &native,
                            sizeof(native));
@@ -799,10 +883,11 @@ static bool d3d12_upload_target(NV2AState *d, bool color, Error **errp)
     g_free(guest_linear);
 
     D3D12_RESOURCE_DESC texture_desc = ID3D12Resource_GetDesc(target->resource);
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2];
+    UINT plane_count = d3d12_surface_plane_count(target->format);
     UINT64 upload_size = 0;
-    ID3D12Device_GetCopyableFootprints(r->device, &texture_desc, 0, 1, 0,
-                                       &footprint, NULL, NULL, &upload_size);
+    ID3D12Device_GetCopyableFootprints(r->device, &texture_desc, 0, plane_count, 0,
+                                       footprints, NULL, NULL, &upload_size);
     D3D12_HEAP_PROPERTIES heap = {
         .Type = D3D12_HEAP_TYPE_UPLOAD,
         .CreationNodeMask = 1,
@@ -831,10 +916,8 @@ static bool d3d12_upload_target(NV2AState *d, bool color, Error **errp)
     D3D12_RANGE no_read = { 0, 0 };
     hr = ID3D12Resource_Map(upload, 0, &no_read, (void **)&mapped);
     if (SUCCEEDED(hr)) {
-        for (uint32_t y = 0; y < target->height; y++) {
-            memcpy(mapped + (size_t)y * footprint.Footprint.RowPitch,
-                   host + (size_t)y * host_pitch, host_pitch);
-        }
+        d3d12_pack_surface_planes(mapped, footprints, host, host_pitch,
+                                   target->width, target->height, target->format);
         ID3D12Resource_Unmap(upload, 0, NULL);
     }
     g_free(host);
@@ -869,10 +952,14 @@ static bool d3d12_upload_target(NV2AState *d, bool color, Error **errp)
     D3D12_TEXTURE_COPY_LOCATION source = {
         .pResource = upload,
         .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-        .PlacedFootprint = footprint,
+        .PlacedFootprint = footprints[0],
     };
-    ID3D12GraphicsCommandList_CopyTextureRegion(list, &destination, 0, 0, 0,
-                                                &source, NULL);
+    for (UINT plane = 0; plane < plane_count; plane++) {
+        destination.SubresourceIndex = plane;
+        source.PlacedFootprint = footprints[plane];
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &destination, 0, 0, 0,
+                                                    &source, NULL);
+    }
     d3d12_transition(list, target, previous);
     bool ok = d3d12_execute_clear(r, list, errp);
     ID3D12GraphicsCommandList_Release(list);
@@ -1211,10 +1298,10 @@ static void d3d12_mirror_clear_to_vram(NV2AState *d, uint32_t parameter,
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHD3D12State *r = pg->d3d12_renderer_state;
-    bool swizzled = pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE;
     if ((parameter & NV097_CLEAR_SURFACE_COLOR) &&
         r->render_targets.color.resource) {
         PGRAPHD3D12RenderTarget *target = &r->render_targets.color;
+        bool swizzled = target->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE;
         unsigned int bpp = d3d12_color_bytes_per_pixel(target->nv2a_format);
         size_t linear_pitch = (size_t)target->guest_width * bpp;
         uint8_t *vram = d->vram_ptr + target->vram_address;
@@ -1249,6 +1336,7 @@ static void d3d12_mirror_clear_to_vram(NV2AState *d, uint32_t parameter,
     if ((parameter & (NV097_CLEAR_SURFACE_Z | NV097_CLEAR_SURFACE_STENCIL)) &&
         r->render_targets.depth_stencil.resource) {
         PGRAPHD3D12RenderTarget *target = &r->render_targets.depth_stencil;
+        bool swizzled = target->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE;
         unsigned int bpp =
             target->nv2a_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ? 2 : 4;
         size_t linear_pitch = (size_t)target->guest_width * bpp;
@@ -1411,7 +1499,7 @@ bool pgraph_d3d12_clear_surface(NV2AState *d, uint32_t parameter, Error **errp)
             flags |= D3D12_CLEAR_FLAG_DEPTH;
         }
         if ((parameter & NV097_CLEAR_SURFACE_STENCIL) &&
-            r->render_targets.depth_stencil.format != DXGI_FORMAT_D32_FLOAT) {
+            d3d12_surface_plane_count(r->render_targets.depth_stencil.format) == 2) {
             flags |= D3D12_CLEAR_FLAG_STENCIL;
         }
         if (flags && depth_rect.left < depth_rect.right &&
@@ -1480,7 +1568,8 @@ static bool d3d12_readback_target(PGRAPHD3D12State *r,
 {
     D3D12_RESOURCE_DESC texture_desc = ID3D12Resource_GetDesc(target->resource);
     UINT64 size = 0;
-    ID3D12Device_GetCopyableFootprints(r->device, &texture_desc, 0, 1, 0,
+    UINT plane_count = d3d12_surface_plane_count(target->format);
+    ID3D12Device_GetCopyableFootprints(r->device, &texture_desc, 0, plane_count, 0,
                                        footprint, NULL, NULL, &size);
     D3D12_HEAP_PROPERTIES heap = {
         .Type = D3D12_HEAP_TYPE_READBACK,
@@ -1537,8 +1626,12 @@ static bool d3d12_readback_target(PGRAPHD3D12State *r,
         .pResource = target->resource,
         .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
     };
-    ID3D12GraphicsCommandList_CopyTextureRegion(list, &destination, 0, 0, 0,
-                                                &source, NULL);
+    for (UINT plane = 0; plane < plane_count; plane++) {
+        source.SubresourceIndex = plane;
+        destination.PlacedFootprint = footprint[plane];
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &destination, 0, 0, 0,
+                                                    &source, NULL);
+    }
     d3d12_transition(list, target, previous);
     bool ok = d3d12_execute_clear(r, list, errp);
     ID3D12GraphicsCommandList_Release(list);
@@ -1550,12 +1643,12 @@ static bool d3d12_readback_target(PGRAPHD3D12State *r,
     return ok;
 }
 
-static void d3d12_store_linear_or_swizzled(PGRAPHState *pg, uint8_t *vram,
+static void d3d12_store_linear_or_swizzled(unsigned int surface_type, uint8_t *vram,
                                            const uint8_t *linear,
                                            uint32_t width, uint32_t height,
                                            uint32_t pitch, unsigned int bpp)
 {
-    if (pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
+    if (surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
         swizzle_rect(linear, width, height, vram, (size_t)width * bpp, bpp);
         return;
     }
@@ -1574,13 +1667,12 @@ static bool d3d12_flush_color(NV2AState *d, Error **errp)
         return true;
     }
     ID3D12Resource *readback = NULL;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-    if (!d3d12_readback_target(r, target, &readback, &footprint, errp)) {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2];
+    if (!d3d12_readback_target(r, target, &readback, footprints, errp)) {
         return false;
     }
     uint8_t *mapped = NULL;
-    D3D12_RANGE range = { 0, (SIZE_T)footprint.Footprint.RowPitch *
-                                 footprint.Footprint.Height };
+    D3D12_RANGE range = { 0, ID3D12Resource_GetDesc(readback).Width };
     HRESULT hr = ID3D12Resource_Map(readback, 0, &range, (void **)&mapped);
     if (FAILED(hr)) {
         ID3D12Resource_Release(readback);
@@ -1594,7 +1686,8 @@ static bool d3d12_flush_color(NV2AState *d, Error **errp)
         for (uint32_t x = 0; x < target->guest_width; x++) {
             uint32_t sx = (uint64_t)x * target->width / target->guest_width;
             memcpy(bgra + (size_t)y * bgra_pitch + x * 4,
-                   mapped + (size_t)sy * footprint.Footprint.RowPitch + sx * 4,
+                   mapped + footprints[0].Offset +
+                       (size_t)sy * footprints[0].Footprint.RowPitch + sx * 4,
                    4);
         }
     }
@@ -1608,7 +1701,7 @@ static bool d3d12_flush_color(NV2AState *d, Error **errp)
         bgra_pitch, target->guest_width, target->guest_height);
     g_free(bgra);
     uint8_t *vram = d->vram_ptr + target->vram_address;
-    d3d12_store_linear_or_swizzled(pg, vram, linear, target->guest_width,
+    d3d12_store_linear_or_swizzled(target->surface_type, vram, linear, target->guest_width,
                                    target->guest_height, target->pitch, bpp);
     g_free(linear);
     size_t length = target->storage_length;
@@ -1629,13 +1722,12 @@ static bool d3d12_flush_depth(NV2AState *d, Error **errp)
         return true;
     }
     ID3D12Resource *readback = NULL;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-    if (!d3d12_readback_target(r, target, &readback, &footprint, errp)) {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2];
+    if (!d3d12_readback_target(r, target, &readback, footprints, errp)) {
         return false;
     }
     uint8_t *mapped = NULL;
-    D3D12_RANGE range = { 0, (SIZE_T)footprint.Footprint.RowPitch *
-                                 footprint.Footprint.Height };
+    D3D12_RANGE range = { 0, ID3D12Resource_GetDesc(readback).Width };
     HRESULT hr = ID3D12Resource_Map(readback, 0, &range, (void **)&mapped);
     if (FAILED(hr)) {
         ID3D12Resource_Release(readback);
@@ -1648,10 +1740,19 @@ static bool d3d12_flush_depth(NV2AState *d, Error **errp)
         g_malloc((size_t)target->guest_width * target->guest_height * bpp);
     for (uint32_t y = 0; y < target->guest_height; y++) {
         uint32_t sy = (uint64_t)y * target->height / target->guest_height;
-        const uint8_t *src = mapped + (size_t)sy * footprint.Footprint.RowPitch;
+        const uint8_t *src = mapped + footprints[0].Offset +
+                             (size_t)sy * footprints[0].Footprint.RowPitch;
+        const uint8_t *stencil_row = d3d12_surface_plane_count(target->format) == 2 ?
+            mapped + footprints[1].Offset +
+                (size_t)sy * footprints[1].Footprint.RowPitch : NULL;
         for (uint32_t x = 0; x < target->guest_width; x++) {
             uint32_t sx = (uint64_t)x * target->width / target->guest_width;
             if (bpp == 2) {
+                if (target->format == DXGI_FORMAT_D16_UNORM) {
+                    memcpy(linear + ((size_t)y * target->guest_width + x) * 2,
+                           src + sx * 2, 2);
+                    continue;
+                }
                 float depth;
                 memcpy(&depth, src + sx * sizeof(float), sizeof(depth));
                 depth = CLAMP(depth, 0.0f, 1.0f);
@@ -1671,15 +1772,15 @@ static bool d3d12_flush_depth(NV2AState *d, Error **errp)
                             d3d12_float_to_f24(native_depth / 16777215.0f *
                                                f24_max) :
                             native_depth;
-                    value = (guest_depth << 8) | (packed >> 24);
+                    value = (guest_depth << 8) | stencil_row[sx];
                 } else {
                     float depth;
-                    memcpy(&depth, src + sx * 8, sizeof(depth));
-                    uint8_t stencil = src[sx * 8 + 4];
+                    memcpy(&depth, src + sx * 4, sizeof(depth));
+                    uint8_t stencil = stencil_row[sx];
                     depth = CLAMP(depth, 0.0f, 1.0f);
                     uint32_t guest_depth =
                         target->z_format ? d3d12_float_to_f24(depth * f24_max) :
-                                           depth * 16777215.0f + 0.5f;
+                                           d3d12_unorm24(depth);
                     value = (guest_depth << 8) | stencil;
                 }
                 memcpy(linear + ((size_t)y * target->guest_width + x) * 4,
@@ -1690,7 +1791,7 @@ static bool d3d12_flush_depth(NV2AState *d, Error **errp)
     ID3D12Resource_Unmap(readback, 0, NULL);
     ID3D12Resource_Release(readback);
     uint8_t *vram = d->vram_ptr + target->vram_address;
-    d3d12_store_linear_or_swizzled(pg, vram, linear, target->guest_width,
+    d3d12_store_linear_or_swizzled(target->surface_type, vram, linear, target->guest_width,
                                    target->guest_height, target->pitch, bpp);
     g_free(linear);
     size_t length = target->storage_length;
@@ -1704,8 +1805,18 @@ static bool d3d12_flush_depth(NV2AState *d, Error **errp)
 
 bool pgraph_d3d12_surface_flush(NV2AState *d, Error **errp)
 {
-    if (!d3d12_flush_color(d, errp)) {
+    Error *color_error = NULL, *depth_error = NULL;
+    bool color_ok = d3d12_flush_color(d, &color_error);
+    bool depth_ok = d3d12_flush_depth(d, &depth_error);
+    if (!color_ok || !depth_ok) {
+        error_setg(errp, "D3D12: surface readback failed (color: %s; depth: %s)",
+                   color_ok ? "ok" : color_error ? error_get_pretty(color_error) : "unknown",
+                   depth_ok ? "ok" : depth_error ? error_get_pretty(depth_error) : "unknown");
+        error_free(color_error);
+        error_free(depth_error);
         return false;
     }
-    return d3d12_flush_depth(d, errp);
+    error_free(color_error);
+    error_free(depth_error);
+    return true;
 }

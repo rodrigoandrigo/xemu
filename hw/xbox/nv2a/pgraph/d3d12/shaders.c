@@ -214,13 +214,20 @@ bool pgraph_d3d12_shader_cache_init(PGRAPHD3D12ShaderCache **cache,
         (SpirvToDxilFreeFn)GetProcAddress(result->module, "spirv_to_dxil_free");
     result->validate = (SpirvToDxilValidateFn)GetProcAddress(
         result->module, "spirv_to_dxil_validate");
-    if (!result->compile || !result->free_object || !result->validate) {
-        error_setg(errp, "D3D12: invalid spirv_to_dxil.dll exports");
+    if (!result->compile || !result->free_object) {
+        error_setg(errp, "D3D12: spirv_to_dxil.dll is missing required compile/free exports");
         FreeLibrary(result->module);
         qemu_mutex_destroy(&result->lock);
         g_free(result->path);
         g_free(result);
         return false;
+    }
+    /* Standalone validation is an optional extension, not part of Mesa's
+     * spirv_to_dxil ABI. D3D12 still validates bytecode when creating PSOs. */
+    if (!result->validate) {
+        qemu_host_emit_log(QEMU_HOST_LOG_INFO,
+                           "D3D12: standalone DXIL validator unavailable; "
+                           "using D3D12 pipeline validation");
     }
 
     d3d12_shader_cache_load(result);
@@ -326,7 +333,8 @@ bool pgraph_d3d12_shader_compile(PGRAPHD3D12ShaderCache *cache,
         }
 
         char validation_error[2048] = { 0 };
-        if (!cache->validate(object.binary.buffer, object.binary.size,
+        if (cache->validate &&
+            !cache->validate(object.binary.buffer, object.binary.size,
                              validation_error, sizeof(validation_error))) {
             error_setg(errp, "D3D12: generated DXIL is invalid: %s",
                        validation_error[0] ? validation_error :
@@ -342,7 +350,7 @@ bool pgraph_d3d12_shader_compile(PGRAPHD3D12ShaderCache *cache,
         entry->stage = stage;
         cache->dirty = true;
         cache->free_object(&object);
-        /* Persist validated DXIL immediately. A renderer failure can prevent
+        /* Persist compiled DXIL immediately. A renderer failure can prevent
          * normal shutdown, and delaying this until finalize() used to discard
          * the only artifacts capable of diagnosing a rejected PSO. */
         if (d3d12_shader_cache_save(cache)) {

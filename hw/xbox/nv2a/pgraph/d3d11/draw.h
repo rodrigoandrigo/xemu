@@ -22,6 +22,8 @@ typedef struct PGRAPHD3D11DrawState {
     ID3D11Buffer *raster_constants;
     size_t vertex_buffer_size;
     size_t index_buffer_size;
+    size_t vertex_buffer_cursor;
+    size_t index_buffer_cursor;
 } PGRAPHD3D11DrawState;
 
 bool pgraph_d3d11_draw_init(PGRAPHD3D11State *r, Error **errp);

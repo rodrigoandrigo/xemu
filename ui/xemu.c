@@ -854,6 +854,7 @@ static void gl_render_frame(struct xemu_console *scon)
         xemu_hud_d3d11_prepare_frame();
     }
     if (nv2a_present_frame() ||
+        g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D12 ||
         g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D11) {
         qatomic_set(&rendering, false);
         return;

@@ -1,5 +1,48 @@
 # D3D11 renderer regression checks
 
+The [2026-10-20 D3D12-reference audit](../../../../../renderer-parity/D3D11_AUDIT_2026-10-20.md)
+records current clear/report/trim corrections, regression coverage and remaining
+limits. It supersedes historical statements below that reject B8/G8B8 clears.
+
+## Geometry streaming from the D3D12 reference (2026-10-20)
+
+The upload-ring design in `xemu-uwp-uwp-d3d12` (`d3d12/buffer.c`,
+`ring_try_place` and `ring_grow`) informs the D3D11 geometry streaming path.
+Vertex/index uploads append with `WRITE_NO_OVERWRITE`; exhaustion or resource
+replacement starts a new allocation with `WRITE_DISCARD`. D3D11 runtime
+renaming replaces the reference's explicit fence retirement; submitted ranges
+are never reused with NO_OVERWRITE. Rings start at 1 MiB for packed vertices
+and 256 KiB for indices and grow only when a single upload requires it.
+Trim releases the buffers and resets both cursors.
+
+Native indexed topologies now rebase directly into mapped upload memory,
+avoiding the intermediate GArray allocation/copy. Primitive expansion retains
+the previous conversion path and guest provoking-vertex handling is unchanged.
+`tests/unit/test-d3d11-upload-ring.py` checks production helper code using WARP
+GPU copies/readback across 600 uploads, two wraps, rebasing and resource growth.
+This establishes data preservation, not a measured gameplay FPS improvement;
+real PC/Xbox performance and memory-pressure testing are still needed.
+
+## Changes ported from xemu-UWP (2026-10-16)
+
+Device creation now requires feature level 10.1 or newer. Generated NV2A
+shaders select SM4.1 at FL10.1 and SM5.0 at FL11.x; shader cache version 27
+includes the selected VS/PS profile in each key to prevent cross-device reuse.
+Presentation preserves the guest geometry shader on both success and failure.
+
+Suspension preserves dirty surfaces, calls DXGI Trim, then releases resources.
+Device recreation attempts preservation even after device loss, and attempts
+color and depth/stencil readbacks independently. A removed device can still
+reject readback; errors are logged, not a guarantee of GPU-only data recovery.
+Teardown invalidates cached blend and depth/stencil descriptors as well as
+releasing their COM objects. Synchronous readback/query waits still have no
+global UWP suspension deadline guarantee.
+
+Regression checks: `test-d3d11-device-profile.py`,
+`test-d3d11-shader-cache-profile.py`, `test-d3d11-lifecycle.py`, and the
+geometry-shader restoration case in `test-d3d11-presentation.py`.
+These checks do not replace real UWP suspend/resume or Xbox validation.
+
 The surface transfer path now handles GPU color/depth format conversion and
 individual guest mip levels/cubemap faces. Z16/Z24S8 fixed/float packing,
 stencil, UNORM/SNORM and Y16 are checked against production CPU conversions on

@@ -78,6 +78,8 @@ struct PGRAPHD3D12State {
     uint64_t zpass_pixel_count;
     bool query_active;
     bool device_lost;
+    bool app_suspended;
+    bool memory_suspended;
     bool memory_pressure;
     bool hud_initialized;
     bool draw_prepared;

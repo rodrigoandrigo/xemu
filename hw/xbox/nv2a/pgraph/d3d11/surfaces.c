@@ -275,6 +275,8 @@ void pgraph_d3d11_surfaces_finalize(PGRAPHD3D11State *r)
         ID3D11DepthStencilState_Release(r->render_targets.depth_stencil_state);
         r->render_targets.depth_stencil_state = NULL;
     }
+    r->render_targets.blend_state_valid = false;
+    r->render_targets.depth_stencil_state_valid = false;
 }
 
 static bool d3d11_surface_color_format_supported(unsigned int format)
@@ -1096,10 +1098,39 @@ static bool d3d11_flush_depth_stencil(NV2AState *d, Error **errp)
 
 bool pgraph_d3d11_surface_flush(NV2AState *d, Error **errp)
 {
-    if (!d3d11_flush_color(d, errp)) {
+    Error *color_error = NULL;
+    Error *depth_error = NULL;
+    bool color_ok = d3d11_flush_color(d, &color_error);
+    bool depth_ok = d3d11_flush_depth_stencil(d, &depth_error);
+
+    if (!color_ok || !depth_ok) {
+        const char *color_message = color_error ?
+                                       error_get_pretty(color_error) :
+                                       "unknown error";
+        const char *depth_message = depth_error ?
+                                       error_get_pretty(depth_error) :
+                                       "unknown error";
+        if (!color_ok && !depth_ok) {
+            error_setg(errp,
+                       "D3D11: color surface readback failed: %s; "
+                       "depth/stencil surface readback failed: %s",
+                       color_message, depth_message);
+        } else if (!color_ok) {
+            error_setg(errp, "D3D11: color surface readback failed: %s",
+                       color_message);
+        } else {
+            error_setg(errp,
+                       "D3D11: depth/stencil surface readback failed: %s",
+                       depth_message);
+        }
+        error_free(color_error);
+        error_free(depth_error);
         return false;
     }
-    return d3d11_flush_depth_stencil(d, errp);
+
+    error_free(color_error);
+    error_free(depth_error);
+    return true;
 }
 
 void pgraph_d3d11_surface_invalidate_range(NV2AState *d, hwaddr address,
@@ -1451,6 +1482,15 @@ static uint8_t d3d11_surface_color_write_mask(uint32_t control0,
 static uint32_t d3d11_surface_color_clear_mask(uint32_t parameter,
                                               unsigned int format)
 {
+    /* Narrow guest B/G bytes occupy logical R/G in the host target. */
+    if (format == NV097_SET_SURFACE_FORMAT_COLOR_LE_B8 ||
+        format == NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8) {
+        return ((parameter & NV097_CLEAR_SURFACE_B) ?
+                    NV097_CLEAR_SURFACE_R : 0) |
+               ((format == NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8 &&
+                 (parameter & NV097_CLEAR_SURFACE_G)) ?
+                    NV097_CLEAR_SURFACE_G : 0);
+    }
     uint8_t format_mask = d3d11_surface_color_format_mask(format);
     uint32_t mask = 0;
     if ((format_mask & D3D11_COLOR_WRITE_ENABLE_RED) &&
@@ -1477,9 +1517,28 @@ static bool d3d11_surface_color_clear_supported(unsigned int format)
     switch (format) {
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8:
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8:
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8:
         return false;
     default:
         return true;
+    }
+}
+
+static void d3d11_special_clear_color(unsigned int format, uint32_t value,
+                                       float rgba[4])
+{
+    rgba[0] = (value & 0xff) / 255.0f;
+    rgba[1] = format == NV097_SET_SURFACE_FORMAT_COLOR_LE_G8B8 ?
+                  ((value >> 8) & 0xff) / 255.0f : 0.0f;
+    rgba[2] = 0.0f;
+    rgba[3] = 1.0f;
+    if (format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_Z1A7R8G8B8 ||
+        format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X1A7R8G8B8_O1A7R8G8B8) {
+        rgba[0] = ((value >> 16) & 0xff) / 255.0f;
+        rgba[1] = ((value >> 8) & 0xff) / 255.0f;
+        rgba[2] = (value & 0xff) / 255.0f;
+        rgba[3] = ((value >> 24) & 0x7f) / 127.0f;
     }
 }
 
@@ -1877,6 +1936,14 @@ out:
     return success;
 }
 
+static UINT d3d11_depth_clear_flags(DXGI_FORMAT format, uint32_t parameter)
+{
+    return ((parameter & NV097_CLEAR_SURFACE_Z) ? D3D11_CLEAR_DEPTH : 0) |
+           ((format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
+             (parameter & NV097_CLEAR_SURFACE_STENCIL)) ?
+                D3D11_CLEAR_STENCIL : 0);
+}
+
 bool pgraph_d3d11_render_targets_clear(NV2AState *d, uint32_t parameter,
                                        Error **errp)
 {
@@ -1923,16 +1990,14 @@ bool pgraph_d3d11_render_targets_clear(NV2AState *d, uint32_t parameter,
             NV097_CLEAR_SURFACE_B | NV097_CLEAR_SURFACE_A;
         if (channel_mask && rect.right > rect.left &&
             rect.bottom > rect.top) {
-            if (!d3d11_surface_color_clear_supported(target->nv2a_format)) {
-                error_setg(errp,
-                           "D3D11: color clear is unsupported for surface "
-                           "format 0x%x",
-                           target->nv2a_format);
-                pg->clearing = false;
-                return false;
-            }
             float clear_color[4];
-            pgraph_get_clear_color(pg, clear_color);
+            if (d3d11_surface_color_clear_supported(target->nv2a_format)) {
+                pgraph_get_clear_color(pg, clear_color);
+            } else {
+                d3d11_special_clear_color(
+                    target->nv2a_format,
+                    pgraph_reg_r(pg, NV_PGRAPH_COLORCLEARVALUE), clear_color);
+            }
             bool full_clear = rect.left == 0 && rect.top == 0 &&
                               rect.right >= target->width &&
                               rect.bottom >= target->height;
@@ -1964,14 +2029,8 @@ bool pgraph_d3d11_render_targets_clear(NV2AState *d, uint32_t parameter,
         }
     }
     if (zeta && r->render_targets.depth_stencil.dsv) {
-        UINT flags = 0;
-        if (parameter & NV097_CLEAR_SURFACE_Z) {
-            flags |= D3D11_CLEAR_DEPTH;
-        }
-        if ((parameter & NV097_CLEAR_SURFACE_STENCIL) &&
-            r->render_targets.depth_stencil.format != DXGI_FORMAT_D32_FLOAT) {
-            flags |= D3D11_CLEAR_STENCIL;
-        }
+        UINT flags = d3d11_depth_clear_flags(
+            r->render_targets.depth_stencil.format, parameter);
         float depth;
         int stencil;
         pgraph_get_clear_depth_stencil_value(pg, &depth, &stencil);

@@ -13,6 +13,7 @@ typedef struct PGRAPHD3D11QueryReport {
     QSIMPLEQ_ENTRY(PGRAPHD3D11QueryReport) entry;
     bool clear;
     uint32_t parameter;
+    uint32_t dma_report;
     ID3D11Query **queries;
     size_t query_count;
 } PGRAPHD3D11QueryReport;

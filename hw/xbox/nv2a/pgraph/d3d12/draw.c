@@ -22,6 +22,8 @@
 #define D3D12_PIPELINE_CACHE_VERSION 1
 #define D3D12_PIPELINE_CACHE_MAX_FILE (128u * 1024u * 1024u)
 #define D3D12_MAX_DRAW_SUBMISSIONS 64
+#define D3D12_UPLOAD_CACHE_BYTES (32u * 1024u * 1024u)
+#define D3D12_UPLOAD_CACHE_ENTRIES 64
 
 void pgraph_vk_init_glsl_compiler(void);
 void pgraph_vk_finalize_glsl_compiler(void);
@@ -100,6 +102,8 @@ struct PGRAPHD3D12DrawState {
     bool pipeline_cache_dirty;
     bool glsl_compiler_initialized;
     GQueue submissions;
+    GQueue upload_cache;
+    uint64_t upload_cache_bytes;
 };
 
 typedef struct D3D12PipelineCacheHeader {
@@ -244,6 +248,22 @@ static void d3d12_release_submission(PGRAPHD3D12DrawSubmission *submission)
     g_free(submission);
 }
 
+/* Only completed submissions may contribute buffers to this bounded cache. */
+static void d3d12_cache_upload(PGRAPHD3D12DrawState *draw,
+                             ID3D12Resource **resource)
+{
+    if (!*resource) {
+        return;
+    }
+    D3D12_RESOURCE_DESC desc = ID3D12Resource_GetDesc(*resource);
+    if (desc.Width <= D3D12_UPLOAD_CACHE_BYTES - draw->upload_cache_bytes &&
+        g_queue_get_length(&draw->upload_cache) < D3D12_UPLOAD_CACHE_ENTRIES) {
+        draw->upload_cache_bytes += desc.Width;
+        g_queue_push_tail(&draw->upload_cache, *resource);
+        *resource = NULL;
+    }
+}
+
 bool pgraph_d3d12_draw_collect(PGRAPHD3D12State *r, bool wait, Error **errp)
 {
     if (!r || !r->draw) {
@@ -252,6 +272,10 @@ bool pgraph_d3d12_draw_collect(PGRAPHD3D12State *r, bool wait, Error **errp)
     while (!g_queue_is_empty(&r->draw->submissions)) {
         PGRAPHD3D12DrawSubmission *submission =
             g_queue_peek_head(&r->draw->submissions);
+        if (submission->fence_value == UINT64_MAX) {
+            error_setg(errp, "D3D12: unfenced submission requires device recovery");
+            return false;
+        }
         uint64_t completed = ID3D12Fence_GetCompletedValue(r->fence);
         if (completed == UINT64_MAX) {
             HRESULT hr = ID3D12Device_GetDeviceRemovedReason(r->device);
@@ -298,6 +322,11 @@ bool pgraph_d3d12_draw_collect(PGRAPHD3D12State *r, bool wait, Error **errp)
             }
         }
         g_queue_pop_head(&r->draw->submissions);
+        d3d12_cache_upload(r->draw, &submission->vertex_buffer);
+        d3d12_cache_upload(r->draw, &submission->index_buffer);
+        d3d12_cache_upload(r->draw, &submission->vertex_constants);
+        d3d12_cache_upload(r->draw, &submission->pixel_constants);
+        d3d12_cache_upload(r->draw, &submission->runtime_constants);
         d3d12_release_submission(submission);
     }
     return true;
@@ -393,6 +422,7 @@ bool pgraph_d3d12_draw_init(PGRAPHD3D12State *r, Error **errp)
 {
     r->draw = g_new0(PGRAPHD3D12DrawState, 1);
     g_queue_init(&r->draw->submissions);
+    g_queue_init(&r->draw->upload_cache);
     r->draw->adapter_luid = ID3D12Device_GetAdapterLuid(r->device);
     char *base_path = qemu_host_dup_pipeline_cache_file();
     if (base_path) {
@@ -418,6 +448,10 @@ void pgraph_d3d12_draw_finalize(PGRAPHD3D12State *r)
     d3d12_pipeline_cache_save(r->draw);
     while (!g_queue_is_empty(&r->draw->submissions)) {
         d3d12_release_submission(g_queue_pop_head(&r->draw->submissions));
+    }
+    while (!g_queue_is_empty(&r->draw->upload_cache)) {
+        ID3D12Resource *resource = g_queue_pop_head(&r->draw->upload_cache);
+        ID3D12Resource_Release(resource);
     }
     for (unsigned int i = 0; i < D3D12_PIPELINE_CACHE_SIZE; i++) {
         if (r->draw->pipeline_cache[i].pipeline) {
@@ -446,11 +480,11 @@ static void d3d12_decode_attribute(const VertexAttribute *attribute,
     output[3] = 1.0f;
     switch (attribute->format) {
     case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D:
-        if (attribute->count == 4) {
+        if (attribute->count >= 3) {
             output[0] = source[2] / 255.0f;
             output[1] = source[1] / 255.0f;
             output[2] = source[0] / 255.0f;
-            output[3] = source[3] / 255.0f;
+            output[3] = attribute->count == 4 ? source[3] / 255.0f : 1.0f;
             break;
         }
         /* fall through */
@@ -492,12 +526,15 @@ static void d3d12_decode_attribute(const VertexAttribute *attribute,
     }
 }
 
-static bool d3d12_build_vertices(NV2AState *d, uint32_t vertex_count,
+static bool d3d12_build_vertices(NV2AState *d, uint32_t first,
+                                 uint32_t vertex_count, uint32_t state_vertex,
                                  bool inline_array, uint32_t inline_stride,
                                  uint8_t **vertices, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
-    if (!vertex_count || vertex_count > NV2A_MAX_BATCH_LENGTH) {
+    if (!vertex_count || vertex_count > NV2A_MAX_BATCH_LENGTH ||
+        first > UINT32_MAX - vertex_count || state_vertex < first ||
+        state_vertex - first >= vertex_count) {
         error_setg(errp, "D3D12: invalid vertex count %u", vertex_count);
         return false;
     }
@@ -508,8 +545,9 @@ static bool d3d12_build_vertices(NV2AState *d, uint32_t vertex_count,
         const uint8_t *base = NULL;
         size_t available = 0;
         uint32_t stride = 0;
-        if (!inline_array && pg->inline_buffer_length &&
-            attribute->inline_buffer_populated) {
+        bool inline_values = !inline_array && pg->inline_buffer_length &&
+                             attribute->inline_buffer_populated;
+        if (inline_values) {
             base = (const uint8_t *)attribute->inline_buffer;
             available = (size_t)pg->inline_buffer_length * 4 * sizeof(float);
             stride = 4 * sizeof(float);
@@ -531,15 +569,15 @@ static bool d3d12_build_vertices(NV2AState *d, uint32_t vertex_count,
             stride = inline_stride;
         } else if (attribute->count) {
             hwaddr dma_length = 0;
-            base = nv_dma_map(
+            uint8_t *mapping = NULL;
+            if (!nv_dma_map_checked(
                 d, attribute->dma_select ? pg->dma_vertex_b : pg->dma_vertex_a,
-                &dma_length);
-            if (!base || attribute->offset >= dma_length) {
+                &mapping, &dma_length) || attribute->offset >= dma_length) {
                 g_free(result);
                 error_setg(errp, "D3D12: vertex attribute DMA is invalid");
                 return false;
             }
-            base += attribute->offset;
+            base = mapping + attribute->offset;
             available = dma_length - attribute->offset;
             stride = attribute->stride;
         }
@@ -548,19 +586,28 @@ static bool d3d12_build_vertices(NV2AState *d, uint32_t vertex_count,
                 (float *)(result +
                           (size_t)vertex * D3D12_CANONICAL_VERTEX_STRIDE) +
                 attribute_index * 4;
-            if (!attribute->count || !stride) {
+            if (!base || (!inline_values && !attribute->count)) {
                 memcpy(destination, attribute->inline_value,
                        sizeof(attribute->inline_value));
             } else {
-                uint64_t offset = (uint64_t)vertex * stride;
-                uint64_t bytes = (uint64_t)attribute->size * attribute->count;
+                uint64_t offset = ((uint64_t)first + vertex) * stride;
+                uint64_t bytes = inline_values ? sizeof(attribute->inline_value) :
+                    (uint64_t)attribute->size * attribute->count;
                 if (offset + bytes > available) {
                     g_free(result);
                     error_setg(errp,
                                "D3D12: vertex attribute exceeds DMA range");
                     return false;
                 }
-                d3d12_decode_attribute(attribute, base + offset, destination);
+                if (inline_values) {
+                    memcpy(destination, base + offset, sizeof(attribute->inline_value));
+                } else {
+                    d3d12_decode_attribute(attribute, base + offset, destination);
+                }
+                if (first + vertex == state_vertex) {
+                    memcpy(attribute->inline_value, destination,
+                           sizeof(attribute->inline_value));
+                }
             }
         }
     }
@@ -658,10 +705,28 @@ static bool d3d12_create_upload(PGRAPHD3D12State *r, const void *data,
         .SampleDesc = { 1, 0 },
         .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
     };
-    HRESULT hr = ID3D12Device_CreateCommittedResource(
+    /* Best-fit avoids consuming a large geometry allocation for a small CBV. */
+    GList *best = NULL;
+    uint64_t best_size = UINT64_MAX;
+    for (GList *link = r->draw->upload_cache.head; link; link = link->next) {
+        D3D12_RESOURCE_DESC cached =
+            ID3D12Resource_GetDesc((ID3D12Resource *)link->data);
+        if (cached.Width >= desc.Width && cached.Width < best_size) {
+            best = link;
+            best_size = cached.Width;
+        }
+    }
+    HRESULT hr = S_OK;
+    if (best) {
+        *resource = best->data;
+        g_queue_delete_link(&r->draw->upload_cache, best);
+        r->draw->upload_cache_bytes -= best_size;
+    } else {
+        hr = ID3D12Device_CreateCommittedResource(
         r->device, &heap, D3D12_HEAP_FLAG_NONE, &desc,
         D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource,
         (void **)resource);
+    }
     if (FAILED(hr)) {
         error_setg(errp, "D3D12: draw upload allocation failed (0x%08lx)",
                    (unsigned long)hr);
@@ -936,7 +1001,8 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
         return false;
     }
     uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
-    if ((raster & NV_PGRAPH_SETUPRASTER_CULLENABLE) &&
+    if (pg->primitive_mode >= PRIM_TYPE_TRIANGLES &&
+        (raster & NV_PGRAPH_SETUPRASTER_CULLENABLE) &&
         GET_MASK(raster, NV_PGRAPH_SETUPRASTER_CULLCTRL) ==
             NV_PGRAPH_SETUPRASTER_CULLCTRL_FRONT_AND_BACK) {
         for (unsigned int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
@@ -956,7 +1022,7 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
         !pgraph_d3d12_process_reports_now(d, errp)) {
         return false;
     }
-    uint32_t max_vertex = 0;
+    uint32_t min_vertex = UINT32_MAX, max_vertex = 0, state_vertex = 0;
     bool inline_array = false;
     uint32_t inline_stride = 0;
     GArray *indices = g_array_new(FALSE, FALSE, sizeof(uint32_t));
@@ -967,6 +1033,17 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
         for (unsigned int batch = 0; batch < pg->draw_arrays_length; batch++) {
             uint32_t start = pg->draw_arrays_start[batch];
             uint32_t count = pg->draw_arrays_count[batch];
+            if (!count) {
+                continue;
+            }
+            if (start > UINT32_MAX - count) {
+                g_array_unref(indices);
+                g_array_unref(ranges);
+                error_setg(errp, "D3D12: draw array range overflows");
+                return false;
+            }
+            min_vertex = MIN(min_vertex, start);
+            state_vertex = start + count - 1;
             uint32_t *sequence = g_new(uint32_t, count);
             for (uint32_t i = 0; i < count; i++) {
                 sequence[i] = start + i;
@@ -994,8 +1071,16 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
         if (range.index_count)
             g_array_append_val(ranges, range);
         for (unsigned int i = 0; i < pg->inline_elements_length; i++) {
+            if (pg->inline_elements[i] == UINT32_MAX) {
+                g_array_unref(indices);
+                g_array_unref(ranges);
+                error_setg(errp, "D3D12: vertex index overflows");
+                return false;
+            }
+            min_vertex = MIN(min_vertex, pg->inline_elements[i]);
             max_vertex = MAX(max_vertex, pg->inline_elements[i] + 1);
         }
+        state_vertex = pg->inline_elements[pg->inline_elements_length - 1];
     } else if (pg->inline_buffer_length) {
         uint32_t *sequence = g_new(uint32_t, pg->inline_buffer_length);
         for (uint32_t i = 0; i < pg->inline_buffer_length; i++) {
@@ -1011,6 +1096,8 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
         if (range.index_count)
             g_array_append_val(ranges, range);
         max_vertex = pg->inline_buffer_length;
+        min_vertex = 0;
+        state_vertex = max_vertex - 1;
         g_free(sequence);
     } else if (pg->inline_array_length) {
         for (unsigned int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
@@ -1030,6 +1117,8 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
             return false;
         }
         max_vertex = pg->inline_array_length * 4 / inline_stride;
+        min_vertex = 0;
+        state_vertex = max_vertex ? max_vertex - 1 : 0;
         uint32_t *sequence = g_new(uint32_t, max_vertex);
         for (uint32_t i = 0; i < max_vertex; i++) {
             sequence[i] = i;
@@ -1055,7 +1144,12 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
         return true;
     }
     uint8_t *vertices = NULL;
-    if (!d3d12_build_vertices(d, max_vertex, inline_array, inline_stride,
+    uint32_t vertex_count = max_vertex - min_vertex;
+    for (unsigned int i = 0; i < indices->len; i++) {
+        g_array_index(indices, uint32_t, i) -= min_vertex;
+    }
+    if (!d3d12_build_vertices(d, min_vertex, vertex_count, state_vertex,
+                              inline_array, inline_stride,
                               &vertices, errp) ||
         !d3d12_ensure_shader(pg, errp)) {
         g_free(vertices);
@@ -1111,7 +1205,7 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
     runtime_data.viewport_height = draw_height;
     bool ok =
         d3d12_create_upload(r, vertices,
-                            (size_t)max_vertex * D3D12_CANONICAL_VERTEX_STRIDE,
+                            (size_t)vertex_count * D3D12_CANONICAL_VERTEX_STRIDE,
                             &vertex_buffer, errp) &&
         d3d12_create_upload(r, indices->data, indices->len * sizeof(uint32_t),
                             &index_buffer, errp) &&
@@ -1167,7 +1261,7 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
     pgraph_d3d12_bind_render_targets(r, list);
     D3D12_VERTEX_BUFFER_VIEW vertex_view = {
         .BufferLocation = ID3D12Resource_GetGPUVirtualAddress(vertex_buffer),
-        .SizeInBytes = max_vertex * D3D12_CANONICAL_VERTEX_STRIDE,
+        .SizeInBytes = vertex_count * D3D12_CANONICAL_VERTEX_STRIDE,
         .StrideInBytes = D3D12_CANONICAL_VERTEX_STRIDE,
     };
     D3D12_INDEX_BUFFER_VIEW index_view = {
@@ -1218,7 +1312,9 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
         ID3D12CommandQueue_ExecuteCommandLists(r->queue, 1, lists);
         hr = ID3D12CommandQueue_Signal(r->queue, r->fence, fence);
         qemu_mutex_unlock(&r->queue_lock);
-        if (SUCCEEDED(hr)) {
+        {
+            /* ExecuteCommandLists has no return value. Even if Signal fails,
+             * the GPU may own these resources: quarantine until teardown. */
             PGRAPHD3D12DrawSubmission *submission =
                 g_new0(PGRAPHD3D12DrawSubmission, 1);
             submission->allocator = allocator;
@@ -1230,7 +1326,7 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
             submission->runtime_constants = runtime_constants;
             submission->pipeline = r->draw->pipeline;
             ID3D12PipelineState_AddRef(submission->pipeline);
-            submission->fence_value = fence;
+            submission->fence_value = SUCCEEDED(hr) ? fence : UINT64_MAX;
             g_queue_push_tail(&r->draw->submissions, submission);
             allocator = NULL;
             list = NULL;
@@ -1239,6 +1335,8 @@ bool pgraph_d3d12_flush_draw(NV2AState *d, Error **errp)
             vertex_constants = NULL;
             pixel_constants = NULL;
             runtime_constants = NULL;
+        }
+        if (SUCCEEDED(hr)) {
             ok = true;
         } else {
             pgraph_d3d12_note_device_error(r, hr, "draw submission");

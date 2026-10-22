@@ -30,6 +30,7 @@ typedef struct PGRAPHD3D12RenderTarget {
     uint32_t guest_height;
     uint32_t pitch;
     size_t storage_length;
+    unsigned int surface_type;
     DXGI_FORMAT format;
     unsigned int nv2a_format;
     bool z_format;

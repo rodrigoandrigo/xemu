@@ -14,6 +14,7 @@ typedef struct PGRAPHD3D12State PGRAPHD3D12State;
 typedef struct PGRAPHD3D12QueryReport {
     bool clear;
     uint32_t parameter;
+    uint32_t dma_report;
     uint32_t query_count;
     QSIMPLEQ_ENTRY(PGRAPHD3D12QueryReport) entry;
 } PGRAPHD3D12QueryReport;

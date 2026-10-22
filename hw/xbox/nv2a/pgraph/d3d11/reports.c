@@ -12,7 +12,26 @@
 #include "hw/xbox/nv2a/nv2a.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "qemu/host-utils.h"
+#include "qemu/bswap.h"
 #include "renderer.h"
+
+static void d3d11_write_report(NV2AState *d, uint32_t dma_report,
+                               uint32_t parameter, uint32_t result)
+{
+    uint8_t *mapping = NULL;
+    hwaddr length = 0;
+    hwaddr offset = GET_MASK(parameter, NV097_GET_REPORT_OFFSET);
+    if (!nv_dma_map_checked(d, dma_report, &mapping, &length) ||
+        !mapping || offset > length || length - offset < 16) {
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
+                           "D3D11: report destination is outside its DMA range");
+        return;
+    }
+    /* Match the common NV2A report layout without its unchecked DMA access. */
+    stq_le_p(mapping + offset, UINT64_C(0x0011223344556677));
+    stl_le_p(mapping + offset + 8, result);
+    stl_le_p(mapping + offset + 12, 0);
+}
 
 static void d3d11_release_queries(ID3D11Query **queries, size_t count)
 {
@@ -125,12 +144,13 @@ void pgraph_d3d11_get_report(NV2AState *d, uint32_t parameter)
 {
     PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
     if (!r || !r->resources_ready || !r->reports) {
-        pgraph_write_zpass_pixel_cnt_report(d, parameter, 0);
+        d3d11_write_report(d, d->pgraph.dma_report, parameter, 0);
         return;
     }
     pgraph_d3d11_report_draw_end(d);
     PGRAPHD3D11QueryReport *report = g_new0(PGRAPHD3D11QueryReport, 1);
     report->parameter = parameter;
+    report->dma_report = d->pgraph.dma_report;
     report->query_count = r->reports->current_queries->len;
     report->queries =
         (ID3D11Query **)g_ptr_array_free(r->reports->current_queries, FALSE);
@@ -141,7 +161,6 @@ void pgraph_d3d11_get_report(NV2AState *d, uint32_t parameter)
 static bool d3d11_read_query(PGRAPHD3D11State *r, ID3D11Query *query,
                              uint64_t *samples)
 {
-    ID3D11DeviceContext_Flush(r->context);
     int64_t deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
     for (;;) {
         HRESULT hr = ID3D11DeviceContext_GetData(
@@ -189,6 +208,10 @@ void pgraph_d3d11_process_pending_reports(NV2AState *d)
         return;
     }
     PGRAPHD3D11QueryReport *report;
+    if (QSIMPLEQ_FIRST(&r->reports->queue)) {
+        /* Submit once for the complete batch, not once per query. */
+        ID3D11DeviceContext_Flush(r->context);
+    }
     while ((report = QSIMPLEQ_FIRST(&r->reports->queue))) {
         if (report->clear) {
             r->reports->zpass_pixel_count = 0;
@@ -206,8 +229,9 @@ void pgraph_d3d11_process_pending_reports(NV2AState *d)
                     /* Do not expose an earlier report's count on query loss. */
                     r->reports->zpass_pixel_count = 0;
                 }
-                pgraph_write_zpass_pixel_cnt_report(
-                    d, report->parameter, r->reports->zpass_pixel_count);
+                /* GET_REPORT may be consumed after the guest switches DMA. */
+                d3d11_write_report(d, report->dma_report, report->parameter,
+                                    r->reports->zpass_pixel_count);
             }
         }
         QSIMPLEQ_REMOVE_HEAD(&r->reports->queue, entry);

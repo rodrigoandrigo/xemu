@@ -63,6 +63,12 @@ void pgraph_d3d11_draw_trim(PGRAPHD3D11State *r)
         return;
     }
     ID3D11Buffer *no_constants = NULL;
+    UINT stride = 0, offset = 0;
+    ID3D11DeviceContext_IASetVertexBuffers(r->context, 0, 1, &no_constants,
+                                           &stride, &offset);
+    ID3D11DeviceContext_IASetIndexBuffer(r->context, NULL,
+                                         DXGI_FORMAT_R32_UINT, 0);
+    ID3D11DeviceContext_RSSetState(r->context, NULL);
     ID3D11DeviceContext_GSSetConstantBuffers(r->context, 1, 1, &no_constants);
     if (r->draw->rasterizer_state) {
         ID3D11RasterizerState_Release(r->draw->rasterizer_state);
@@ -83,6 +89,8 @@ void pgraph_d3d11_draw_trim(PGRAPHD3D11State *r)
     r->draw->rasterizer_state_valid = false;
     r->draw->vertex_buffer_size = 0;
     r->draw->index_buffer_size = 0;
+    r->draw->vertex_buffer_cursor = 0;
+    r->draw->index_buffer_cursor = 0;
     r->draw->prepared = false;
 }
 
@@ -395,6 +403,42 @@ static bool d3d11_ensure_dynamic_buffer(PGRAPHD3D11State *r,
     return true;
 }
 
+/* Append without touching submitted bytes. DISCARD starts a new driver-owned
+ * allocation on wrap; unlike D3D12, retirement is managed by the runtime. */
+static bool d3d11_map_geometry(PGRAPHD3D11State *r, ID3D11Buffer **buffer,
+                               size_t *capacity, size_t *cursor, size_t size,
+                               UINT bind_flags, UINT *offset,
+                               D3D11_MAPPED_SUBRESOURCE *mapped, Error **errp)
+{
+    if (!size || size > UINT32_MAX) {
+        error_setg(errp, "D3D11: invalid geometry upload size");
+        return false;
+    }
+    bool replace = !*buffer || *capacity < size;
+    size_t minimum = bind_flags == D3D11_BIND_VERTEX_BUFFER ? MiB : 256 * KiB;
+    if (!d3d11_ensure_dynamic_buffer(r, buffer, capacity, MAX(size, minimum),
+                                      bind_flags, errp)) {
+        return false;
+    }
+    size_t start = replace ? 0 : *cursor;
+    if (start > *capacity || size > *capacity - start) {
+        start = 0;
+    }
+    HRESULT hr = ID3D11DeviceContext_Map(
+        r->context, (ID3D11Resource *)*buffer, 0,
+        start ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD,
+        0, mapped);
+    if (FAILED(hr)) {
+        error_setg(errp, "D3D11: geometry-buffer map failed (HRESULT 0x%08lx)",
+                   (unsigned long)hr);
+        return false;
+    }
+    *offset = start;
+    *cursor = start + size;
+    mapped->pData = (uint8_t *)mapped->pData + start;
+    return true;
+}
+
 static bool d3d11_ensure_input_layout(PGRAPHD3D11State *r, Error **errp)
 {
     PGRAPHD3D11VertexShader *shader = r->shaders->vertex;
@@ -606,18 +650,16 @@ static bool d3d11_upload_vertices(NV2AState *d, D3D11VertexSource source,
 {
     PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
     size_t size = count * sizeof(D3D11PackedVertex);
-    if (!count || !d3d11_ensure_dynamic_buffer(
-                      r, &r->draw->vertex_buffer, &r->draw->vertex_buffer_size,
-                      size, D3D11_BIND_VERTEX_BUFFER, errp)) {
-        return count == 0;
+    if (!count) {
+        return true;
     }
     D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = ID3D11DeviceContext_Map(
-        r->context, (ID3D11Resource *)r->draw->vertex_buffer, 0,
-        D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) {
-        error_setg(errp, "D3D11: vertex-buffer map failed (HRESULT 0x%08lx)",
-                   (unsigned long)hr);
+    UINT offset;
+    if (!d3d11_map_geometry(r, &r->draw->vertex_buffer,
+                              &r->draw->vertex_buffer_size,
+                              &r->draw->vertex_buffer_cursor, size,
+                              D3D11_BIND_VERTEX_BUFFER, &offset, &mapped,
+                              errp)) {
         return false;
     }
     bool packed = d3d11_pack_vertices(d, source, first, count, state_vertex,
@@ -627,7 +669,7 @@ static bool d3d11_upload_vertices(NV2AState *d, D3D11VertexSource source,
     if (!packed) {
         return false;
     }
-    UINT stride = sizeof(D3D11PackedVertex), offset = 0;
+    UINT stride = sizeof(D3D11PackedVertex);
     ID3D11DeviceContext_IASetVertexBuffers(
         r->context, 0, 1, &r->draw->vertex_buffer, &stride, &offset);
     return d3d11_ensure_input_layout(r, errp);
@@ -661,28 +703,33 @@ static bool d3d11_native_topology(enum ShaderPrimitiveMode mode,
 }
 
 static bool d3d11_upload_indices(PGRAPHD3D11State *r, const uint32_t *indices,
-                                 uint32_t count, Error **errp)
+                                 uint32_t count, uint32_t first, Error **errp)
 {
     size_t size = count * sizeof(uint32_t);
-    if (!count || !d3d11_ensure_dynamic_buffer(
-                      r, &r->draw->index_buffer, &r->draw->index_buffer_size,
-                      size, D3D11_BIND_INDEX_BUFFER, errp)) {
-        return count == 0;
+    if (!count) {
+        return true;
     }
     D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = ID3D11DeviceContext_Map(
-        r->context, (ID3D11Resource *)r->draw->index_buffer, 0,
-        D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) {
-        error_setg(errp, "D3D11: index-buffer map failed (HRESULT 0x%08lx)",
-                   (unsigned long)hr);
+    UINT offset;
+    if (!d3d11_map_geometry(r, &r->draw->index_buffer,
+                              &r->draw->index_buffer_size,
+                              &r->draw->index_buffer_cursor, size,
+                              D3D11_BIND_INDEX_BUFFER, &offset, &mapped,
+                              errp)) {
         return false;
     }
-    memcpy(mapped.pData, indices, size);
+    if (!first) {
+        memcpy(mapped.pData, indices, size);
+    } else {
+        uint32_t *destination = mapped.pData;
+        for (uint32_t i = 0; i < count; i++) {
+            destination[i] = indices[i] - first;
+        }
+    }
     ID3D11DeviceContext_Unmap(r->context,
                               (ID3D11Resource *)r->draw->index_buffer, 0);
     ID3D11DeviceContext_IASetIndexBuffer(r->context, r->draw->index_buffer,
-                                         DXGI_FORMAT_R32_UINT, 0);
+                                         DXGI_FORMAT_R32_UINT, offset);
     return true;
 }
 
@@ -758,6 +805,15 @@ static bool d3d11_emit_draw(NV2AState *d, D3D11VertexSource source,
         return true;
     }
 
+    if (source_indices && native && !r->shaders->polygon_line_geometry) {
+        if (!d3d11_upload_indices(r, source_indices, source_index_count,
+                                    first, errp)) {
+            return false;
+        }
+        ID3D11DeviceContext_DrawIndexed(r->context, source_index_count, 0, 0);
+        return true;
+    }
+
     GArray *indices = g_array_sized_new(FALSE, FALSE, sizeof(uint32_t),
                                         source_index_count ?: vertex_count);
     if (source_indices) {
@@ -781,7 +837,7 @@ static bool d3d11_emit_draw(NV2AState *d, D3D11VertexSource source,
         indices = converted;
     }
     bool uploaded = d3d11_upload_indices(r, (const uint32_t *)indices->data,
-                                         indices->len, errp);
+                                         indices->len, 0, errp);
     if (uploaded && indices->len) {
         ID3D11DeviceContext_DrawIndexed(r->context, indices->len, 0, 0);
     }

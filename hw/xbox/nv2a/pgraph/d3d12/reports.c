@@ -10,8 +10,33 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
 #include "reports.h"
+#include "qemu/bswap.h"
 
 #define D3D12_MAX_OCCLUSION_QUERIES 1024
+
+static void d3d12_write_report(NV2AState *d, uint32_t dma_report,
+                               uint32_t parameter, uint32_t value)
+{
+    uint8_t *mapping = NULL;
+    hwaddr length = 0;
+    hwaddr offset = GET_MASK(parameter, NV097_GET_REPORT_OFFSET);
+    if (!nv_dma_map_checked(d, dma_report, &mapping, &length) || !mapping ||
+        offset > length || length - offset < 16) {
+        qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
+                           "D3D12: report destination exceeds DMA range");
+        return;
+    }
+    stq_le_p(mapping + offset, UINT64_C(0x0011223344556677));
+    stl_le_p(mapping + offset + 8, value);
+    stl_le_p(mapping + offset + 12, 0);
+}
+
+static uint32_t d3d12_scaled_report(uint64_t samples, uint32_t scale_factor)
+{
+    uint64_t scale = MAX(scale_factor, 1U);
+    samples /= scale * scale;
+    return MIN(samples, (uint64_t)UINT32_MAX);
+}
 
 static bool d3d12_wait_for_query_submission(PGRAPHD3D12State *r,
                                             ID3D12GraphicsCommandList *list,
@@ -129,19 +154,21 @@ void pgraph_d3d12_reports_end_draw(PGRAPHD3D12State *r,
     r->query_active = false;
 }
 
-static void d3d12_queue_report(PGRAPHD3D12State *r, bool clear,
+static void d3d12_queue_report(NV2AState *d, bool clear,
                                uint32_t parameter)
 {
+    PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
     PGRAPHD3D12QueryReport *report = g_new0(PGRAPHD3D12QueryReport, 1);
     report->clear = clear;
     report->parameter = parameter;
+    report->dma_report = d->pgraph.dma_report;
     report->query_count = r->query_count;
     QSIMPLEQ_INSERT_TAIL(&r->report_queue, report, entry);
 }
 
 void pgraph_d3d12_clear_report_value(NV2AState *d)
 {
-    d3d12_queue_report(d->pgraph.d3d12_renderer_state, true, 0);
+    d3d12_queue_report(d, true, 0);
 }
 
 void pgraph_d3d12_get_report(NV2AState *d, uint32_t parameter)
@@ -150,10 +177,10 @@ void pgraph_d3d12_get_report(NV2AState *d, uint32_t parameter)
     if (type != NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT) {
         qemu_host_emit_log(QEMU_HOST_LOG_WARNING,
                            "D3D12: unsupported NV2A report type");
-        pgraph_write_zpass_pixel_cnt_report(d, parameter, 0);
+        d3d12_write_report(d, d->pgraph.dma_report, parameter, 0);
         return;
     }
-    d3d12_queue_report(d->pgraph.d3d12_renderer_state, false, parameter);
+    d3d12_queue_report(d, false, parameter);
 }
 
 bool pgraph_d3d12_process_reports_now(NV2AState *d, Error **errp)
@@ -203,8 +230,6 @@ bool pgraph_d3d12_process_reports_now(NV2AState *d, Error **errp)
     }
 
     uint32_t consumed = 0;
-    uint64_t divisor = MAX(pg->surface_scale_factor, 1);
-    divisor *= divisor;
     PGRAPHD3D12QueryReport *report;
     while ((report = QSIMPLEQ_FIRST(&r->report_queue))) {
         while (consumed < report->query_count && consumed < r->query_count) {
@@ -213,8 +238,8 @@ bool pgraph_d3d12_process_reports_now(NV2AState *d, Error **errp)
         if (report->clear) {
             r->zpass_pixel_count = 0;
         } else {
-            pgraph_write_zpass_pixel_cnt_report(d, report->parameter,
-                                                r->zpass_pixel_count / divisor);
+            d3d12_write_report(d, report->dma_report, report->parameter,
+                d3d12_scaled_report(r->zpass_pixel_count, pg->surface_scale_factor));
         }
         QSIMPLEQ_REMOVE_HEAD(&r->report_queue, entry);
         g_free(report);
@@ -233,9 +258,7 @@ bool pgraph_d3d12_process_reports_now(NV2AState *d, Error **errp)
 void pgraph_d3d12_process_pending_reports(NV2AState *d)
 {
     PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
-    uint32_t dma_get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
-    uint32_t dma_put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
-    if (dma_get != dma_put || QSIMPLEQ_EMPTY(&r->report_queue)) {
+    if (!r || QSIMPLEQ_EMPTY(&r->report_queue)) {
         return;
     }
     Error *error = NULL;
@@ -255,7 +278,7 @@ void pgraph_d3d12_reports_device_lost(NV2AState *d)
         if (report->clear) {
             r->zpass_pixel_count = 0;
         } else {
-            pgraph_write_zpass_pixel_cnt_report(d, report->parameter, 0);
+            d3d12_write_report(d, report->dma_report, report->parameter, 0);
         }
         QSIMPLEQ_REMOVE_HEAD(&r->report_queue, entry);
         g_free(report);

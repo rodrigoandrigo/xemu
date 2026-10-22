@@ -22,6 +22,15 @@ typedef HRESULT(WINAPI *D3D12GetDebugInterfaceFn)(REFIID, void **);
 
 static void d3d12_enable_optional_debug_layer(void)
 {
+#ifdef CONFIG_UWP
+    return;
+#else
+    const char *enabled = g_getenv("XEMU_D3D12_DEBUG_LAYER");
+    if (!enabled || !g_strcmp0(enabled, "0") ||
+        !g_ascii_strcasecmp(enabled, "false") ||
+        !g_ascii_strcasecmp(enabled, "off")) {
+        return;
+    }
     HMODULE module = LoadPackagedLibrary(L"d3d12.dll", 0);
     if (!module) {
         return;
@@ -40,6 +49,7 @@ static void d3d12_enable_optional_debug_layer(void)
                            "D3D12: optional desktop debug layer enabled");
     }
     FreeLibrary(module);
+#endif
 }
 
 static void d3d12_set_error(Error **errp, const char *operation, HRESULT hr)
@@ -913,7 +923,7 @@ static void pgraph_d3d12_finalize(NV2AState *d)
 static bool pgraph_d3d12_present_frame_unlocked(NV2AState *d)
 {
     PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
-    if (!r) {
+    if (!r || r->app_suspended || r->memory_suspended) {
         return false;
     }
     HRESULT reason = ID3D12Device_GetDeviceRemovedReason(r->device);
@@ -1159,6 +1169,12 @@ static void pgraph_d3d12_pre_shutdown_trigger(NV2AState *d)
 static void pgraph_d3d12_draw_begin(NV2AState *d)
 {
     PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
+    if (!r || r->device_lost || r->app_suspended || r->memory_suspended) {
+        if (r) {
+            r->draw_prepared = false;
+        }
+        return;
+    }
     Error *error = NULL;
     r->draw_prepared = pgraph_d3d12_update_output_merger(d, &error) &&
                        pgraph_d3d12_bind_textures(d, &error);
@@ -1273,7 +1289,16 @@ static void pgraph_d3d12_clear_surface_op(NV2AState *d, uint32_t parameter)
 static void pgraph_d3d12_surface_update_op(NV2AState *d, bool upload,
                                            bool color_write, bool zeta_write)
 {
+    PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
+    if (!r || r->device_lost || r->app_suspended || r->memory_suspended) {
+        return;
+    }
     if (!upload) {
+        if (color_write || zeta_write ||
+            d->pgraph.surface_color.write_enabled_cache ||
+            d->pgraph.surface_zeta.write_enabled_cache) {
+            pgraph_d3d12_surface_flush_op(d);
+        }
         return;
     }
     Error *error = NULL;
@@ -1282,6 +1307,88 @@ static void pgraph_d3d12_surface_update_op(NV2AState *d, bool upload,
                            error ? error_get_pretty(error) :
                                    "D3D12: surface update failed");
         error_free(error);
+    }
+}
+
+static bool d3d12_preserve_state(NV2AState *d)
+{
+    PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
+    Error *error = NULL;
+    bool ok = d3d12_wait_idle(r, &error) &&
+              pgraph_d3d12_draw_collect(r, true, &error) &&
+              pgraph_d3d12_surface_flush(d, &error) &&
+              pgraph_d3d12_process_reports_now(d, &error);
+    if (!ok) {
+        qemu_host_emit_log(QEMU_HOST_LOG_WARNING,
+                           error ? error_get_pretty(error) :
+                                   "D3D12: could not preserve graphics state");
+        error_free(error);
+    }
+    return ok;
+}
+
+static void pgraph_d3d12_suspend(NV2AState *d)
+{
+    PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
+    if (!r || r->app_suspended) {
+        return;
+    }
+    r->app_suspended = true;
+    r->draw_prepared = false;
+    if (d3d12_preserve_state(d)) {
+        pgraph_d3d12_textures_trim(r);
+    }
+}
+
+static bool pgraph_d3d12_resume(NV2AState *d)
+{
+    PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
+    if (!r) {
+        return false;
+    }
+    r->app_suspended = false;
+    if (r->memory_suspended) {
+        return true;
+    }
+    return !r->device_lost || pgraph_d3d12_recover_device(d);
+}
+
+static void pgraph_d3d12_memory_pressure(NV2AState *d, unsigned int level)
+{
+    PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
+    if (!r) {
+        return;
+    }
+    if (level == QEMU_HOST_MEMORY_PRESSURE_NORMAL) {
+        r->memory_suspended = false;
+        return;
+    }
+    if (level >= QEMU_HOST_MEMORY_PRESSURE_CRITICAL) {
+        r->memory_suspended = true;
+        r->draw_prepared = false;
+    }
+    if (!d3d12_preserve_state(d)) {
+        return;
+    }
+    pgraph_d3d12_textures_trim(r);
+    if (level >= QEMU_HOST_MEMORY_PRESSURE_HIGH) {
+        pgraph_d3d12_draw_finalize(r);
+        pgraph_d3d12_surfaces_finalize(r);
+        Error *error = NULL;
+        if (!pgraph_d3d12_surfaces_init(r, &error) ||
+            !pgraph_d3d12_draw_init(r, &error)) {
+            qemu_host_emit_log(QEMU_HOST_LOG_ERROR,
+                               error ? error_get_pretty(error) :
+                                       "D3D12: resource reconstruction failed");
+            error_free(error);
+            r->device_lost = true;
+        }
+        d->pgraph.surface_color.buffer_dirty = true;
+        d->pgraph.surface_zeta.buffer_dirty = true;
+    }
+    if (level >= QEMU_HOST_MEMORY_PRESSURE_CRITICAL) {
+        r->memory_suspended = true;
+        r->draw_prepared = false;
     }
 }
 
@@ -1305,11 +1412,18 @@ static PGRAPHRenderer pgraph_d3d12_renderer = {
         .pre_shutdown_wait = pgraph_d3d12_wait_complete,
         .process_pending = pgraph_d3d12_process_pending,
         .process_pending_reports = pgraph_d3d12_process_pending_reports,
+        .process_pending_reports_requires_pgraph_lock = true,
         .surface_flush = pgraph_d3d12_surface_flush_op,
         .surface_update = pgraph_d3d12_surface_update_op,
         .set_surface_scale_factor = pgraph_d3d12_set_surface_scale_factor,
         .get_surface_scale_factor = pgraph_d3d12_get_surface_scale_factor,
         .present_frame = pgraph_d3d12_present_frame,
+        .suspend = pgraph_d3d12_suspend,
+        .resume = pgraph_d3d12_resume,
+        .memory_pressure = pgraph_d3d12_memory_pressure,
+        .suspend_requires_pgraph_lock = true,
+        .resume_requires_pgraph_lock = true,
+        .memory_pressure_requires_pgraph_lock = true,
         .get_gpu_properties = pgraph_d3d12_get_gpu_properties,
     },
 };

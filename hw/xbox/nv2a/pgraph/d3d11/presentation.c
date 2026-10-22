@@ -897,6 +897,7 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     ID3D11InputLayout *layout;
     D3D11_PRIMITIVE_TOPOLOGY topology;
     ID3D11VertexShader *vertex;
+    ID3D11GeometryShader *geometry;
     ID3D11PixelShader *pixel;
     ID3D11ShaderResourceView *views[NV2A_MAX_TEXTURES];
     ID3D11SamplerState *samplers[NV2A_MAX_TEXTURES];
@@ -912,6 +913,7 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     ID3D11DeviceContext_IAGetInputLayout(context, &layout);
     ID3D11DeviceContext_IAGetPrimitiveTopology(context, &topology);
     ID3D11DeviceContext_VSGetShader(context, &vertex, NULL, NULL);
+    ID3D11DeviceContext_GSGetShader(context, &geometry, NULL, NULL);
     ID3D11DeviceContext_PSGetShader(context, &pixel, NULL, NULL);
     ID3D11DeviceContext_PSGetShaderResources(context, 0, ARRAY_SIZE(views),
                                              views);
@@ -934,7 +936,7 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     ID3D11DeviceContext_IASetInputLayout(context, layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(context, topology);
     ID3D11DeviceContext_VSSetShader(context, vertex, NULL, 0);
-    ID3D11DeviceContext_GSSetShader(context, NULL, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(context, geometry, NULL, 0);
     ID3D11DeviceContext_PSSetShader(context, pixel, NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(context, 0, ARRAY_SIZE(views),
                                              views);
@@ -963,6 +965,7 @@ bool pgraph_d3d11_present_color(NV2AState *d, Error **errp)
     RELEASE_SAVED(ID3D11RasterizerState, raster);
     RELEASE_SAVED(ID3D11InputLayout, layout);
     RELEASE_SAVED(ID3D11VertexShader, vertex);
+    RELEASE_SAVED(ID3D11GeometryShader, geometry);
     RELEASE_SAVED(ID3D11PixelShader, pixel);
 #undef RELEASE_SAVED
     return result;

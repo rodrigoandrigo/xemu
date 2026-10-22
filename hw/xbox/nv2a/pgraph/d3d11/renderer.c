@@ -139,12 +139,10 @@ static HRESULT d3d11_create_hardware_device(
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0,
     };
     static const D3D_FEATURE_LEVEL levels_legacy_runtime[] = {
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0,
     };
     HRESULT hr = D3D11CreateDevice(
         adapter, driver_type, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -206,6 +204,13 @@ static bool d3d11_create_device(PGRAPHD3D11State *r, Error **errp)
     }
     if (!r->device) {
         d3d11_set_error(errp, "D3D11CreateDevice", hr);
+        return false;
+    }
+    if (r->feature_level < D3D_FEATURE_LEVEL_10_1) {
+        error_setg(errp,
+                   "D3D11: feature level 10_1 or newer is required; got "
+                   "0x%x",
+                   (unsigned int)r->feature_level);
         return false;
     }
     ID3D10Multithread *multithread = NULL;
@@ -369,6 +374,8 @@ static void d3d11_check_device_removed(PGRAPHD3D11State *r,
     }
 }
 
+static void d3d11_flush_preserved_state(NV2AState *d);
+
 static bool d3d11_recreate_device(NV2AState *d, Error **errp)
 {
     PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
@@ -376,6 +383,7 @@ static bool d3d11_recreate_device(NV2AState *d, Error **errp)
         return false;
     }
     if (r->resources_ready) {
+        d3d11_flush_preserved_state(d);
         d3d11_release_device_resources(r);
     }
     if (!d3d11_create_device_resources(r, errp)) {
@@ -519,7 +527,6 @@ static void pgraph_d3d11_draw_end(NV2AState *d)
             (depth->DepthEnable &&
              depth->DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) ||
             (depth->StencilEnable && depth->StencilWriteMask != 0);
-        ID3D11DeviceContext_Flush(r->context);
     }
 }
 
@@ -700,7 +707,7 @@ static bool pgraph_d3d11_present_frame(NV2AState *d)
 static void d3d11_flush_preserved_state(NV2AState *d)
 {
     PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
-    if (!r->resources_ready || r->device_lost) {
+    if (!r->resources_ready) {
         return;
     }
     Error *error = NULL;
@@ -712,6 +719,8 @@ static void d3d11_flush_preserved_state(NV2AState *d)
     d3d11_wait_idle(r);
 }
 
+static void d3d11_dxgi_trim(PGRAPHD3D11State *r);
+
 static void pgraph_d3d11_suspend(NV2AState *d)
 {
     PGRAPHD3D11State *r = d->pgraph.d3d11_renderer_state;
@@ -720,6 +729,7 @@ static void pgraph_d3d11_suspend(NV2AState *d)
     }
     r->app_suspended = true;
     d3d11_flush_preserved_state(d);
+    d3d11_dxgi_trim(r);
     d3d11_release_device_resources(r);
     qemu_host_emit_log(QEMU_HOST_LOG_INFO,
                        "D3D11: resources released for suspension");
@@ -783,8 +793,13 @@ static void pgraph_d3d11_memory_pressure(NV2AState *d, unsigned int level)
     pgraph_d3d11_draw_trim(r);
     if (level >= QEMU_HOST_MEMORY_PRESSURE_HIGH) {
         d3d11_flush_preserved_state(d);
+        ID3D11DeviceContext_OMSetRenderTargets(r->context, 0, NULL, NULL);
+        ID3D11DeviceContext_OMSetBlendState(r->context, NULL, NULL, UINT_MAX);
+        ID3D11DeviceContext_OMSetDepthStencilState(r->context, NULL, 0);
         pgraph_d3d11_surfaces_finalize(r);
     }
+    /* Release deferred context references before asking DXGI to trim. */
+    ID3D11DeviceContext_Flush(r->context);
     d3d11_dxgi_trim(r);
     if (level >= QEMU_HOST_MEMORY_PRESSURE_CRITICAL) {
         r->memory_suspended = true;
